@@ -1,0 +1,11 @@
+[Unit]
+Description=Run verified Opus Mail V2 backup every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:17:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=mail-opus-viewer-v2-backup.service
+
+[Install]
+WantedBy=timers.target

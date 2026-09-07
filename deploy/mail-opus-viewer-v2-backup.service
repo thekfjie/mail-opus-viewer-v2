@@ -1,0 +1,19 @@
+[Unit]
+Description=Opus Mail Viewer V2 verified SQLite backup
+After=mail-opus-viewer-v2.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/opt/mail-opus-viewer-v2
+Environment=NODE_ENV=production
+Environment=PROJECT_ROOT=/opt/mail-opus-viewer-v2
+UMask=0077
+StateDirectory=mail-opus-v2
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/node /opt/mail-opus-viewer-v2/dist/server/server/backup.js
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mail-opus-v2 /var/backups/mail-opus-v2
