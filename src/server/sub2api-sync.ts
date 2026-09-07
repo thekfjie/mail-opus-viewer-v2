@@ -3,7 +3,7 @@ import { emailHash, normalizeEmail, splitEmail, stableId } from "./association.j
 import { config } from "./config.js";
 import { encryptSecret } from "./crypto.js";
 import { db } from "./db.js";
-import { observeAccessToken } from "./access-token-observation.js";
+import { observeCredentialVersion } from "./credential-versions.js";
 import { isStrictPlusEvidenceSubject } from "./plus-evidence.js";
 import {
   rebindAccountTransition,
@@ -145,33 +145,29 @@ function updateCredential(accountId: string, item: JsonObject, metadata: JsonObj
   const accessToken = String(credentials.access_token || "");
   const refreshToken = String(credentials.refresh_token || "");
   const idToken = String(credentials.id_token || "");
-  const existing = db.prepare("SELECT access_token_fingerprint, access_token_first_seen_at FROM credentials WHERE account_id=?").get(accountId) as any;
-  const tokenObservation = observeAccessToken(accessToken, existing ? {
-    fingerprint: String(existing.access_token_fingerprint || ""),
-    firstSeenAt: String(existing.access_token_first_seen_at || ""),
-  } : null, now);
-  db.prepare(`INSERT INTO credentials(
-    account_id, access_token_enc, refresh_token_enc, id_token_enc, openai_subject_hash,
-    access_token_alive, refresh_token_alive, source, source_updated_at, access_token_fingerprint, access_token_first_seen_at, updated_at
-  ) VALUES(?, ?, ?, ?, ?, ?, ?, 'sub2api-active', ?, ?, ?, ?)
-  ON CONFLICT(account_id) DO UPDATE SET
-    access_token_enc=CASE WHEN excluded.access_token_enc!='' THEN excluded.access_token_enc ELSE credentials.access_token_enc END,
-    refresh_token_enc=CASE WHEN excluded.refresh_token_enc!='' THEN excluded.refresh_token_enc ELSE credentials.refresh_token_enc END,
-    id_token_enc=CASE WHEN excluded.id_token_enc!='' THEN excluded.id_token_enc ELSE credentials.id_token_enc END,
-    openai_subject_hash=CASE WHEN excluded.openai_subject_hash!='' THEN excluded.openai_subject_hash ELSE credentials.openai_subject_hash END,
-    access_token_alive=excluded.access_token_alive, refresh_token_alive=excluded.refresh_token_alive,
-    access_token_fingerprint=CASE WHEN excluded.access_token_fingerprint!='' THEN excluded.access_token_fingerprint ELSE credentials.access_token_fingerprint END,
-    access_token_first_seen_at=CASE WHEN excluded.access_token_fingerprint!='' THEN excluded.access_token_first_seen_at ELSE credentials.access_token_first_seen_at END,
-    source=excluded.source, source_updated_at=excluded.source_updated_at, updated_at=excluded.updated_at`).run(
-    accountId, encryptSecret(accessToken), encryptSecret(refreshToken), encryptSecret(idToken), identityHash,
-    accessToken ? 1 : 0, refreshToken ? 1 : 0, String(metadata.updated_at || now), tokenObservation.fingerprint, tokenObservation.firstSeenAt, now,
-  );
-  if (credentials.plan_type) {
+  if (accessToken || refreshToken || idToken) {
+    const email = normalizeEmail(credentials.email || metadata.extra?.email || "");
+    const binding = email
+      ? db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND email_hash=? ORDER BY is_current DESC LIMIT 1").get(accountId, emailHash(email)) as any
+      : db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId) as any;
+    observeCredentialVersion({
+      accountId, bindingId: String(binding?.id || "") || null, accessToken, refreshToken, idToken,
+      subjectHash: identityHash, source: "sub2api-active", observedAt: String(metadata.updated_at || now),
+      validityStatus: accessToken ? "alive" : "unknown", evidence: { sub2apiId: metadata.id || "" },
+      observationKey: String(metadata.id || item.name || ""),
+      allowAccountMutation: config.accountAuthority !== "v1",
+    });
+  }
+  if (!config.readOnly && config.accountAuthority !== "v1" && credentials.plan_type) {
     const incomingPlan = String(credentials.plan_type).toLowerCase();
+    const current = db.prepare("SELECT plan, billing_channel, billing_channel_override FROM gpt_accounts WHERE id=?").get(accountId) as any;
     // Sub2API can report a stale Free snapshot after Plus was activated. A
     // persisted activation receipt is stronger evidence than that snapshot,
-    // so never downgrade a mailbox with a confirmed Plus mail.
-    const plan = incomingPlan === "plus" || hasPlusActivationMailEvidence(accountId) ? "plus" : incomingPlan;
+    // so never downgrade a mailbox with a confirmed Plus mail or an explicit
+    // administrator-confirmed billing channel.
+    const protectedPlus = String(current?.plan || "") === "plus"
+      && Boolean(String(current?.billing_channel_override || current?.billing_channel || ""));
+    const plan = incomingPlan === "plus" || protectedPlus || hasPlusActivationMailEvidence(accountId) ? "plus" : incomingPlan;
     db.prepare("UPDATE gpt_accounts SET plan=?, updated_at=? WHERE id=?").run(plan, now, accountId);
   }
 }
@@ -180,24 +176,29 @@ function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { account
   const credentials = item.credentials || {};
   const { email, identityHash } = identityMaterial(item);
   const parts = splitEmail(email);
+  const topologyWritable = !config.readOnly && config.accountAuthority !== "v1";
   if (!parts.localPart || !parts.domain) {
     const identityOnly = identityHash ? resolveAccountMatch(identityHash, "") : null;
     if (!identityOnly || identityOnly.kind !== "account") return { accountId: "", created: false, rebind: false, conflict: Boolean(identityOnly?.kind === "conflict"), skipped: true };
     const now = new Date().toISOString();
-    const identity = recordIdentityObservation(identityOnly.accountId, identityHash, "sub2api", { sub2apiId: metadata.id });
-    if (identity.conflict) return { accountId: identityOnly.accountId, created: false, rebind: false, conflict: true, skipped: false };
+    if (topologyWritable) {
+      const identity = recordIdentityObservation(identityOnly.accountId, identityHash, "sub2api", { sub2apiId: metadata.id });
+      if (identity.conflict) return { accountId: identityOnly.accountId, created: false, rebind: false, conflict: true, skipped: false };
+    }
     updateCredential(identityOnly.accountId, item, metadata, identityHash, now);
     return { accountId: identityOnly.accountId, created: false, rebind: false, conflict: false, skipped: false };
   }
   const match = resolveAccountMatch(identityHash, email);
   const now = new Date().toISOString();
   if (match.kind === "conflict") {
-    if (match.accountId && ["identity_email_conflict", "contradictory_identity", "trusted_local_identity_conflict"].includes(match.method)) {
+    if (topologyWritable && match.accountId && ["identity_email_conflict", "contradictory_identity", "trusted_local_identity_conflict"].includes(match.method)) {
       quarantineAccount(match.accountId, match.reason, "sub2api", { sub2apiId: metadata.id, identityHash, email, candidateAccountIds: match.candidateAccountIds });
     }
-    addPendingReview(match.accountId || null, email, match.reason, {
-      sub2apiId: metadata.id, identityHash, candidateAccountIds: match.candidateAccountIds, matchMethod: match.method,
-    });
+    if (topologyWritable) {
+      addPendingReview(match.accountId || null, email, match.reason, {
+        sub2apiId: metadata.id, identityHash, candidateAccountIds: match.candidateAccountIds, matchMethod: match.method,
+      });
+    }
     return { accountId: match.accountId, created: false, rebind: false, conflict: true, skipped: false };
   }
   let accountId = match.accountId;
@@ -207,6 +208,7 @@ function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { account
   let staleHistoricalEmail = false;
 
   if (!accountId) {
+    if (!topologyWritable) return { accountId: "", created: false, rebind: false, conflict: false, skipped: true };
     accountId = stableId("sub2api-gpt-account", identityHash || emailHash(email));
     const arrivedAt = String(metadata.created_at || now);
     db.prepare(`INSERT OR IGNORE INTO gpt_accounts(
@@ -238,7 +240,11 @@ function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { account
     if (current && String(current.email_hash) !== emailHash(email)) {
       const historical = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND email_hash=? AND is_current=0 LIMIT 1")
         .get(accountId, emailHash(email)) as any;
-      if (historical) {
+      if (!topologyWritable) {
+        // V1 owns mailbox topology during coexistence. Wait for its projection
+        // before associating a credential observed under another address.
+        staleHistoricalEmail = true;
+      } else if (historical) {
         // A live export can lag behind an already-completed V1 rebind. The old
         // mailbox and old AT are historical evidence only: never move the
         // current binding backwards and never overwrite the fresh target AT.
@@ -287,7 +293,7 @@ function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { account
       }
     }
   }
-  if (!conflict && identityHash) {
+  if (topologyWritable && !conflict && identityHash) {
     const identity = recordIdentityObservation(accountId, identityHash, "sub2api", { sub2apiId: metadata.id, email });
     conflict = identity.conflict;
   }
@@ -320,6 +326,9 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
       // Keep the encrypted material for audit/recovery, but never leave stale green AT/RT flags behind.
       db.prepare("UPDATE credentials SET access_token_alive=0, refresh_token_alive=0, updated_at=? WHERE source='sub2api-active'")
         .run(new Date().toISOString());
+      db.prepare(`UPDATE credential_versions SET validity_status='unknown', updated_at=?
+        WHERE source='sub2api-active' AND validity_status='alive'
+          AND id IN (SELECT credential_version_id FROM account_current_credentials)`).run(new Date().toISOString());
       db.prepare("UPDATE pending_reviews SET status='resolved', updated_at=? WHERE review_type LIKE 'sub2api_%' AND status='pending'")
         .run(new Date().toISOString());
       for (const item of rawAccounts) {
@@ -329,7 +338,7 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
         handledMetadata.add(String(meta.id || meta.name));
         const result = ensureSub2ApiAccount(item, meta);
         if (result.skipped) {
-          addUnresolvedReview(meta, "Sub2API活账号缺少可定位邮箱，且OpenAI身份无法唯一匹配现有GPT账号");
+          if (!config.readOnly && config.accountAuthority !== "v1") addUnresolvedReview(meta, "Sub2API活账号缺少可定位邮箱，且OpenAI身份无法唯一匹配现有GPT账号");
           continue;
         }
         processedActive += 1;
@@ -341,7 +350,7 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
       for (const meta of metadata) {
         if (String(meta.platform || "").toLowerCase() !== "openai" || String(meta.status || "").toLowerCase() !== "active") continue;
         if (handledMetadata.has(String(meta.id || meta.name))) continue;
-        addUnresolvedReview(meta, "Sub2API活账号无法与原始凭证导出唯一匹配，已禁止自动导入");
+        if (!config.readOnly && config.accountAuthority !== "v1") addUnresolvedReview(meta, "Sub2API活账号无法与原始凭证导出唯一匹配，已禁止自动导入");
       }
       const now = new Date().toISOString();
       db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('sub2api_active_count', ?, ?)

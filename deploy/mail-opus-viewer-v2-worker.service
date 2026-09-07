@@ -1,5 +1,5 @@
 [Unit]
-Description=Opus Mail Viewer V2 Sync Worker
+Description=Opus Mail Viewer V2 Native Sync Worker
 After=network-online.target mail-opus-viewer-v2.service
 Wants=network-online.target
 
@@ -12,6 +12,7 @@ Environment=PROJECT_ROOT=/opt/mail-opus-viewer-v2
 UMask=0077
 StateDirectory=mail-opus-v2
 StateDirectoryMode=0700
+LoadCredential=automyai-config:/opt/payment-checker/data/runtime-config/config.json
 ExecStart=/usr/local/bin/node /opt/mail-opus-viewer-v2/dist/server/server/worker.js
 Restart=always
 RestartSec=5

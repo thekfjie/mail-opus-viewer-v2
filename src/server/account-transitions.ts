@@ -305,14 +305,15 @@ export function rebindAccountTransition(accountId: string, newEmailInput: string
       changedAt, method, `v2:${bindingId}`, JSON.stringify(options.evidence || {}), changedAt, changedAt,
     );
     insertAdminOnlyGrant(accountId, bindingId, newEmail, changedAt);
-    db.prepare(`INSERT INTO account_relations(id, relation_type, from_account_id, to_account_id, changed_at, association_method, evidence_json, created_at)
-      VALUES(?, 'email_rebind', ?, ?, ?, ?, ?, ?)`).run(
-      crypto.randomUUID(), accountId, accountId, changedAt, method,
-      JSON.stringify({ previousBindingId: current.id, nextBindingId: bindingId, customerAccessInherited: false, ...(options.evidence || {}) }), changedAt,
+    db.prepare(`INSERT INTO binding_transitions(id, account_id, from_binding_id, to_binding_id, changed_at, method, task_id, evidence_json, created_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      crypto.randomUUID(), accountId, current.id, bindingId, changedAt, method,
+      String(options.evidence?.taskId || ""),
+      JSON.stringify({ customerAccessInherited: false, credentialsInheritedByAccountPointer: true, ...(options.evidence || {}) }), changedAt,
     );
     addEvent(accountId, bindingId, "email_binding_changed", changedAt, source,
       { previousBindingId: current.id, customerAccessInherited: false, deactivationInherited: boolean(account.deactivation_locked), ...(options.evidence || {}) });
-    db.prepare("UPDATE gpt_accounts SET arrived_at=?, updated_at=? WHERE id=?").run(changedAt, changedAt, accountId);
+    db.prepare("UPDATE gpt_accounts SET updated_at=? WHERE id=?").run(changedAt, accountId);
   })();
   return { bindingId, changed: true };
 }

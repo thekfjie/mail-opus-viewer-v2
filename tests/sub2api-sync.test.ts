@@ -61,6 +61,8 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
   process.env.DATABASE_PATH = path.join(directory, "test.sqlite");
   process.env.V2_SESSION_SECRET = "test-session-secret";
   process.env.CREDENTIAL_ENCRYPTION_KEY = "test-encryption-key";
+  process.env.V2_READ_ONLY = "false";
+  process.env.V2_ACCOUNT_AUTHORITY = "v2";
   process.env.SUB2API_API_URL = `http://127.0.0.1:${address.port}/api/v1`;
   process.env.SUB2API_ADMIN_TOKEN = "test-token";
 
@@ -145,6 +147,12 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
   assert.equal(decryptSecret(staleRebindCredential.access_token_enc), "fresh-target-at");
   assert.equal(decryptSecret(staleRebindCredential.refresh_token_enc), "fresh-target-rt");
 
+  // An administrator-confirmed regional billing channel is durable Plus
+  // evidence. A later stale Free snapshot must not erase a paid account.
+  db.prepare("UPDATE gpt_accounts SET plan='plus', billing_channel_override='vn-momo' WHERE id='account-b'").run();
+  await syncSub2ApiAlive();
+  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='account-b'").get() as any).plan, "plus");
+
   // Header-only "new plan" subjects are fetch candidates, not proof that a
   // paid subscription became active. A stale upstream Free snapshot may
   // therefore clear the derived plan.
@@ -178,6 +186,23 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
 
   const stale = db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='stale-account'").get() as any;
   assert.deepEqual(stale, { access_token_alive: 0, refresh_token_alive: 0 });
+
+  const invalidVersion = db.prepare("SELECT credential_version_id FROM account_current_credentials WHERE account_id='account-a'").get() as any;
+  const invalidated = db.prepare("UPDATE credential_versions SET validity_status='invalid', validity_checked_at=? WHERE id=?")
+    .run(now, invalidVersion.credential_version_id);
+  assert.equal(invalidated.changes, 1);
+  const beforeResync = db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
+    FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
+    WHERE cc.account_id='account-a'`).get() as any;
+  assert.equal(beforeResync.validity_status, "invalid");
+  await syncSub2ApiAlive();
+  const afterResync = db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
+    FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
+    WHERE cc.account_id='account-a'`).get() as any;
+  assert.deepEqual(afterResync, beforeResync);
+  assert.deepEqual(db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='account-a'").get(), {
+    access_token_alive: 0, refresh_token_alive: 0,
+  });
 
   metadata.find((item) => item.name === "brand-new")!.status = "error";
   await syncSub2ApiAlive();

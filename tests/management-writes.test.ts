@@ -4,6 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+test("API 与 Worker 的 SQLite 写入等待完整 V1 投影完成", () => {
+  const configSource = fs.readFileSync(path.join(process.cwd(), "src/server/config.ts"), "utf8");
+  const dbSource = fs.readFileSync(path.join(process.cwd(), "src/server/db.ts"), "utf8");
+  assert.match(configSource, /V2_SQLITE_BUSY_TIMEOUT_MS\s*\|\|\s*30_000/);
+  assert.match(dbSource, /busy_timeout = \$\{config\.sqliteBusyTimeoutMs\}/);
+});
+
+test("单账号凭证保存允许 V1 写入成功后后台投影，避免阻塞弹窗", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "src/server/v1-compat.ts"), "utf8");
+  const server = fs.readFileSync(path.join(process.cwd(), "src/server/server.ts"), "utf8");
+  assert.match(source, /proxyV1AndScheduleSync/);
+  assert.match(source, /setTimeout\(\(\) =>/);
+  assert.match(source, /syncPending: true/);
+  assert.match(server, /proxyV1AndScheduleSync/);
+});
+
 test("导入、永久停用、改绑、授权截止和回收保持账号隔离", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mail-opus-writes-"));
   process.env.PROJECT_ROOT = directory;
@@ -13,6 +29,7 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   process.env.CREDENTIAL_ENCRYPTION_KEY = "writes-test-encryption";
   process.env.PUBLIC_ORIGIN = "https://mail.example.test";
   process.env.V2_READ_ONLY = "false";
+  process.env.V2_ACCOUNT_AUTHORITY = "v2";
 
   const [{ db }, association, repository] = await Promise.all([
     import("../src/server/db.js"),
@@ -43,6 +60,13 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
     sessionToken: "",
     openaiPassword: "",
   });
+  const manuallySaved = repository.saveAccountCredentials(account.id, {
+    accessToken: "manual-at", refreshToken: "manual-rt", idToken: "", sessionToken: "", openaiPassword: "manual-password",
+  });
+  assert.equal(manuallySaved.hasAccessToken, true);
+  assert.equal(repository.revealCredentials(account.id)?.accessToken, "manual-at");
+  assert.equal(repository.revealCredentials(account.id)?.refreshToken, "manual-rt");
+  assert.equal(repository.revealCredentials(account.id)?.openaiPassword, "manual-password");
 
   const oldBinding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(account.id) as any;
   const grant = repository.createCustomerGrant(account.id, oldBinding.id, { password: "customer-password" });
@@ -71,6 +95,16 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   const inherited = db.prepare("SELECT scope, active FROM access_grants WHERE binding_id=?").all(newBinding.id) as any[];
   assert.ok(inherited.length >= 1);
   assert.ok(inherited.every((item) => item.scope === "admin_only" && item.active === 0));
+  assert.equal((db.prepare("SELECT count(*) count FROM credential_versions WHERE account_id=?").get(account.id) as any).count, 3);
+  assert.deepEqual(repository.revealCredentials(account.id), {
+    accessToken: "new-at",
+    refreshToken: "new-rt",
+    idToken: "",
+    sessionToken: "",
+    openaiPassword: "",
+  });
+  assert.equal((db.prepare(`SELECT count(*) count FROM credential_versions
+    WHERE account_id=? AND retired_reason='superseded'`).get(account.id) as any).count, 2);
   assert.equal(repository.getCurrentCustomerExport(account.id)?.available, false);
   assert.throws(() => repository.createCustomerGrant(account.id, newBinding.id, { password: "new-customer-password" }), /不能出售/);
 
@@ -94,6 +128,7 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   assert.equal(reboundReplacement.id, recycled.replacement.id);
   assert.equal(reboundReplacement.bindingCount, 2);
   assert.equal(reboundReplacement.deactivationLocked, false);
+  assert.equal(repository.revealCredentials(recycled.replacement.id), null);
   const credentialImport = repository.importAccounts([{
     email: "fresh-child@example.com",
     accessToken: "fresh-at",
@@ -102,6 +137,11 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
     plan: "plus",
   }]);
   assert.deepEqual(credentialImport, { imported: 1, created: 0, rebound: 0, errors: [] });
+  assert.equal((db.prepare("SELECT count(*) count FROM credential_versions WHERE account_id=?").get(recycled.replacement.id) as any).count, 1);
+  const currentVersion = db.prepare(`SELECT cv.token_fingerprint, cv.validity_status FROM account_current_credentials cc
+    JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(recycled.replacement.id) as any;
+  assert.ok(currentVersion.token_fingerprint);
+  assert.equal(currentVersion.validity_status, "alive");
   const replacementBinding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(recycled.replacement.id) as any;
   const replacementGrant = repository.createCustomerGrant(recycled.replacement.id, replacementBinding.id, { password: "replacement-customer-password" });
   assert.ok(repository.grantByPublicToken(replacementGrant.publicToken));
@@ -129,6 +169,7 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   }]);
   assert.equal(conflicting.imported, 0);
   assert.equal(conflicting.errors.length, 1);
+  assert.equal(repository.revealCredentials(recycled.replacement.id)?.accessToken, "fresh-at");
   const quarantined = db.prepare("SELECT lifecycle_status, identity_status FROM gpt_accounts WHERE id=?").get(recycled.replacement.id) as any;
   assert.deepEqual(quarantined, { lifecycle_status: "quarantined", identity_status: "conflict" });
   assert.equal((db.prepare("SELECT active FROM access_grants WHERE id=?").get(replacementGrant.grantId) as any).active, 0);

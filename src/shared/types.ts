@@ -45,6 +45,24 @@ export interface PaymentExposureRoute {
   configured: boolean;
   promotionConfigured: boolean;
   promotionIpCountry: string;
+  source: "saved" | "environment" | "none";
+  addressDisplay: string;
+}
+
+export interface PaymentEligibilityApiSummary {
+  configured: boolean;
+  source: "saved" | "environment" | "default" | "none";
+  endpoint: string;
+  hasApiToken: boolean;
+}
+
+export interface CheckRouteSummary {
+  key: "promotion_jp" | "nl_ideal" | "de_paypal" | "ph_gcash";
+  label: string;
+  ipCountry: string;
+  configured: boolean;
+  source: "saved" | "environment" | "none";
+  addressDisplay: string;
 }
 
 export interface PaymentExposureJobItem {
@@ -100,11 +118,15 @@ export interface AccountSummary {
   hidePromotion: boolean;
   plan: string;
   billingChannel: string;
+  billingChannelOverride: string;
   provider: string;
   domainMailbox: boolean;
+  isAuto: boolean;
   suspectedUnused: boolean;
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
+  hasStoredAccessToken: boolean;
+  hasStoredRefreshToken: boolean;
   credentialState: string;
   credentialStateLabel: string;
   internalPending: boolean;
@@ -126,10 +148,36 @@ export interface AccountSummary {
   trialStatus: string;
   promoEligible: boolean | null;
   promoCampaign: string;
+  promoCampaigns: string[];
+  promoSuspicious: boolean;
+  promoSuspiciousOverride: boolean;
+  historicalPromoCampaigns: string[];
   trialCheckedAt: string;
   accessTokenFirstSeenAt: string;
   autoTrialDueAt: string;
   autoTrialStatus: string;
+  promotionCheckStatus: string;
+  promotionCheckStartedAt: string;
+  promotionCheckUpdatedAt: string;
+  promotionCheckErrorClass: string;
+  promotionCheckErrorDetail: string;
+  promotionCheckNextRetryAt: string;
+}
+
+export interface CredentialVersionSummary {
+  id: string;
+  subjectHash: string;
+  tokenFingerprint: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  validityStatus: string;
+  validityCheckedAt: string;
+  source: string;
+  supersedesId: string;
+  retiredReason: string;
+  observedBindingId: string;
+  current: boolean;
+  observationCount: number;
 }
 
 export interface BindingStage {
@@ -141,6 +189,7 @@ export interface BindingStage {
   isCurrent: boolean;
   associationMethod: string;
   legacyMappingId: string;
+  receiveDisabledAt: string;
 }
 
 export interface AccountRelation {
@@ -160,4 +209,8 @@ export interface AccountDetail extends AccountSummary {
   relations: AccountRelation[];
   timeline: Array<{ id: string; eventType: string; occurredAt: string; payload: unknown }>;
   paymentExposureChecks: PaymentExposureCheck[];
+  credentialVersions: CredentialVersionSummary[];
+  promotion: Record<string, unknown> | null;
+  mailboxConnections: Array<{ id: string; bindingId: string; provider: string; status: string; externalGroupId: string; metadata: unknown }>;
+  routingRules: Array<{ id: string; bindingId: string; senderPattern: string; recipientPattern: string; validFrom: string; validTo: string; priority: number }>;
 }

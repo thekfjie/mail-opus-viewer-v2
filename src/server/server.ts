@@ -5,20 +5,15 @@ import cookie from "@fastify/cookie";
 import { config } from "./config.js";
 import { constantTimeEqual, signSession, verifySession } from "./crypto.js";
 import {
-  authenticateCustomer,
   applyBulkAction,
   createRebind,
   createCustomerGrant,
   deactivateAccount,
-  customerMailDetail,
   getAccountDetail,
   getCurrentCustomerExport,
-  grantById,
-  grantByPublicToken,
   ingestPaymentExposureChecks,
   listAccounts,
   listAccountGrants,
-  listCustomerMails,
   listPendingReviews,
   listRedGroups,
   importAccounts,
@@ -26,18 +21,62 @@ import {
   overview,
   primaryEmailForAccount,
   recycleAccount,
+  recycleAccountByMode,
   resolvePendingReview,
   revealCredentials,
+  saveAccountCredentials,
   revokeCustomerGrant,
+  setPromotionSuspicion,
   updateAccount,
 } from "./repository.js";
 import {
   getPaymentExposureCheckStatus,
   listPaymentExposureRoutes,
   startPaymentExposureCheck,
-  startTrialCheck,
 } from "./payment-exposure.js";
-import { fetchOutlookMessage, fetchSharedMessage } from "./upstream-mail.js";
+import { promotionJob, promotionJobs, queuePromotionCheck, queuePromotionChecks, runPromotionQueue } from "./promotion.js";
+import {
+  clearCheckRouteProxy,
+  clearPaymentEligibilityApi,
+  effectivePaymentEligibilityApi,
+  isCheckRouteKey,
+  listCheckRouteSummaries,
+  paymentEligibilityApiSummary,
+  saveCheckRouteProxy,
+  savePaymentEligibilityApi,
+} from "./check-routes.js";
+import {
+  accountVerificationCode,
+  adminAccountMailDetail,
+  listAdminAccountMails,
+  outlookFreeMailDetail,
+  outlookFreeMails,
+  outlookFreePool,
+} from "./native-mail.js";
+import {
+  applyOauthBatch,
+  applyOutlookTransfer,
+  createShareLink,
+  importOutlook,
+  importSession,
+  listShareLinks,
+  oauthHealthStatus,
+  previewOauthBatch,
+  previewOutlookTransfer,
+  readShareSnapshot,
+  revokeShareLink,
+  runUsageAudit,
+  startOauthHealth,
+} from "./native-operations.js";
+import { db } from "./db.js";
+import {
+  currentLegacyMappingId,
+  proxyV1AndSync,
+  proxyV1AndScheduleSync,
+  requestV1,
+  v1CompatCommand,
+  v1Health,
+} from "./v1-compat.js";
 
 const app = Fastify({ logger: true, disableRequestLogging: true, trustProxy: true, bodyLimit: 2 * 1024 * 1024 });
 await app.register(cookie);
@@ -109,20 +148,43 @@ function requireAdmin(request: FastifyRequest, reply: FastifyReply): boolean {
 
 function requireWrite(reply: FastifyReply): boolean {
   if (!config.readOnly) return true;
-  reply.code(409).send({ error: "V2当前处于只读影子验证阶段，写入仍由V1负责" });
+  reply.code(409).send({ error: "V2当前由配置锁定为只读模式" });
   return false;
 }
 
-function customerGrant(request: FastifyRequest) {
-  const session = verifySession(String(request.cookies.mail_opus_v2_session || ""));
-  return session?.type === "customer" ? grantById(session.id) : null;
+function commandWritesAvailable(): boolean {
+  return !config.readOnly;
+}
+
+function v1AccountAuthority(): boolean {
+  return config.accountAuthority === "v1";
+}
+
+function commandWriterLabel(): string {
+  return v1AccountAuthority() ? "v1-via-v2" : "v2";
+}
+
+function requireCommandWrite(reply: FastifyReply): boolean {
+  if (commandWritesAvailable()) return true;
+  reply.code(409).send({ error: "业务命令写入当前未启用" });
+  return false;
 }
 
 function setSessionCookie(reply: FastifyReply, name: string, value: string): void {
   reply.setCookie(name, value, { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 12 * 60 * 60 });
 }
 
-app.get("/health", async () => ({ ok: true, service: "mail-opus-viewer-v2", readOnly: config.readOnly, release: releaseManifest() }));
+app.get("/health", async () => ({
+  ok: true, service: "mail-opus-viewer-v2", readOnly: !commandWritesAvailable(), nativeReadOnly: config.readOnly,
+  commandWriter: commandWriterLabel(), accountAuthority: config.accountAuthority,
+  independent: !v1AccountAuthority(), release: releaseManifest(),
+}));
+app.get("/api/v2/health/coexistence", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const worker = db.prepare("SELECT status,heartbeat_at,artifact_sha256 FROM worker_heartbeats WHERE worker_name='native-sync-worker'").get() || null;
+  const v1 = v1AccountAuthority() ? await v1Health() : { mode: "standby", probed: false };
+  return { v1, v2: { ok: true, nativeReadOnly: config.readOnly, worker }, commandWriter: commandWriterLabel(), hardDependency: v1AccountAuthority() };
+});
 app.get("/api/v2/version", async () => ({ ok: true, release: releaseManifest() }));
 app.get("/api/v2/status", async (request, reply) => requireAdmin(request, reply) ? overview() : undefined);
 
@@ -139,7 +201,9 @@ app.post("/api/v2/admin/logout", async (_request, reply) => {
   reply.clearCookie("mail_opus_v2_admin", { path: "/" });
   return { ok: true };
 });
-app.get("/api/v2/admin/session", async (request, reply) => adminSession(request) ? { ok: true, readOnly: config.readOnly } : reply.code(401).send({ error: "未登录" }));
+app.get("/api/v2/admin/session", async (request, reply) => adminSession(request)
+  ? { ok: true, readOnly: !commandWritesAvailable(), nativeReadOnly: config.readOnly, commandWriter: commandWriterLabel(), accountAuthority: config.accountAuthority, independent: !v1AccountAuthority() }
+  : reply.code(401).send({ error: "未登录" }));
 
 app.get("/api/v2/admin/overview", async (request, reply) => requireAdmin(request, reply) ? overview() : undefined);
 app.get("/api/v2/admin/accounts", async (request, reply) => {
@@ -149,6 +213,7 @@ app.get("/api/v2/admin/accounts", async (request, reply) => {
     search: String(query.search || ""), range: query.range || "all", status: String(query.status || ""),
     provider: String(query.provider || ""), billingChannel: String(query.billingChannel || ""), sold: String(query.sold || ""), plan: String(query.plan || ""),
     credential: String(query.credential || ""), sourceStatus: String(query.sourceStatus || ""), unused: String(query.unused || ""),
+    workbench: String(query.workbench || ""), deactivationWindow: query.deactivationWindow || "today",
     redGroup: String(query.redGroup || ""), markColor: String(query.markColor || ""), pending: String(query.pending || ""),
     limit: Number(query.limit || 80), offset: Number(query.offset || 0),
   });
@@ -162,21 +227,231 @@ app.get("/api/v2/admin/pending-reviews", async (request, reply) => {
   return { results: listPendingReviews() };
 });
 app.post("/api/v2/admin/pending-reviews/:id/resolve", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  if (v1AccountAuthority()) return reply.code(409).send({ error: "V1 权威模式下禁止用 V2 审查结果改写账号关系" });
   try {
-    return resolvePendingReview(String((request.params as any).id), String((request.body as any)?.action || ""));
+    const reviewId = String((request.params as any).id);
+    const action = String((request.body as any)?.action || "");
+    return resolvePendingReview(reviewId, action);
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/migration-report", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   return migrationReport();
 });
+app.get("/api/v2/admin/outlook-free", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    if (v1AccountAuthority()) {
+      const refresh = String((request.query as any)?.refresh || "") === "1" ? "?refresh=1" : "";
+      return requestV1(`/api/admin/outlook/free-pool${refresh}`);
+    }
+    return outlookFreePool(String((request.query as any)?.refresh || "") === "1");
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/outlook-free/refresh", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/outlook/free-pool/refresh", { method: "POST", body: {} });
+    return outlookFreePool(true);
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/outlook-free/mails", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    const query = request.query as any;
+    if (v1AccountAuthority()) {
+      const params = new URLSearchParams({ email: String(query?.email || ""), offset: String(query?.offset || 0), limit: String(query?.limit || 20) });
+      return requestV1(`/api/admin/outlook/free-pool/mails?${params}`);
+    }
+    return outlookFreeMails(String(query?.email || ""), query?.offset, query?.limit);
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/outlook-free/mail-detail", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    const query = request.query as any;
+    if (v1AccountAuthority()) {
+      const params = new URLSearchParams({ email: String(query?.email || ""), id: String(query?.id || ""), folder: String(query?.folder || "inbox") });
+      return requestV1(`/api/admin/outlook/free-pool/mail-detail?${params}`);
+    }
+    return outlookFreeMailDetail(String(query?.email || ""), String(query?.id || ""), String(query?.folder || "inbox"));
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/accounts/:id/recent-mails", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    const accountId = String((request.params as any).id);
+    const query = request.query as any;
+    if (v1AccountAuthority()) {
+      const params = new URLSearchParams({ id: currentLegacyMappingId(accountId), offset: String(query?.offset || 0), limit: String(query?.limit || 10) });
+      return requestV1(`/api/admin/mapping-mails?${params}`);
+    }
+    return listAdminAccountMails(accountId, query?.offset, query?.limit);
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/accounts/:id/recent-mail-detail", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    const query = request.query as any;
+    const accountId = String((request.params as any).id);
+    if (v1AccountAuthority()) {
+      const params = new URLSearchParams({ mappingId: currentLegacyMappingId(accountId), id: String(query?.id || ""), folder: String(query?.folder || "inbox") });
+      return requestV1(`/api/admin/mapping-mail-detail?${params}`);
+    }
+    const item = await adminAccountMailDetail(accountId, String(query?.id || ""));
+    return item || reply.code(404).send({ error: "邮件不存在或不属于该账号" });
+  } catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/accounts/:id/verification-code", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    const accountId = String((request.params as any).id);
+    if (v1AccountAuthority()) {
+      const params = new URLSearchParams({ id: currentLegacyMappingId(accountId), ignoreAccessWindow: "1" });
+      return requestV1(`/api/admin/mapping-verification-code?${params}`);
+    }
+    return accountVerificationCode(accountId);
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/oauth/batch-preview", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/oauth/batch-preview", { method: "POST", body: request.body });
+    return previewOauthBatch((request.body as any)?.text || request.body);
+  }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/oauth/batch-apply", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  try {
+    if (v1AccountAuthority()) return (await proxyV1AndSync("/api/admin/oauth/batch-apply", { method: "POST", body: request.body })).result;
+    const body = request.body as any;
+    return applyOauthBatch(body?.text, body?.previewHash, body?.confirm);
+  }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/oauth-health/start", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/oauth-health/all-normal", { method: "POST", body: {} });
+    return startOauthHealth();
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/oauth-health/status", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/oauth-health/status");
+    return oauthHealthStatus();
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+for (const [route, v1Path, action, previewOnly] of [
+  ["/api/v2/admin/import/outlook", "/api/admin/outlook/import", importOutlook, false],
+  ["/api/v2/admin/import/session", "/api/admin/session/import", (input: unknown) => importSession(input), false],
+  ["/api/v2/admin/import/outlook-transfer-preview", "/api/admin/outlook/transfer/preview", previewOutlookTransfer, true],
+  ["/api/v2/admin/import/outlook-transfer", "/api/admin/outlook/transfer", applyOutlookTransfer, false],
+] as const) {
+  app.post(route, async (request, reply) => {
+    if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+    try {
+      const body = request.body as any;
+      const input = body?.accounts || body?.accountString || body?.emails || "";
+      if (v1AccountAuthority()) {
+        const result = previewOnly
+          ? await requestV1(v1Path, { method: "POST", body: { accounts: input, emails: input } })
+          : (await proxyV1AndSync(v1Path, { method: "POST", body: { accounts: input, emails: input } })).result;
+        return result;
+      }
+      return action(input);
+    } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+}
+app.post("/api/v2/admin/usage-audit", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/usage-audit", { method: "POST", body: request.body || {} });
+    return runUsageAudit();
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.get("/api/v2/admin/share/links", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/share/links");
+    return listShareLinks();
+  }
+  catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/share/links", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    if (v1AccountAuthority()) return requestV1("/api/admin/share/links", { method: "POST", body: request.body });
+    return createShareLink(request.body as any);
+  }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.delete("/api/v2/admin/share/links/:id", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  try {
+    const id = String((request.params as any).id);
+    if (v1AccountAuthority()) return requestV1(`/api/admin/share/links/${encodeURIComponent(id)}`, { method: "DELETE" });
+    return revokeShareLink(id) ? { ok: true } : reply.code(404).send({ error: "分享链接不存在" });
+  }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
 app.get("/api/v2/admin/payment-exposure/routes", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  return { routes: listPaymentExposureRoutes() };
+  const checkRoutes = listCheckRouteSummaries();
+  return {
+    routes: listPaymentExposureRoutes(),
+    promotionRoute: checkRoutes.find((route) => route.key === "promotion_jp"),
+    checkRoutes,
+    eligibilityApi: paymentEligibilityApiSummary(),
+  };
 });
-// This diagnostic starts an AutoMyAI read-only probe. It intentionally bypasses
-// V2's shadow-write gate; the only V2 write is the sanitized callback result.
+app.put("/api/v2/admin/payment-exposure/api", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  if (!consumeRate(request, "payment-eligibility-api-save", 20)) return reply.code(429).send({ error: "检查接口配置操作过多" });
+  const body = request.body as any;
+  try {
+    return { eligibilityApi: savePaymentEligibilityApi(body?.endpoint, body?.apiToken, Object.prototype.hasOwnProperty.call(body || {}, "apiToken")) };
+  } catch (error) {
+    return reply.code(400).send({ error: error instanceof Error ? error.message : "检查接口配置保存失败" });
+  }
+});
+app.get("/api/v2/admin/payment-exposure/api/reveal", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  reply.header("Cache-Control", "no-store");
+  return effectivePaymentEligibilityApi();
+});
+app.delete("/api/v2/admin/payment-exposure/api", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  return { eligibilityApi: clearPaymentEligibilityApi() };
+});
+app.put("/api/v2/admin/payment-exposure/routes/:key", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  if (!consumeRate(request, "check-route-save", 30)) return reply.code(429).send({ error: "出口配置操作过多" });
+  const key = String((request.params as any).key || "").trim().toLowerCase();
+  if (!isCheckRouteKey(key)) return reply.code(404).send({ error: "检测出口不存在" });
+  try { return { route: saveCheckRouteProxy(key, (request.body as any)?.proxy) }; }
+  catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : "出口配置保存失败" }); }
+});
+app.delete("/api/v2/admin/payment-exposure/routes/:key", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  const key = String((request.params as any).key || "").trim().toLowerCase();
+  if (!isCheckRouteKey(key)) return reply.code(404).send({ error: "检测出口不存在" });
+  return { route: clearCheckRouteProxy(key) };
+});
+// This is an API-only eligibility lookup. It must never create Checkout or
+// call Stripe payment-page endpoints.
 app.post("/api/v2/admin/accounts/:id/payment-exposure-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   if (!consumeRate(request, "payment-exposure-start", 30)) return reply.code(429).send({ error: "支付检查请求过多" });
@@ -192,10 +467,39 @@ app.post("/api/v2/admin/accounts/:id/trial-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   if (!consumeRate(request, "trial-check-start", 30)) return reply.code(429).send({ error: "试用检测请求过多" });
   try {
-    return await startTrialCheck(String((request.params as any).id));
+    const item = queuePromotionCheck(String((request.params as any).id), "manual");
+    void runPromotionQueue(500).catch(() => undefined);
+    return promotionJob(String(item.id || ""));
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : "试用检测启动失败" });
   }
+});
+app.post("/api/v2/admin/accounts/promotion-check", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  if (!consumeRate(request, "promotion-check-bulk", 30)) return reply.code(429).send({ error: "批量优惠检测请求过多" });
+  const accountIds = Array.isArray((request.body as any)?.accountIds) ? (request.body as any).accountIds : [];
+  if (!accountIds.length) return reply.code(400).send({ error: "请选择至少一个账号" });
+  const result = queuePromotionChecks(accountIds);
+  void runPromotionQueue(500).catch(() => undefined);
+  return result;
+});
+app.post("/api/v2/admin/accounts/promotion-check/status", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
+  const jobIds = Array.isArray((request.body as any)?.jobIds) ? (request.body as any).jobIds : [];
+  return { jobs: promotionJobs(jobIds) };
+});
+app.get("/api/v2/admin/accounts/:id/promotion-check/:jobId", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const item = promotionJob(String((request.params as any).jobId));
+  return item && String(item.accountId) === String((request.params as any).id)
+    ? item : reply.code(404).send({ error: "优惠检测任务不存在" });
+});
+app.post("/api/v2/admin/accounts/:id/promotion-suspicion", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  const accountId = String((request.params as any).id);
+  const suspicious = Boolean((request.body as any)?.suspicious);
+  const item = setPromotionSuspicion(accountId, suspicious);
+  return item || reply.code(404).send({ error: "账号不存在" });
 });
 app.get("/api/v2/admin/accounts/:id/payment-exposure-check/:jobId", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
@@ -228,8 +532,31 @@ app.post("/api/v2/internal/payment-exposure-check", async (request, reply) => {
 
 app.get("/api/v2/admin/accounts/:id/credentials", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  const item = revealCredentials(String((request.params as any).id));
-  return item || reply.code(404).send({ error: "凭证不存在" });
+  try {
+    const accountId = String((request.params as any).id);
+    if (v1AccountAuthority()) {
+      const legacyId = currentLegacyMappingId(accountId);
+      return requestV1(`/api/admin/mappings/${encodeURIComponent(legacyId)}/oauth`);
+    }
+    return revealCredentials(accountId) || {
+      accessToken: "", refreshToken: "", idToken: "", sessionToken: "", openaiPassword: "",
+    };
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
+});
+app.post("/api/v2/admin/accounts/:id/credentials", async (request, reply) => {
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  try {
+    const accountId = String((request.params as any).id);
+    const body = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {};
+    if (v1AccountAuthority()) {
+      const legacyId = currentLegacyMappingId(accountId);
+      const saved = await proxyV1AndScheduleSync(`/api/admin/mappings/${encodeURIComponent(legacyId)}/oauth`, {
+        method: "POST", body,
+      });
+      return { ...saved.result, syncPending: saved.syncPending };
+    }
+    return saveAccountCredentials(accountId, body);
+  } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/accounts/bulk-credentials", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
@@ -265,27 +592,58 @@ app.post("/api/v2/admin/accounts/bulk-current-export", async (request, reply) =>
   return { results };
 });
 app.patch("/api/v2/admin/accounts/:id", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
-    const item = updateAccount(String((request.params as any).id), request.body as any);
+    const accountId = String((request.params as any).id);
+    const patch = request.body as any;
+    if (v1AccountAuthority()) {
+      if (Object.prototype.hasOwnProperty.call(patch || {}, "sold")) {
+        const id = currentLegacyMappingId(accountId);
+        await proxyV1AndSync("/api/admin/mappings/batch-sold", { method: "POST", body: { ids: [id], sold: Boolean(patch.sold) } });
+      } else {
+        await v1CompatCommand("patch", [accountId], { patch });
+      }
+      return getAccountDetail(accountId) || reply.code(404).send({ error: "账号不存在" });
+    }
+    const item = updateAccount(accountId, patch);
     return item || reply.code(404).send({ error: "账号不存在" });
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/accounts/:id/rebind", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
-  try { return createRebind(String((request.params as any).id), String((request.body as any)?.email || "")); }
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  try {
+    const accountId = String((request.params as any).id);
+    const email = String((request.body as any)?.email || "");
+    if (v1AccountAuthority()) return v1CompatCommand("rebind", [accountId], { email });
+    return createRebind(accountId, email);
+  }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/accounts/:id/deactivate", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
-  try { return deactivateAccount(String((request.params as any).id), String((request.body as any)?.reason || "admin_manual")); }
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
+  try {
+    const accountId = String((request.params as any).id);
+    const reason = String((request.body as any)?.reason || "admin_manual");
+    if (v1AccountAuthority()) return v1CompatCommand("deactivate", [accountId], { reason });
+    return deactivateAccount(accountId, reason);
+  }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/accounts/:id/recycle", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
+    const accountId = String((request.params as any).id);
     const body = request.body as any;
-    return recycleAccount(String((request.params as any).id), String(body?.email || ""), String(body?.plan || "free"));
+    if (v1AccountAuthority()) {
+      const id = currentLegacyMappingId(accountId);
+      return (await proxyV1AndSync("/api/admin/mappings/recycle", {
+        method: "POST",
+        body: { ids: [id], mode: String(body?.mode || "deactivated") },
+      })).result;
+    }
+    return body?.mode
+      ? recycleAccountByMode(accountId, String(body.mode))
+      : recycleAccount(accountId, String(body?.email || ""), String(body?.plan || "free"));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/accounts/:id/grants", async (request, reply) => {
@@ -293,89 +651,64 @@ app.get("/api/v2/admin/accounts/:id/grants", async (request, reply) => {
   return { results: listAccountGrants(String((request.params as any).id)) };
 });
 app.post("/api/v2/admin/accounts/:id/grants", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
+    const accountId = String((request.params as any).id);
     const body = request.body as any;
-    return createCustomerGrant(String((request.params as any).id), String(body?.bindingId || ""), body || {});
+    if (v1AccountAuthority()) return v1CompatCommand("grant", [accountId], body || {});
+    return createCustomerGrant(accountId, String(body?.bindingId || ""), body || {});
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.delete("/api/v2/admin/accounts/:id/grants/:grantId", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   const params = request.params as any;
+  if (v1AccountAuthority()) return v1CompatCommand("revoke", [String(params.id)]);
   return revokeCustomerGrant(String(params.id), String(params.grantId)) ? { ok: true } : reply.code(404).send({ error: "授权不存在" });
 });
 app.post("/api/v2/admin/accounts/bulk", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
     const body = request.body as any;
-    return applyBulkAction(Array.isArray(body?.accountIds) ? body.accountIds : [], String(body?.action || ""), body?.value);
+    const accountIds = Array.isArray(body?.accountIds) ? body.accountIds.map(String) : [];
+    const action = String(body?.action || "");
+    if (v1AccountAuthority()) {
+      if (action === "deactivate") return v1CompatCommand("deactivate", accountIds, { reason: "V2 管理后台批量停用" });
+      if (["markColor", "groupBoundary", "hidePromotion"].includes(action)) {
+        const patchKey = action;
+        return v1CompatCommand("patch", accountIds, { patch: { [patchKey]: body?.value } });
+      }
+      const ids = [...new Set(accountIds.map(currentLegacyMappingId))];
+      if (action === "sold") {
+        return (await proxyV1AndSync("/api/admin/mappings/batch-sold", { method: "POST", body: { ids, sold: Boolean(body?.value) } })).result;
+      }
+      if (action === "delete") {
+        return (await proxyV1AndSync("/api/admin/mappings/batch-delete", { method: "POST", body: { ids } })).result;
+      }
+      if (action === "receiveDisabled") {
+        return (await proxyV1AndSync("/api/admin/mappings/batch-receive", {
+          method: "POST", body: { ids, disabled: Boolean(body?.value) },
+        })).result;
+      }
+      return reply.code(400).send({ error: "V1 权威模式不支持这个批量操作" });
+    }
+    return applyBulkAction(accountIds, action, body?.value);
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/import/accounts", async (request, reply) => {
-  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireWrite(reply)) return;
+  if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   const body = request.body as any;
   if (!Array.isArray(body?.accounts)) return reply.code(400).send({ error: "accounts 必须是数组" });
+  if (v1AccountAuthority()) {
+    return (await proxyV1AndSync("/api/v1/accounts/import", { method: "POST", apiKey: true, body: { accounts: body.accounts } })).result;
+  }
   return importAccounts(body.accounts);
 });
 
-async function establishPreset(request: FastifyRequest, reply: FastifyReply, token: string) {
-  if (!consumeRate(request, "preset", 60)) return reply.code(429).send({ error: "请求过多" });
-  const grant = grantByPublicToken(token);
-  if (!grant) return reply.code(404).send({ error: "账号不存在、未授权或仍在管理员确认中" });
-  setSessionCookie(reply, "mail_opus_v2_session", signSession("customer", grant.id));
-  return { ok: true, label: grant.label };
-}
-app.get("/api/preset", async (request, reply) => {
-  return reply.code(405).send({ error: "查询参数授权已停用，请使用新版片段链接" });
-});
-app.post("/api/preset", async (request, reply) => {
-  if (!sameOrigin(request)) return reply.code(403).send({ error: "请求来源不允许" });
-  return establishPreset(request, reply, String((request.body as any)?.m || ""));
-});
-
-app.post("/api/login", async (request, reply) => {
-  if (!consumeRate(request, "customer-login", 20)) return reply.code(429).send({ error: "登录尝试过多" });
-  if (!sameOrigin(request)) return reply.code(403).send({ error: "请求来源不允许" });
-  const body = request.body as any;
-  const grant = authenticateCustomer(String(body?.email || ""), String(body?.password || ""));
-  if (!grant) return reply.code(401).send({ error: "邮箱或密码不正确，或新绑定尚未分配客户权限" });
-  setSessionCookie(reply, "mail_opus_v2_session", signSession("customer", grant.id));
-  return { ok: true, label: grant.label };
-});
-app.post("/api/logout", async (_request, reply) => {
-  reply.clearCookie("mail_opus_v2_session", { path: "/" });
-  return { ok: true };
-});
-app.get("/api/session", async (request, reply) => {
-  const grant = customerGrant(request);
-  return grant ? { ok: true, label: grant.label, hidePromotion: grant.hidePromotion } : reply.code(401).send({ error: "未登录" });
-});
-app.get("/api/mails", async (request, reply) => {
-  const grant = customerGrant(request);
-  if (!grant) return reply.code(401).send({ error: "未登录" });
-  const query = request.query as any;
-  const offset = Math.max(0, Number(query.offset || 0));
-  const limit = Math.max(1, Math.min(30, Number(query.limit || 30)));
-  return { label: grant.label, ...listCustomerMails(grant, offset, limit) };
-});
-app.get("/api/mail-detail", async (request, reply) => {
-  const grant = customerGrant(request);
-  if (!grant) return reply.code(401).send({ error: "未登录" });
-  const message = customerMailDetail(grant, String((request.query as any).id || ""));
-  if (!message) return reply.code(404).send({ error: "邮件不存在或不属于当前授权" });
-  let text = "";
-  if (message.provider === "shared-mail-api") {
-    const upstream = await fetchSharedMessage(String(message.provider_message_id)).catch(() => null);
-    text = upstream?.text || "";
-  } else if (String(message.provider || "").startsWith("outlook:")) {
-    const upstream = await fetchOutlookMessage(
-      String(message._upstreamMailboxEmail || ""),
-      String(message.provider_message_id || ""),
-      String(message.folder || "inbox"),
-    ).catch(() => null);
-    text = upstream?.text || "";
-  }
-  return { ok: true, mail: { from: message.sender, subject: message.subject, created_at: message.received_at, folder: message.folder, text: text || "邮件正文暂时无法从上游读取。" } };
+app.get("/api/share/snapshot", async (request, reply) => {
+  if (!consumeRate(request, "share-snapshot", 120)) return reply.code(429).send({ error: "请求过多，请稍后再试" });
+  const token = String((request.query as any)?.t || (request.query as any)?.token || "");
+  const item = readShareSnapshot(token, request.ip);
+  return item || reply.code(410).send({ error: "分享链接无效、已过期或次数用尽" });
 });
 
 app.get("/api/v2/import/accounts", async (_request, reply) => reply.code(405).send({ error: "请使用POST" }));
@@ -387,6 +720,9 @@ app.post("/api/v2/import/accounts", async (request, reply) => {
   if (!requireWrite(reply)) return;
   const body = request.body as any;
   if (!Array.isArray(body?.accounts)) return reply.code(400).send({ error: "accounts 必须是数组" });
+  if (v1AccountAuthority()) {
+    return (await proxyV1AndSync("/api/v1/accounts/import", { method: "POST", apiKey: true, body: { accounts: body.accounts } })).result;
+  }
   return importAccounts(body.accounts);
 });
 

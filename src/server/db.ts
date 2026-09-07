@@ -4,12 +4,15 @@ import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import { config } from "./config.js";
 import { decryptSecret } from "./crypto.js";
+import { runMigrations } from "./migrations.js";
 
 fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
 export const db = new Database(config.databasePath);
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
-db.pragma("busy_timeout = 5000");
+// A full V1 projection can hold the single SQLite writer for several seconds.
+// Let API and Worker processes serialize instead of surfacing a transient lock.
+db.pragma(`busy_timeout = ${config.sqliteBusyTimeoutMs}`);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -303,6 +306,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE INDEX IF NOT EXISTS idx_accounts_arrived ON gpt_accounts(arrived_at DESC);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON gpt_accounts(lifecycle_status, deactivation_locked, sold);
+CREATE INDEX IF NOT EXISTS idx_accounts_deactivated_at ON gpt_accounts(deactivation_locked, deactivated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bindings_account ON email_bindings(account_id, valid_from);
 CREATE INDEX IF NOT EXISTS idx_bindings_local ON email_bindings(local_part, domain);
 CREATE INDEX IF NOT EXISTS idx_grants_login ON access_grants(login_identifier_hash, active);
@@ -377,3 +381,5 @@ const version = db.prepare("SELECT COALESCE(MAX(version), 0) AS version FROM sch
 if (version.version < 5) {
 	db.prepare("INSERT INTO schema_meta(version, applied_at) VALUES(5, ?)").run(new Date().toISOString());
 }
+
+runMigrations(db);

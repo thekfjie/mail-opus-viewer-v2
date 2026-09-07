@@ -7,6 +7,7 @@ import test from "node:test";
 test("V1 影子同步保留账号标记、账号状态和支付检查结果", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mail-opus-legacy-sync-"));
   const configFile = path.join(directory, "access-config.json");
+  const outboxFile = path.join(directory, "v1-change-outbox.jsonl");
   const backupsDirectory = path.join(directory, "backups");
   const sharedIdentityToken = `x.${Buffer.from(JSON.stringify({ sub: "restore-shared-identity" })).toString("base64url")}.x`;
   fs.mkdirSync(backupsDirectory, { recursive: true });
@@ -87,6 +88,7 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   process.env.V1_CONFIG_FILE = configFile;
   process.env.V1_BACKUPS_DIR = backupsDirectory;
   process.env.V1_MAIL_INDEX_FILE = path.join(directory, "missing-mail-index.json");
+  process.env.V1_CHANGE_OUTBOX_FILE = outboxFile;
   process.env.DATABASE_PATH = path.join(directory, "test.sqlite");
   process.env.V2_SESSION_SECRET = "legacy-sync-test-session";
   process.env.CREDENTIAL_ENCRYPTION_KEY = "legacy-sync-test-encryption";
@@ -95,10 +97,11 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   process.env.ROUTING_LEGACY_EMAILS = "legacy-relay@example.net,archive-relay@example.net";
   process.env.ROUTING_EMAILS = "relay@routing.example.net";
 
-  const [{ db }, repository, { syncFromV1 }] = await Promise.all([
+  const [{ db }, repository, { syncFromV1 }, { consumeV1Outbox }] = await Promise.all([
     import("../src/server/db.js"),
     import("../src/server/repository.js"),
     import("../src/server/legacy-import.js"),
+    import("../src/server/sync-outbox.js"),
   ]);
   t.after(() => db.close());
 
@@ -159,11 +162,59 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   assert.equal(unreviewed.hasAccessToken, false);
   assert.equal(unreviewed.hasRefreshToken, false);
   assert.equal(unreviewed.suspectedUnused, false);
+  db.prepare(`UPDATE gpt_accounts SET lifecycle_status='quarantined', identity_status='conflict',
+    quarantined_at=?, quarantine_reason='secondary projection conflict' WHERE id=?`).run(new Date().toISOString(), unreviewed.id);
+  db.prepare(`INSERT INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, created_at, updated_at)
+    VALUES('secondary-review', 'sub2api_rebind', ?, 'candidate', 'secondary projection conflict', ?, ?)`).run(
+    unreviewed.id, new Date().toISOString(), new Date().toISOString(),
+  );
+  syncFromV1();
+  const v1Restored = db.prepare(`SELECT lifecycle_status, identity_status, quarantined_at, quarantine_reason
+    FROM gpt_accounts WHERE id=?`).get(unreviewed.id) as any;
+  assert.deepEqual(v1Restored, { lifecycle_status: "active", identity_status: "unknown", quarantined_at: "", quarantine_reason: "" });
+  assert.equal((db.prepare("SELECT count(*) count FROM pending_reviews WHERE status='pending'").get() as any).count, 0);
   const directional = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
   assert.ok(directional);
   assert.equal(directional.primaryEmail, "directional@example.net");
   assert.equal(directional.hasAccessToken, true);
   assert.equal(repository.revealCredentials(directional.id)?.accessToken, "new-at-owned-by-new-email");
+  const withoutCurrentCredential = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  const previousCurrent = withoutCurrentCredential.find((item: any) => item.id === "direction-new");
+  previousCurrent.rebindNextId = "direction-newer";
+  previousCurrent.rebindNextEmail = "directional@example.com";
+  previousCurrent.rebindChangedAt = "2026-08-29T00:00:00.000Z";
+  withoutCurrentCredential.push({
+    id: "direction-newer",
+    email: "directional@example.com",
+    domainMailbox: true,
+    bindingVerified: true,
+    rebindPreviousId: "direction-new",
+    rebindPreviousEmail: "directional@example.net",
+    rebindChangedAt: "2026-08-29T01:00:00.000Z",
+    createdAt: "2026-08-29T00:00:00.000Z",
+    updatedAt: "2026-08-29T00:01:00.000Z",
+  });
+  fs.writeFileSync(configFile, JSON.stringify(withoutCurrentCredential));
+  syncFromV1();
+  const directionalMissing = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
+  assert.ok(directionalMissing);
+  assert.equal(directionalMissing.primaryEmail, "directional@example.com");
+  assert.equal(directionalMissing.hasAccessToken, false);
+  // Manual read/copy returns the newest retained AT even when it is invalid;
+  // automated checks still require an alive current credential.
+  assert.equal(repository.revealCredentials(directionalMissing.id)?.accessToken, "new-at-owned-by-new-email");
+  assert.equal(repository.getPaymentExposureCredentials(directionalMissing.id), null);
+  assert.equal((db.prepare(`SELECT cv.validity_status FROM account_current_credentials cc
+    JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(directionalMissing.id) as any).validity_status, "invalid");
+  const sharedCredential = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  sharedCredential.find((item: any) => item.id === "direction-newer").openaiOAuth = { accessToken: "new-at-owned-by-new-email" };
+  fs.writeFileSync(configFile, JSON.stringify(sharedCredential));
+  syncFromV1();
+  const directionalShared = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
+  assert.ok(directionalShared);
+  assert.equal(directionalShared.hasAccessToken, true);
+  assert.equal(repository.revealCredentials(directionalShared.id)?.accessToken, "new-at-owned-by-new-email");
+  assert.equal((db.prepare("SELECT count(*) count FROM credential_versions WHERE account_id=?").get(directionalShared.id) as any).count, 1);
   const restored = repository.listAccounts({ search: "restore-current", limit: 10 }).results[0];
   assert.ok(restored);
   assert.equal(restored.primaryEmail, "restore-current@icloud.com");
@@ -185,4 +236,22 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   assert.equal(secondSync.paymentExposureRestoredCount, 1);
   assert.equal(secondSync.promoEligibilityRestoredCount, 1);
   assert.equal(repository.getPaymentExposureJob(accountAfter.id, "exposure-sync-job")?.status, "running");
+
+  const event = (id: string) => JSON.stringify({
+    eventId: id, aggregateType: "mapping_collection", aggregateId: "access-config", aggregateVersion: 1,
+    eventType: "mapping_collection_changed", occurredAt: "2026-09-02T00:00:00.000Z",
+    payload: { sourceRevision: id, changedIds: [id], deletedIds: [], count: 1 },
+  });
+  const first = `${event("outbox-1")}\n`;
+  const second = `${event("outbox-2")}\n`;
+  fs.writeFileSync(outboxFile, `${first}${second.slice(0, 20)}`);
+  assert.deepEqual(consumeV1Outbox(), { consumed: 1, cursor: Buffer.byteLength(first), reset: false });
+  fs.appendFileSync(outboxFile, second.slice(20));
+  assert.deepEqual(consumeV1Outbox(), { consumed: 1, cursor: Buffer.byteLength(first + second), reset: false });
+  assert.equal(consumeV1Outbox().consumed, 0);
+  fs.writeFileSync(outboxFile, `${event("x")}\n`);
+  const replay = consumeV1Outbox();
+  assert.equal(replay.reset, true);
+  assert.equal(replay.consumed, 1);
+  assert.equal((db.prepare("SELECT count(*) count FROM change_outbox WHERE source_system='v1'").get() as any).count, 3);
 });

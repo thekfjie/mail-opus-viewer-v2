@@ -41,9 +41,9 @@ test("支付方式检查按 OpenAI subject hash 批量匹配并安全 upsert", a
   });
 
   const account = repository.listAccounts({ limit: 10 }).results[0];
-  assert.equal(account.paymentExposureStatus, "exposed");
-  assert.equal(account.paymentExposureCount, 3);
-  assert.equal(account.paymentExposureExposedCount, 2);
+  assert.equal(account.paymentExposureStatus, "never");
+  assert.equal(account.paymentExposureCount, 0);
+  assert.equal(account.paymentExposureExposedCount, 0);
   assert.equal(account.paymentExposureUnknownCount, 0);
 
   const changed = repository.ingestPaymentExposureChecks([{
