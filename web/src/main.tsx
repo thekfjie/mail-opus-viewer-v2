@@ -1,5 +1,11 @@
 import React, { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { customerGrantBlockReason } from "../../src/shared/customer-access-policy";
+import type { MailHealth } from "../../src/shared/mail-health";
+import { MailHealthPanel } from "./mail-health";
+import { accountRowStatusClass, lifecycleLabel, lifecycleTone, promotionCheckUnavailableReason } from "./account-status";
+import { RecycleEligibilityPanel, recycleConfirmationMessage, type RecycleMode } from "./recycle-eligibility";
+import { accountSearchFromQuery } from "./admin-query";
 import {
   Activity,
   AtSign,
@@ -34,8 +40,11 @@ import type {
   AccountSummary,
   CheckRouteSummary,
   PaymentEligibilityApiSummary,
+  PaymentExposureCheck,
   PaymentExposureJobStatus,
+  PaymentExposurePromoMode,
   PaymentExposureRoute,
+  RecycleEligibility,
 } from "../../src/shared/types";
 import {
   adminLoadStatusText,
@@ -159,8 +168,15 @@ function fmtBeijing(value: string): string {
     : value;
 }
 
-function Badge({ tone = "neutral", children }: { tone?: string; children: React.ReactNode }) {
-  return <span className={`badge ${tone}`}>{children}</span>;
+function Badge({ tone = "neutral", children, title }: { tone?: string; children: React.ReactNode; title?: string }) {
+  return <span className={`badge ${tone}`} title={title}>{children}</span>;
+}
+
+function OpusBrand({ className = "", compact = false }: { className?: string; compact?: boolean }) {
+  return <span className={`opus-brand ${className}`.trim()} aria-label="Opusmail v2">
+    <span className="opus-brand-icon" aria-hidden="true" />
+    <span className="opus-brand-copy"><strong>Opusmail<sup>v2</sup></strong>{!compact && <small>账号与邮件管理</small>}</span>
+  </span>;
 }
 
 const paymentMethodLabels: Record<string, string> = {
@@ -171,6 +187,7 @@ const paymentMethodLabels: Record<string, string> = {
   blik: "BLIK",
   momo: "MoMo",
   kakao: "Kakao Pay",
+  naver: "Naver Pay",
   upi: "UPI",
   pix: "PIX",
   twint: "TWINT",
@@ -205,6 +222,7 @@ const billingChannelLabels: Record<string, string> = {
   "vn-momo": "越南 MoMo",
   "ch-twint": "瑞士 TWINT",
   "kr-kakao": "韩国 KAKAO",
+  "kr-naver": "韩国 NAVER",
   "pl-blik": "波兰 BLIK",
 };
 const billingChannelBadgeLabels: Record<string, string> = {
@@ -222,6 +240,7 @@ const billingChannelBadgeLabels: Record<string, string> = {
   "vn-momo": "MOMO",
   "ch-twint": "TWINT",
   "kr-kakao": "KAKAO",
+  "kr-naver": "NAVER",
   "pl-blik": "BLIK",
 };
 const billingChannelFilterOptions = [
@@ -239,6 +258,7 @@ const billingChannelFilterOptions = [
   ["vn-momo", "越南 MoMo"],
   ["ch-twint", "瑞士 TWINT"],
   ["kr-kakao", "韩国 KAKAO"],
+  ["kr-naver", "韩国 NAVER"],
   ["pl-blik", "波兰 BLIK"],
   ["unknown", "渠道待确认"],
 ] as const;
@@ -249,6 +269,7 @@ function paymentMethodLabel(value: string): string {
 }
 
 function lifecycleEventLabel(value: string): string {
+  if (value === "plus_trial_only_corrected") return "零元试用 Plus 已纠正";
   if (value === "email_rebind_notice_detected") return "检测到换绑邮件";
   if (value === "email_binding_changed") return "邮箱绑定已变更";
   if (value === "email_binding_imported") return "导入邮箱绑定";
@@ -350,6 +371,124 @@ function billingChannelStatusTone(item: Pick<AccountSummary, "plan" | "billingCh
   return item.billingChannel ? "blue" : "yellow";
 }
 
+function accountHasBilling(item: Pick<AccountSummary, "plan" | "billingChannel" | "billingStartedAt">): boolean {
+  return String(item.plan || "").toLowerCase() === "plus" || Boolean(item.billingChannel) || Boolean(item.billingStartedAt);
+}
+
+interface PaymentMethodDisplayItem { method: string; sources: string[]; promoMode?: PaymentExposurePromoMode }
+
+function paymentMethodSourceLabel(value: string): string {
+  switch (String(value || "").trim().toLowerCase()) {
+    case "checkout":
+    case "customer_subscription":
+    case "stripe":
+    case "stripe_live": return "cs";
+    case "oaics_custom": return "oaics";
+    case "eligibility_api": return "api";
+    case "local_extractor": return "local";
+    default: return String(value || "").trim().toLowerCase();
+  }
+}
+
+function uniqueMethodSources(values: string[]): string[] {
+  return [...new Set(values.flatMap((value) => String(value || "").split(/[,|>→]+/))
+    .map(paymentMethodSourceLabel).filter(Boolean))];
+}
+
+function paymentMethodSingleSource(sources: string[]): string {
+  const allowed = new Set(["oaics", "cs"]);
+  const normalized = uniqueMethodSources(sources);
+  // OAICS is the outer checkout chain. When both the generic checkout marker
+  // (cs) and OAICS are present, the chain must be attributed to OAICS.
+  return ["oaics", "cs"].find((source) => normalized.includes(source) && allowed.has(source)) || "";
+}
+
+function visiblePaymentMethodItems(items: PaymentMethodDisplayItem[]): PaymentMethodDisplayItem[] {
+  // The compact account-list tag is intentionally limited to actionable,
+  // provider-specific methods. Generic wallet/card rails are still retained
+  // in the detailed observation, but must not crowd the summary tag row.
+  const excluded = new Set(["card", "link", "apple_pay", "google_pay"]);
+  return items.filter((item) => !excluded.has(item.method.toLowerCase())).slice(0, 6);
+}
+
+function paymentMethodColorClass(value: string): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["momo", "momo_wallet"].includes(normalized)) return "method-momo";
+  if (["ideal", "paypal", "gcash", "gopay", "pix", "upi", "twint", "kakao", "naver", "blik", "card", "link", "apple_pay", "google_pay"].includes(normalized)) {
+    return `method-${normalized}`;
+  }
+  return "";
+}
+
+function paymentExposureMethodItems(item: Pick<AccountSummary, "paymentExposureMethods" | "paymentExposureMethodDetails">): PaymentMethodDisplayItem[] {
+  const details = Array.isArray(item.paymentExposureMethodDetails) ? item.paymentExposureMethodDetails : [];
+  const promoRank = (mode: PaymentExposurePromoMode | undefined): number => mode === "one_month" ? 2 : mode === "none" ? 1 : 0;
+  const result: PaymentMethodDisplayItem[] = [];
+  for (const detail of details) {
+    const candidate = {
+      method: String(detail.method || "").trim(),
+      sources: uniqueMethodSources(detail.sources || []),
+      promoMode: detail.promoMode,
+    };
+    if (!candidate.method) continue;
+    const existing = result.find((entry) => entry.method.toLowerCase() === candidate.method.toLowerCase());
+    if (!existing) result.push(candidate);
+    else if (promoRank(candidate.promoMode) > promoRank(existing.promoMode)) {
+      existing.promoMode = candidate.promoMode;
+      existing.sources = uniqueMethodSources([...existing.sources, ...candidate.sources]);
+    } else {
+      existing.sources = uniqueMethodSources([...existing.sources, ...candidate.sources]);
+    }
+  }
+  for (const method of item.paymentExposureMethods || []) {
+    const normalized = String(method || "").trim();
+    if (normalized && !result.some((detail) => detail.method.toLowerCase() === normalized.toLowerCase())) {
+      result.push({ method: normalized, sources: [], promoMode: "unknown" });
+    }
+  }
+  const priority = ["momo", "momo_wallet", "ideal", "paypal", "gcash", "gopay", "upi", "kakao", "naver", "card", "link", "apple_pay", "google_pay"];
+  return result.sort((left, right) => {
+    const leftIndex = priority.indexOf(left.method.toLowerCase());
+    const rightIndex = priority.indexOf(right.method.toLowerCase());
+    return (leftIndex < 0 ? priority.length : leftIndex) - (rightIndex < 0 ? priority.length : rightIndex);
+  });
+}
+
+function paymentExposureCheckMethodItems(check: PaymentExposureCheck): PaymentMethodDisplayItem[] {
+  const result: PaymentMethodDisplayItem[] = [];
+  for (const method of check.paymentMethods || []) {
+    const name = String(method.type || method.code || method.name || method.displayName || method.id || "").trim();
+    if (!name) continue;
+    const promoMode = method.promoMode || check.promoMode || "unknown";
+    const existing = result.find((item) => item.method.toLowerCase() === name.toLowerCase() && item.promoMode === promoMode);
+    const sources = uniqueMethodSources([...(method.sources || []), method.source]);
+    if (existing) existing.sources = uniqueMethodSources([...existing.sources, ...sources]);
+    else result.push({ method: name, sources, promoMode });
+  }
+  for (const method of check.availableMethods || []) {
+    const normalized = String(method || "").trim();
+    if (normalized && !result.some((item) => item.method.toLowerCase() === normalized.toLowerCase())) {
+      result.push({ method: normalized, sources: [], promoMode: check.promoMode || "unknown" });
+    }
+  }
+  return result;
+}
+
+function PaymentMethodChips({ items, compact = false }: { items: PaymentMethodDisplayItem[]; compact?: boolean }) {
+  return <div className={`method-chip-list ${compact ? "compact" : ""}`}>
+    {visiblePaymentMethodItems(items).map((item) => {
+      const source = paymentMethodSingleSource(item.sources);
+      const promoClass = item.promoMode === "one_month" ? "promo-one-month" : item.promoMode === "none" ? "promo-none" : "promo-unknown";
+      const promoLabel = item.promoMode === "one_month" ? "1 month 优惠探查" : item.promoMode === "none" ? "无优惠探查" : "历史探查（模式未知）";
+      return <span className={`method-chip ${promoClass} ${paymentMethodColorClass(item.method)} ${source ? `source-${source}` : ""}`.trim()} title={promoLabel} key={`${item.method}-${item.promoMode || "unknown"}`}>
+        {source && <span className="method-chip-source">{source}:</span>}
+        <code>{paymentMethodLabel(item.method)}</code>
+        {item.promoMode === "one_month" && <span className="method-chip-promo" aria-label="1 month 优惠">1M</span>}
+      </span>;
+    })}
+  </div>;
+}
+
 function paymentExposureTone(status: string, exposed = false): string {
   if (status !== "complete") return "yellow";
   return exposed ? "green" : "gray";
@@ -393,20 +532,6 @@ function exposureJobStatusTone(value: string): string {
   }
 }
 
-function lifecycleLabel(item: AccountSummary): string {
-  if (item.deactivationLocked) return "永久停用";
-  if (item.lifecycleStatus === "quarantined") return item.identityStatus === "conflict" ? "凭证归属冲突" : "归属待核对";
-  if (item.lifecycleStatus === "retired") return "历史回收";
-  return "活跃";
-}
-
-function lifecycleTone(item: AccountSummary): string {
-  if (item.deactivationLocked) return "red";
-  if (item.lifecycleStatus === "quarantined") return "yellow";
-  if (item.lifecycleStatus === "retired") return "gray";
-  return "green";
-}
-
 function providerLabel(value: string): string {
   const provider = String(value || "").toLowerCase();
   if (provider === "icloud") return "iCloud";
@@ -442,12 +567,6 @@ function promotionCampaignClass(value: string): string {
 
 function promotionCheckActive(status: string): boolean {
   return ["queued", "running", "dispatching"].includes(String(status || ""));
-}
-
-function promotionCheckUnavailableReason(item: Pick<AccountSummary, "plan" | "lifecycleStatus" | "deactivationLocked">): string {
-  if (item.lifecycleStatus !== "active" || item.deactivationLocked) return "账号已停用，无需检测优惠";
-  if (String(item.plan || "").toLowerCase() === "plus") return "Plus 已开通，无需检测优惠";
-  return "";
 }
 
 function PromotionStatusCell({ item }: { item: AccountSummary }) {
@@ -494,6 +613,7 @@ function PaymentExposureSection({
   autoTrialStatus,
   autoTrialDueAt,
   plan,
+  billingKnown,
   lifecycleStatus,
   deactivationLocked,
   readOnly,
@@ -509,7 +629,8 @@ function PaymentExposureSection({
   autoTrialStatus: string;
   autoTrialDueAt: string;
   plan: string;
-  lifecycleStatus: string;
+  billingKnown: boolean;
+  lifecycleStatus: AccountSummary["lifecycleStatus"];
   deactivationLocked: boolean;
   readOnly: boolean;
   onRefresh: () => void | Promise<void>;
@@ -518,6 +639,7 @@ function PaymentExposureSection({
   const [promotionRoute, setPromotionRoute] = useState<CheckRouteSummary | null>(null);
   const [eligibilityApi, setEligibilityApi] = useState<PaymentEligibilityApiSummary | null>(null);
   const [selectedRoute, setSelectedRoute] = useState("");
+  const [paymentPromoMode, setPaymentPromoMode] = useState<Exclude<PaymentExposurePromoMode, "unknown">>("none");
   const [job, setJob] = useState<PaymentExposureJobStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [trialStarting, setTrialStarting] = useState(false);
@@ -644,7 +766,7 @@ function PaymentExposureSection({
     setStarting(true); setError("");
     try {
       const next = await api<PaymentExposureJobStatus>(`/api/v2/admin/accounts/${accountId}/payment-exposure-check`, {
-        method: "POST", body: JSON.stringify({ routeKey: selected.key }),
+        method: "POST", body: JSON.stringify({ routeKey: selected.key, promoMode: paymentPromoMode }),
       });
       setJob(next);
     } catch (reason) {
@@ -759,7 +881,8 @@ function PaymentExposureSection({
     }
   };
   const liveChecks = job?.items.flatMap((item) => item.paymentExposure || []) || [];
-  const eligibilityChecks = checks.filter((check) => check.checkoutType === "eligibility_api");
+  const eligibilityChecks = checks.filter((check) => ["eligibility_api", "local_extractor"].includes(check.checkoutType));
+  const localExtractorReady = routes.length > 0 && routes.every((route) => route.configured);
   const evidence = promotion?.evidence && typeof promotion.evidence === "object" ? promotion.evidence as Record<string, any> : {};
   const promotionCampaigns = Array.isArray(evidence.campaigns)
     ? evidence.campaigns.map((item: any) => String(item?.id || "").trim()).filter(Boolean)
@@ -784,39 +907,35 @@ function PaymentExposureSection({
       <div className="payment-exposure-auto-status"><span>自动优惠检测：<Badge tone={autoTrialStatus === "completed" ? "green" : ["queued", "running", "dispatching"].includes(autoTrialStatus) ? "blue" : autoTrialStatus === "failed" ? "red" : "gray"}>{exposureJobStatusLabel(autoTrialStatus === "not_scheduled" ? "unknown" : autoTrialStatus)}</Badge></span>{autoTrialDueAt && <small>首次 AT {fmt(autoTrialDueAt)} 前后执行</small>}</div>
     </div>
     </section>
-    <section className="payment-method-panel">
-    <div className="payment-exposure-heading payment-method-heading"><div><h3>支付资格接口检测</h3><small>每次只请求一次资格接口；不会创建 Checkout，也不会访问 Stripe 支付流程</small></div><span>{eligibilityChecks.length ? `最近 ${eligibilityChecks.length} 项` : "暂无结果"}</span></div>
-    <div className="promotion-route-row"><span><Badge tone={eligibilityApi?.configured ? "green" : "red"}>API</Badge><strong>资格检查接口</strong><small className={eligibilityApi?.configured ? "route-ready" : "route-missing"}>{eligibilityApi?.configured ? `${eligibilityApi.endpoint} · ${eligibilityApi.source === "saved" ? "后台长期配置" : eligibilityApi.source === "default" ? "系统默认" : "环境配置"}${eligibilityApi.hasApiToken ? " · 已配置接口令牌" : ""}` : "未配置"}</small></span><button onClick={() => setEligibilityConfigOpen((value) => !value)}>{eligibilityConfigOpen ? "收起配置" : "管理接口"}</button></div>
-    {eligibilityConfigOpen && <div className="check-route-editor eligibility-api-editor">
-      <input aria-label="支付资格检查接口地址" type="url" autoComplete="off" value={eligibilityEndpoint} onChange={(event) => setEligibilityEndpoint(event.target.value)} placeholder="https://example.com/api/v1/check" />
-      <input aria-label="支付资格检查接口令牌" type="password" autoComplete="off" value={eligibilityApiToken} onChange={(event) => setEligibilityApiToken(event.target.value)} placeholder={eligibilityApi?.hasApiToken ? "留空保留现有接口令牌" : "接口令牌（如接口不需要可留空）"} />
-      <button disabled={eligibilitySaving} onClick={() => void revealEligibilityApiConfig()}>读取完整当前配置</button>
-      <button className="primary" disabled={!eligibilityEndpoint.trim() || eligibilitySaving} onClick={() => void saveEligibilityApiConfig()}>{eligibilitySaving ? "保存中…" : "长期保存"}</button>
-      <button disabled={eligibilitySaving || eligibilityApi?.source !== "saved"} onClick={() => void resetEligibilityApiConfig()}>恢复系统默认</button>
-      <small>接口地址和令牌加密落盘；登录管理员可读取完整原文。这里只配置资格 API，不配置支付页。留空令牌会保留已保存值。</small>
-      {eligibilityConfigFeedback && <small className="route-ready" role="status">{eligibilityConfigFeedback}</small>}
-    </div>}
+    {!billingKnown && <section className="payment-method-panel">
+    <div className="payment-exposure-heading payment-method-heading"><div><h3>支付资格检测</h3><small>可选择无优惠或带 1 month 优惠创建一次只读 Checkout，读取支付 method 后立即停止；不创建 PaymentMethod，不 confirm 或 approve</small></div><span>{eligibilityChecks.length ? `最近 ${eligibilityChecks.length} 项` : "暂无结果"}</span></div>
+    <div className="promotion-route-row"><span><Badge tone={localExtractorReady ? "green" : "red"}>LOCAL</Badge><strong>本机支付方式提炼</strong><small className={localExtractorReady ? "route-ready" : "route-missing"}>{localExtractorReady ? "已接入全部支付方式 · 代理跟随提炼侧配置" : "本机提炼服务未就绪"}</small></span></div>
     <div className="payment-exposure-controls">
       <select aria-label="选择支付资格项目" value={selectedRoute} onChange={(event) => setSelectedRoute(event.target.value)} disabled={starting || jobRunning || !routes.length}>
         {!routes.length && <option value="">正在读取资格项目…</option>}
         {routes.length > 0 && <option value="">选择一个资格项目</option>}
-        {routes.map((route) => <option key={route.key} value={route.key} disabled={!route.configured}>{paymentMethodLabel(route.expectedMethod)} · 读取 {route.target}_eligible</option>)}
+      {routes.map((route) => <option key={route.key} value={route.key} disabled={!route.configured}>{paymentMethodLabel(route.expectedMethod)} · 本机探查</option>)}
+      </select>
+      <select aria-label="选择支付方式探查优惠模式" value={paymentPromoMode} onChange={(event) => setPaymentPromoMode(event.target.value as Exclude<PaymentExposurePromoMode, "unknown">)} disabled={starting || jobRunning}>
+        <option value="none">无优惠</option>
+        <option value="one_month">带 1 month 优惠</option>
       </select>
       <button className="primary" disabled={!selected?.configured || starting || jobRunning} onClick={() => void start()}>{starting ? "请求中…" : jobRunning ? "检测进行中…" : "检测所选资格"}</button>
-      {selected && <span className={selected.configured ? "route-ready" : "route-missing"}>{selected.configured ? `接口已就绪 · 本次只保存 ${selected.target}_eligible 及原因` : "请先配置资格检查接口"}</span>}
+      {selected && <span className={selected.configured ? "route-ready" : "route-missing"}>{selected.configured ? `本机提炼已就绪 · ${paymentPromoMode === "one_month" ? "带 1 month 优惠" : "无优惠"} · 只保存 ${selected.target} 的观察结果 · 代理跟随提炼侧配置` : "请先配置对应检查服务"}</span>}
       {!selected && routes.length > 0 && <span className="route-missing">请选择一个要检测的支付资格</span>}
     </div>
-    {job && <div className="payment-exposure-job"><div className="payment-exposure-job-heading"><span><Badge tone={exposureJobStatusTone(job.status)}>{exposureJobStatusLabel(job.status)}</Badge><span>{job.route.label}</span></span><small>{job.jobId}</small></div>{job.items.map((item) => <div className="payment-exposure-job-item" key={`${job.jobId}-${item.index}`}><span>资格接口请求</span><span>{item.stage === "eligibility_api" ? "接口读取" : item.stage || item.extractionStatus || "等待阶段"}</span><span>{item.finishedAt ? fmt(item.finishedAt) : "进行中"}</span></div>)}{job.pollError && <small className="route-missing">{job.pollError}</small>}{liveChecks.length > 0 && <div className="payment-exposure-live-methods">{liveChecks.map((check) => <span key={check.id}><Badge tone={paymentExposureTone(check.status, check.exposed)}>{paymentMethodLabel(check.target)} · {paymentExposureLabel(check.status, check.exposed)}</Badge></span>)}</div>}</div>}
+    {job && <div className="payment-exposure-job"><div className="payment-exposure-job-heading"><span><Badge tone={exposureJobStatusTone(job.status)}>{exposureJobStatusLabel(job.status)}</Badge><span>{job.route.label}</span></span><small>{job.jobId}</small></div>{job.items.map((item) => <div className="payment-exposure-job-item" key={`${job.jobId}-${item.index}`}><span>本机支付方式探查</span><span>{item.stage === "payment_method_exposure" ? `${job.promoMode === "one_month" ? "1 month 优惠" : "无优惠"} method 观察` : item.stage || item.extractionStatus || "等待阶段"}</span><span>{item.finishedAt ? fmt(item.finishedAt) : "进行中"}</span></div>)}{job.pollError && <small className="route-missing">{job.pollError}</small>}{liveChecks.length > 0 && <div className="payment-exposure-live-methods">{liveChecks.map((check) => <span key={check.id}><Badge tone={paymentExposureTone(check.status, check.exposed)}>{paymentMethodLabel(check.target)} · {paymentExposureLabel(check.status, check.exposed)}</Badge></span>)}</div>}</div>}
     {eligibilityChecks.length ? <div className="payment-exposure-list">{eligibilityChecks.map((check) => <div className="payment-exposure-row" key={check.id}>
-      <div className="payment-exposure-target"><strong>{paymentMethodLabel(check.target)}</strong><small>资格字段：{check.target}_eligible</small></div>
+      <div className="payment-exposure-target"><strong>{paymentMethodLabel(check.target)}</strong><small>{check.checkoutType === "local_extractor" ? `本机提炼：${check.promoMode === "one_month" ? "1 month 优惠" : check.promoMode === "none" ? "无优惠" : "历史"} method 观察` : `旧资格字段：${check.target}_eligible`}</small></div>
       <div><Badge tone={paymentExposureTone(check.status, check.exposed)}>{paymentExposureLabel(check.status, check.exposed)}</Badge><Badge tone="blue">{check.status}</Badge></div>
       <div className="payment-exposure-methods">
-        <span>接口资格结果</span>
-        <small>{check.detail || (check.status === "complete" ? check.exposed ? "eligible" : "ineligible" : "接口未返回该资格字段")}</small>
+        <span>支付方式观察结果</span>
+        {paymentExposureCheckMethodItems(check).length > 0 && <PaymentMethodChips items={paymentExposureCheckMethodItems(check)} />}
+        <small>{check.detail || (check.status === "complete" ? check.exposed ? "已暴露" : "未暴露" : "未返回明确 method 列表")}</small>
       </div>
-      <div className="payment-exposure-meta"><span>资格接口</span><time>{fmt(check.observedAt || check.updatedAt)}</time></div>
-    </div>)}</div> : <p className="muted">该账号尚未完成支付资格接口检测。</p>}
-    </section>
+      <div className="payment-exposure-meta"><span>{check.checkoutType === "local_extractor" ? "本机提炼" : "资格接口"}</span><time>{fmt(check.observedAt || check.updatedAt)}</time></div>
+    </div>)}</div> : <p className="muted">该账号尚未完成本机支付方式探查。</p>}
+    </section>}
     {error && <div className="payment-exposure-error">{error}</div>}
   </section>;
 }
@@ -830,7 +949,7 @@ function AdminLogin({ onDone }: { onDone: () => void }) {
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   };
   return <main className="login-shell"><form className="login-panel" onSubmit={submit}>
-    <div className="brand-mark">O</div><h1>Opus Mail V2</h1><p>独立影子后台</p>
+    <OpusBrand className="admin-login-brand" /><p>独立管理后台</p>
     <input autoFocus type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="后台口令" />
     <button className="primary" type="submit">登录</button>{error && <div className="error">{error}</div>}
   </form></main>;
@@ -862,11 +981,40 @@ interface PromotionBatchProgress {
   failed: number;
   status: "running" | "completed" | "error";
 }
+interface PersistedPaymentExposureBatch {
+  total: number;
+  skipped: number;
+  failed: number;
+  jobs: Array<{ accountId: string; jobId: string }>;
+  savedAt: number;
+}
+const PAYMENT_EXPOSURE_BATCH_SESSION_KEY = "opus-v2-payment-exposure-batch";
+
+function readPersistedPaymentExposureBatch(): PersistedPaymentExposureBatch | null {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(PAYMENT_EXPOSURE_BATCH_SESSION_KEY) || "null") as PersistedPaymentExposureBatch | null;
+    if (!parsed || !Array.isArray(parsed.jobs) || !parsed.jobs.length || parsed.jobs.length > 24) return null;
+    if (!Number.isFinite(parsed.savedAt) || Date.now() - parsed.savedAt > 24 * 60 * 60 * 1000) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+function persistPaymentExposureBatch(value: PersistedPaymentExposureBatch | null): void {
+  try {
+    if (value) sessionStorage.setItem(PAYMENT_EXPOSURE_BATCH_SESSION_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(PAYMENT_EXPOSURE_BATCH_SESSION_KEY);
+  } catch { /* 后台 Worker 仍会接管远程任务。 */ }
+}
 const PAGE_SIZE = 24;
 const DEFAULT_ACCOUNT_FILTERS = {
   search: "", range: "all", status: "", provider: "", billingChannel: "", sold: "", plan: "", credential: "",
   sourceStatus: "", unused: "", redGroup: "", markColor: "", pending: "exclude", workbench: "", deactivationWindow: "",
 };
+
+function initialAccountFilters() {
+  const search = accountSearchFromQuery(window.location.search);
+  return { ...DEFAULT_ACCOUNT_FILTERS, search };
+}
 
 function OutlookFreeWorkbench() {
   const [data, setData] = useState<Record<string, any> | null>(null);
@@ -925,6 +1073,9 @@ function ImportWorkbench({ readOnly, onRefresh }: { readOnly: boolean; onRefresh
         const parsed = JSON.parse(text); const accounts = Array.isArray(parsed) ? parsed : parsed?.accounts;
         if (!Array.isArray(accounts)) throw new Error("JSON 必须是账号数组或包含 accounts 数组");
         body = { accounts };
+      } else if (mode === "third-party-file") {
+        url = "/api/v2/admin/import/third-party-file";
+        body = { paths: text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean) };
       } else {
         url = mode === "outlook" ? "/api/v2/admin/import/outlook"
           : mode === "session" ? "/api/v2/admin/import/session"
@@ -935,8 +1086,9 @@ function ImportWorkbench({ readOnly, onRefresh }: { readOnly: boolean; onRefresh
       if (mode !== "transfer" || applyTransfer) onRefresh();
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   };
-  return <section className="report-panel import-panel"><header className="workbench-heading"><div><h2>账号与凭证导入</h2><p className="muted">逐行错误会保留；AT、RT、Session 和 Outlook 密钥只进入内部凭证链</p></div><select value={mode} onChange={(event) => { setMode(event.target.value); setResult(null); }}><option value="json">JSON / API</option><option value="outlook">Outlook 4/6 段</option><option value="session">OpenAI Session</option><option value="transfer">Outlook 转移</option></select></header>
-    <textarea value={text} onChange={(event) => setText(event.target.value)} spellCheck={false} />
+  return <section className="report-panel import-panel"><header className="workbench-heading"><div><h2>账号与凭证导入</h2><p className="muted">逐行错误会保留；AT、RT、Session 和 Outlook 密钥只进入内部凭证链</p></div><select value={mode} onChange={(event) => { const next = event.target.value; setMode(next); if (next === "third-party-file") setText(""); setResult(null); }}><option value="json">JSON / API</option><option value="outlook">Outlook 4/6 段</option><option value="session">OpenAI Session</option><option value="third-party-file">注册材料（自动识别）</option><option value="transfer">Outlook 转移</option></select></header>
+    {mode === "third-party-file" && <p className="muted">每行一个文件路径；支持“邮箱----密码”、OpenAI Session JSONL、加密注册导出 + Base64 密钥。可单独导入，也可多选后按邮箱自动互补。</p>}
+    <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={mode === "third-party-file" ? "/var/lib/drop/files/文件1\n/var/lib/drop/files/文件2" : undefined} spellCheck={false} />
     <div className="row-actions"><button className="primary" disabled={readOnly} onClick={() => void run(false)}>{mode === "transfer" ? "预览转移" : "开始导入"}</button>{mode === "transfer" && <button disabled={readOnly || !result} onClick={() => void run(true)}>确认转移</button>}</div>
     {error && <div className="error">{error}</div>}{result && <pre>{JSON.stringify(result, null, 2)}</pre>}
   </section>;
@@ -994,11 +1146,44 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
   const [recentMails, setRecentMails] = useState<any[]>([]);
   const [recentMail, setRecentMail] = useState<any>(null);
   const [verificationCode, setVerificationCode] = useState("");
+  const [recycleEligibility, setRecycleEligibility] = useState<RecycleEligibility | null>(null);
+  const [recycleLoading, setRecycleLoading] = useState(false);
+  const [recycleBusy, setRecycleBusy] = useState(false);
+  const [recycleError, setRecycleError] = useState("");
+  const recycleRequest = useRef<{ id: string; sequence: number; controller?: AbortController }>({ id, sequence: 0 });
+  const loadRecycleEligibility = async () => {
+    recycleRequest.current.controller?.abort();
+    const controller = new AbortController();
+    const sequence = recycleRequest.current.sequence + 1;
+    recycleRequest.current = { id, sequence, controller };
+    setRecycleLoading(true); setRecycleError("");
+    const current = () => !controller.signal.aborted && recycleRequest.current.id === id && recycleRequest.current.sequence === sequence;
+    try {
+      const data = await api<RecycleEligibility>(`/api/v2/admin/accounts/${id}/recycle-eligibility`, { signal: controller.signal });
+      if (current() && data.accountId === id) setRecycleEligibility(data);
+      else if (current()) throw new Error("账号已切换，请重新核对回收资格");
+    } catch (reason) { if (current()) { setRecycleEligibility(null); setRecycleError(reason instanceof Error ? reason.message : String(reason)); } }
+    finally { if (current()) setRecycleLoading(false); }
+  };
   const loadDetail = () => Promise.all([
     api<AccountDetail>(`/api/v2/admin/accounts/${id}`),
     api<{ results: Array<Record<string, any>> }>(`/api/v2/admin/accounts/${id}/grants`),
   ]).then(([account, grantData]) => { setDetail(account); setGrants(grantData.results); }).catch((e) => setError(e.message));
   useEffect(() => { void loadDetail(); }, [id]);
+  useEffect(() => {
+    setRecycleEligibility(null); setRecycleError("");
+    return () => { recycleRequest.current.controller?.abort(); };
+  }, [id]);
+  const executeRecycle = async (mode: RecycleMode) => {
+    if (readOnly || recycleLoading || recycleBusy || recycleError || recycleEligibility?.accountId !== id || !recycleEligibility?.modes[mode]?.eligible || !detail) return;
+    if (!confirm(recycleConfirmationMessage(mode, detail.primaryEmail))) return;
+    setRecycleBusy(true); setRecycleError(""); setResult(null);
+    try {
+      const output = await api<Record<string, unknown>>(`/api/v2/admin/accounts/${id}/recycle`, { method: "POST", body: JSON.stringify({ mode, confirmRevokeCustomerAccess: true }) });
+      setResult(output); await loadDetail(); onRefresh();
+    } catch (reason) { setRecycleError(reason instanceof Error ? reason.message : String(reason)); }
+    finally { setRecycleBusy(false); setRecycleEligibility(null); }
+  };
   const write = async (url: string, method: string, body: unknown) => {
     setError(""); setResult(null);
     try {
@@ -1026,7 +1211,7 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
       setCredentials({
         accessToken: String(loaded.accessToken || ""), refreshToken: String(loaded.refreshToken || ""),
         idToken: String(loaded.idToken || ""), sessionToken: String(loaded.sessionToken || ""),
-        openaiPassword: String(loaded.openaiPassword || ""),
+        openaiPassword: String(loaded.openaiPassword || ""), totpSecret: String(loaded.totpSecret || ""),
       });
       setCredentialEditorOpen(true);
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
@@ -1040,7 +1225,7 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
       });
       const syncing = output.syncPending === true;
       setCredentialEditorOpen(false);
-      setCredentialSaveFeedback(syncing ? "凭证已保存到 V1，V2 正在后台同步" : "凭证保存成功");
+      setCredentialSaveFeedback(syncing ? "凭证已保存，后台正在更新状态" : "凭证保存成功");
       if (syncing) {
         window.setTimeout(() => { void loadDetail(); onRefresh(); }, 8_000);
       } else {
@@ -1073,8 +1258,7 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
       if (code) await onCopy("验证码复制成功", code, "最新验证码");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   };
-  const canIssueGrant = detail.lifecycleStatus === "active" && !detail.deactivationLocked && detail.identityStatus !== "conflict"
-    && (!detail.everSold || detail.saleStatus === "active");
+  const canIssueGrant = !customerGrantBlockReason(detail);
   const currentCredential = detail.credentialVersions.find((version) => version.current);
   const activeGrantCount = grants.filter((grant) => grant.active).length;
   const promotionEvidence = detail.promotion?.evidence && typeof detail.promotion.evidence === "object"
@@ -1093,23 +1277,28 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
         {detail.hidePromotion && <Badge tone="gray">隐藏广告</Badge>}
         {detail.saleStatus === "active" && <Badge tone="purple">当前已售</Badge>}
       </div>
+      {accountHasBilling(detail) ? (detail.aliveLabel
+        ? <div className={`alive-summary ${detail.aliveActive ? "active" : "ended"}`}><strong>{detail.aliveLabel}</strong><small>账单渠道 {billingChannelLabel(detail.billingChannel)} · 起点 {fmt(detail.billingStartedAt)} · 结束 {detail.aliveActive ? "现在" : fmt(detail.aliveUntil)}</small></div>
+        : <div className="alive-summary active"><strong>已开通</strong><small>{billingChannelStatus(detail) || "账单渠道待确认"} · 尚未形成可计算的账单起点</small></div>)
+        : <div className="alive-summary method-summary">{paymentExposureMethodItems(detail).length > 0 && <PaymentMethodChips items={paymentExposureMethodItems(detail)} />}
+          <small>{detail.paymentExposureCheckedAt ? `最近探测 ${fmt(detail.paymentExposureCheckedAt)}` : "可在列表中批量探测支付方式"}</small></div>}
     </section>
 
     <section className="detail-summary-grid" aria-label="账号状态摘要">
       <article className="detail-summary-card summary-blue"><span className="detail-summary-icon"><Workflow size={18} /></span><div><small>绑定状态</small><strong>{currentBinding ? "已绑定" : "未绑定"}</strong><span>{detail.bindings.length} 次邮箱绑定</span></div></article>
       <article className={`detail-summary-card summary-${credentialTone}`}><span className="detail-summary-icon"><Bot size={18} /></span><div><small>AT / RT</small><strong>{detail.credentialVersions.length} 个版本</strong><span>{currentCredential ? `当前 ${currentCredential.validityStatus}` : "等待有效凭证"}</span></div></article>
-      <article className="detail-summary-card summary-purple"><span className="detail-summary-icon"><ShieldCheck size={18} /></span><div><small>客户授权</small><strong>{activeGrantCount} 条有效</strong><span>共 {grants.length} 条记录</span></div></article>
+      <article className="detail-summary-card summary-purple"><span className="detail-summary-icon"><ShieldCheck size={18} /></span><div><small>接码入口</small><strong>{activeGrantCount} 条有效</strong><span>共 {grants.length} 条记录</span></div></article>
       <article className={`detail-summary-card summary-${promotionCheckActive(detail.promotionCheckStatus) ? "blue" : detail.promoSuspicious ? "yellow" : detail.promoEligible === true ? "green" : detail.promoEligible === false ? "gray" : "yellow"}`}><span className="detail-summary-icon"><Activity size={18} /></span><div><small>优惠检测</small><strong>{promotionCheckActive(detail.promotionCheckStatus) ? "正在检测" : detail.promoSuspicious ? "优惠存疑" : detail.promoEligible === true ? `${promotionCount || 1} 项可用` : detail.promoEligible === false ? "暂无优惠" : "结果未知"}</strong><span>{promotionCheckActive(detail.promotionCheckStatus) ? "结果完成后自动刷新" : detail.trialCheckedAt ? fmt(detail.trialCheckedAt) : "尚未完成检测"}</span></div></article>
     </section>
 
     <section className="detail-actions detail-quick-actions">
-      <div className="detail-section-heading"><h3>常用操作</h3><small>{readOnly ? "业务命令未启用" : commandWriter === "v1-via-v2" ? "账号操作由 V1 规则执行" : "V2 独立写入"}</small></div>
+      <div className="detail-section-heading"><h3>常用操作</h3><small>{readOnly ? "业务命令未启用" : "账号管理"}</small></div>
       <div className="detail-action-grid">
         <button disabled={credentialSaving} onClick={() => void openCredentialEditor()}><Bot size={14} />编辑 OAuth / 填写 AT</button>
         <button disabled={readOnly} onClick={() => { const note = prompt("账号备注", detail.note); if (note !== null) void write(`/api/v2/admin/accounts/${id}`, "PATCH", { note }); }}><FileChartColumn size={14} />编辑备注</button>
         <button disabled={readOnly} onClick={() => { const paymentLink = prompt("Stripe / 支付链接", detail.paymentLink); if (paymentLink !== null) void write(`/api/v2/admin/accounts/${id}`, "PATCH", { paymentLink }); }}><ShoppingCart size={14} />支付链接</button>
         <button disabled={readOnly || !currentBinding || (detail.everSold && !detail.deactivationLocked)} onClick={() => { const email = prompt("改绑后的新邮箱（完整本地部分必须一致）"); if (email) void write(`/api/v2/admin/accounts/${id}/rebind`, "POST", { email }); }}><AtSign size={14} />新增改绑</button>
-        <button disabled={readOnly || !currentBinding || !canIssueGrant} onClick={() => { if (currentBinding && confirm(detail.saleStatus === "active" ? "重置当前客户权限？旧链接和现有登录会立即失效。" : "为当前绑定建立首次出售并生成客户权限？")) void write(`/api/v2/admin/accounts/${id}/grants`, "POST", { bindingId: currentBinding.id }); }}><ShieldCheck size={14} />{detail.saleStatus === "active" ? "重置当前客户授权" : "生成首次客户授权"}</button>
+        <button disabled={readOnly || !currentBinding || !canIssueGrant} onClick={() => { if (currentBinding && confirm("为当前邮箱新增一个独立接码入口？已有入口会继续有效。")) void write(`/api/v2/admin/accounts/${id}/grants`, "POST", { bindingId: currentBinding.id }); }}><ShieldCheck size={14} />新增接码入口</button>
         <button disabled={readOnly || !currentBinding} onClick={() => void write(`/api/v2/admin/accounts/${id}`, "PATCH", { receiveDisabled: !currentBinding?.receiveDisabledAt })}><Ban size={14} />{currentBinding?.receiveDisabledAt ? "恢复接收新邮件" : "停止接收新邮件"}</button>
         <button onClick={() => void readVerificationCode()}><ClipboardCopy size={14} />复制最新验证码</button>
         <button onClick={() => void loadRecentMails()}><Mail size={14} />读取最近邮件</button>
@@ -1127,9 +1316,10 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
       <div className="detail-group-body recent-mail-layout"><div>{recentMails.length ? recentMails.map((item) => <button key={item.id} onClick={() => void loadRecentMail(item)}><strong>{item.subject || "(无主题)"}</strong><span>{item.from}</span><time>{fmt(item.created_at)}</time></button>) : <p className="muted">点击“读取最近邮件”加载</p>}</div><article>{recentMail ? <><h3>{recentMail.subject}</h3><small>{recentMail.from} · {fmt(recentMail.created_at)}</small><pre>{recentMail.text || "无文本正文"}</pre></> : <p className="muted">选择邮件查看正文</p>}</article></div>
     </details>
 
-    <details className="detail-group detail-recycle-group">
-      <summary><span>回收模式</span><small>资格由 V2 领域规则判定</small></summary>
-      <div className="detail-group-body detail-action-grid"><button className="danger" disabled={readOnly} onClick={() => { if (confirm("按停用满 7 天规则回收？")) void write(`/api/v2/admin/accounts/${id}/recycle`, "POST", { mode: "deactivated" }); }}>停用账号回收</button><button disabled={readOnly} onClick={() => { if (confirm("回收 Free 无特殊标记账号？")) void write(`/api/v2/admin/accounts/${id}/recycle`, "POST", { mode: "untagged_free" }); }}>Free 无标记回收</button><button disabled={readOnly} onClick={() => { if (confirm("回收 AT 已失效账号？")) void write(`/api/v2/admin/accounts/${id}/recycle`, "POST", { mode: "invalid_at" }); }}>失效 AT 回收</button><button disabled={readOnly} onClick={() => { if (confirm("轮换待注册 iCloud 点号别名？")) void write(`/api/v2/admin/accounts/${id}/recycle`, "POST", { mode: "alias_rotate" }); }}>注册别名轮换</button></div>
+    <details className="detail-group detail-recycle-group" onToggle={(event) => { if (event.currentTarget.open && !recycleEligibility && !recycleLoading && !recycleError) void loadRecycleEligibility(); }}>
+      <summary><span>回收模式</span><small>查看资格与保护原因 · 仅手动执行</small></summary>
+      <RecycleEligibilityPanel data={recycleEligibility} loading={recycleLoading} busy={recycleBusy} readOnly={readOnly} error={recycleError}
+        formatTime={fmtBeijing} onRefresh={() => void loadRecycleEligibility()} onExecute={(mode) => void executeRecycle(mode)} />
     </details>
 
     <details className="detail-group detail-identity-group" open>
@@ -1157,10 +1347,10 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
 
     {credentialEditorOpen && credentials && <div className="credential-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCredentialEditorOpen(false); }}>
       <section className="credential-editor" role="dialog" aria-modal="true" aria-label="编辑 OpenAI OAuth 凭证">
-        <header><div><h3>OpenAI 凭证</h3><small>当前账号 · 保存由 {commandWriter === "v1-via-v2" ? "V1 账号规则" : "V2 凭证链"} 校验归属</small></div><button onClick={() => setCredentialEditorOpen(false)}>关闭</button></header>
+        <header><div><h3>OpenAI 凭证</h3><small>当前账号 · 保存时校验归属</small></div><button onClick={() => setCredentialEditorOpen(false)}>关闭</button></header>
         {([
           ["accessToken", "Access Token（AT）"], ["refreshToken", "Refresh Token（RT）"],
-          ["idToken", "ID Token"], ["sessionToken", "Session Token"], ["openaiPassword", "OpenAI 登录密码"],
+          ["idToken", "ID Token"], ["sessionToken", "Session Token"], ["openaiPassword", "OpenAI 登录密码"], ["totpSecret", "TOTP / 2FA 密钥"],
         ] as const).map(([key, label]) => <label key={key}><span>{label}</span><textarea value={credentials[key] || ""} onChange={(event) => setCredentials({ ...credentials, [key]: event.target.value })} spellCheck={false} /><button disabled={!credentials[key]} onClick={() => void onCopy(`${label} 复制成功`, credentials[key], label)}>复制</button></label>)}
         {credentialError && <div className="credential-editor-error" role="alert">{credentialError}</div>}
         <div className="credential-editor-actions"><small>先读取现有字段，再修改并保存；这样不会误清空没有改动的 RT 或 Session。</small><div className="row-actions"><button onClick={() => setCredentialEditorOpen(false)}>取消</button><button className="primary" disabled={readOnly || credentialSaving} onClick={() => void saveCredentialEditor()}>{credentialSaving ? "保存中…" : "保存凭证"}</button></div></div>
@@ -1178,7 +1368,7 @@ function AccountExpanded({ id, readOnly, commandWriter, onRefresh, onCopy }: { i
 
     <details className="detail-group detail-payment-group" open>
       <summary><span>支付与试用检测</span><small>{detail.paymentExposureChecks?.length || 0} 项结果</small></summary>
-      <div className="detail-group-body"><PaymentExposureSection accountId={id} checks={detail.paymentExposureChecks || []} promotion={detail.promotion} promoSuspicious={detail.promoSuspicious} promoSuspiciousOverride={detail.promoSuspiciousOverride} historicalPromoCampaigns={detail.historicalPromoCampaigns} promotionCheckStatus={detail.promotionCheckStatus} autoTrialStatus={detail.autoTrialStatus} autoTrialDueAt={detail.autoTrialDueAt} plan={detail.plan} lifecycleStatus={detail.lifecycleStatus} deactivationLocked={detail.deactivationLocked} readOnly={readOnly} onRefresh={async () => { await loadDetail(); onRefresh(); }} /></div>
+      <div className="detail-group-body"><PaymentExposureSection accountId={id} checks={detail.paymentExposureChecks || []} promotion={detail.promotion} promoSuspicious={detail.promoSuspicious} promoSuspiciousOverride={detail.promoSuspiciousOverride} historicalPromoCampaigns={detail.historicalPromoCampaigns} promotionCheckStatus={detail.promotionCheckStatus} autoTrialStatus={detail.autoTrialStatus} autoTrialDueAt={detail.autoTrialDueAt} plan={detail.plan} billingKnown={accountHasBilling(detail)} lifecycleStatus={detail.lifecycleStatus} deactivationLocked={detail.deactivationLocked} readOnly={readOnly} onRefresh={async () => { await loadDetail(); onRefresh(); }} /></div>
     </details>
 
     <details className="detail-group detail-routing-group" open>
@@ -1228,6 +1418,14 @@ function AdminApp() {
   const [promotionBatching, setPromotionBatching] = useState(false);
   const [promotionBatchProgress, setPromotionBatchProgress] = useState<PromotionBatchProgress | null>(null);
   const promotionBatchRun = useRef(0);
+  const [paymentExposureBatching, setPaymentExposureBatching] = useState(false);
+  const [paymentExposureBatchProgress, setPaymentExposureBatchProgress] = useState<PromotionBatchProgress | null>(null);
+  const paymentExposureBatchRun = useRef(0);
+  const paymentExposureBatchResume = useRef<() => Promise<void>>(async () => undefined);
+  const [batchExposureRoutes, setBatchExposureRoutes] = useState<PaymentExposureRoute[]>([]);
+  const [batchExposureRoute, setBatchExposureRoute] = useState("");
+  const [batchExposurePromoMode, setBatchExposurePromoMode] = useState<Exclude<PaymentExposurePromoMode, "unknown">>("none");
+  const [batchExposureRoutesError, setBatchExposureRoutesError] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
@@ -1242,11 +1440,12 @@ function AdminApp() {
   const [redGroups, setRedGroups] = useState<RedGroup[]>([]);
   const [reviews, setReviews] = useState<PendingReview[]>([]);
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
+  const [mailHealthData, setMailHealthData] = useState<MailHealth | null>(null);
   const [theme, setTheme] = useState(localStorage.getItem("opus-v2-admin-theme-reference") || "dark");
   const [bulkMarkColor, setBulkMarkColor] = useState("yellow");
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [release, setRelease] = useState<ReleaseInfo | null>(null);
-  const [filters, setFilters] = useState({ ...DEFAULT_ACCOUNT_FILTERS });
+  const [filters, setFilters] = useState(initialAccountFilters);
 
   useEffect(() => { document.documentElement.dataset.theme = localStorage.getItem("opus-v2-theme") || "dark"; }, []);
   useEffect(() => { localStorage.setItem("opus-v2-admin-theme-reference", theme); }, [theme]);
@@ -1258,6 +1457,20 @@ function AdminApp() {
     return () => window.clearInterval(timer);
   }, [loadState.requestId, loadState.phase]);
   useEffect(() => { void api<{ release: ReleaseInfo }>("/api/v2/version").then((data) => setRelease(data.release || null)).catch(() => undefined); }, []);
+  useEffect(() => {
+    if (authenticated !== true) return;
+    const controller = new AbortController();
+    void api<{ routes: PaymentExposureRoute[] }>("/api/v2/admin/payment-exposure/routes", { signal: controller.signal })
+      .then((data) => {
+        const routes = Array.isArray(data.routes) ? data.routes : [];
+        setBatchExposureRoutesError("");
+        setBatchExposureRoutes(routes);
+        setBatchExposureRoute((current) => routes.some((route) => route.key === current && route.configured) ? current : "");
+      })
+      .catch((reason) => setBatchExposureRoutesError(reason instanceof Error ? reason.message : String(reason)));
+    return () => controller.abort();
+  }, [authenticated]);
+  useEffect(() => { if (authenticated === true) void paymentExposureBatchResume.current(); }, [authenticated]);
   useEffect(() => {
     if (!copyFeedback || copyFeedback.kind !== "success" || copyPreviewOpen) return;
     const timer = window.setTimeout(() => setCopyFeedback(null), 6500);
@@ -1273,6 +1486,11 @@ function AdminApp() {
     const timer = window.setTimeout(() => setPromotionBatchProgress(null), 4800);
     return () => window.clearTimeout(timer);
   }, [promotionBatchProgress?.status]);
+  useEffect(() => {
+    if (paymentExposureBatchProgress?.status !== "completed") return;
+    const timer = window.setTimeout(() => setPaymentExposureBatchProgress(null), 5200);
+    return () => window.clearTimeout(timer);
+  }, [paymentExposureBatchProgress?.status]);
   useEffect(() => {
     if (!expanded && !copyPreviewOpen) return;
     const previousOverflow = document.body.style.overflow;
@@ -1343,6 +1561,8 @@ function AdminApp() {
         ? settled(api<{ results: PendingReview[] }>("/api/v2/admin/pending-reviews", { signal: controller.signal }))
         : tab === "migration"
           ? settled(api<Record<string, unknown>>("/api/v2/admin/migration-report", { signal: controller.signal }))
+          : tab === "mail-health"
+            ? settled(api<MailHealth>("/api/v2/admin/mail-health", { signal: controller.signal }))
           : Promise.resolve({});
       const [summary, groups, extra] = await Promise.all([summaryResult, groupsResult, tabResult]);
       if (!isCurrent()) return;
@@ -1350,6 +1570,7 @@ function AdminApp() {
       if (groups.value) setRedGroups(groups.value.results);
       if (tab === "reviews" && "value" in extra && extra.value) setReviews((extra.value as { results: PendingReview[] }).results);
       if (tab === "migration" && "value" in extra && extra.value) setReport(extra.value as Record<string, unknown>);
+      if (tab === "mail-health" && "value" in extra && extra.value) setMailHealthData(extra.value as MailHealth);
       const backgroundError = summary.error || groups.error || ("error" in extra ? extra.error : undefined);
       if (backgroundError) {
         const message = backgroundError instanceof Error ? backgroundError.message : String(backgroundError);
@@ -1383,6 +1604,7 @@ function AdminApp() {
     window.addEventListener("online", onOnline);
     return () => {
       promotionBatchRun.current += 1;
+      paymentExposureBatchRun.current += 1;
       loadRequest.current.controller?.abort();
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
@@ -1468,6 +1690,53 @@ function AdminApp() {
     setAccounts(list.results); setTotal(list.total);
     return list.results;
   };
+  const pollPaymentExposureBatch = async (batch: PersistedPaymentExposureBatch, runId: number): Promise<void> => {
+    let consecutiveFailures = 0;
+    while (paymentExposureBatchRun.current === runId) {
+      try {
+        const response = await api<{ jobs: PaymentExposureJobStatus[] }>(
+          "/api/v2/admin/accounts/payment-exposure-check/status",
+          { method: "POST", body: JSON.stringify({ jobs: batch.jobs }) },
+        );
+        const statuses = response.jobs || [];
+        await refreshAccountListQuietly();
+        consecutiveFailures = 0;
+        const queued = statuses.filter((job) => job.status === "queued").length;
+        const running = statuses.filter((job) => ["running", "dispatching"].includes(job.status)).length;
+        const terminal = statuses.filter((job) => ["completed", "failed", "cancelled", "interrupted"].includes(job.status)).length;
+        const failed = batch.failed + statuses.filter((job) => ["failed", "cancelled", "interrupted"].includes(job.status)).length;
+        setPaymentExposureBatchProgress({ total: batch.total, processed: Math.min(batch.total, terminal + batch.failed + batch.skipped),
+          queued, running, retrying: 0, failed, status: queued || running ? "running" : "completed" });
+        if (!queued && !running) {
+          persistPaymentExposureBatch(null);
+          await refreshAccountListQuietly();
+          break;
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1800));
+      } catch (reason) {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= 5) throw reason;
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(5000, 1200 * consecutiveFailures)));
+      }
+    }
+  };
+  paymentExposureBatchResume.current = async () => {
+    const batch = readPersistedPaymentExposureBatch();
+    if (!batch || paymentExposureBatching) return;
+    const runId = paymentExposureBatchRun.current + 1;
+    paymentExposureBatchRun.current = runId;
+    setPaymentExposureBatching(true);
+    setPaymentExposureBatchProgress({ total: batch.total, processed: batch.skipped + batch.failed, queued: batch.jobs.length,
+      running: 0, retrying: 0, failed: batch.failed, status: "running" });
+    try {
+      await pollPaymentExposureBatch(batch, runId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setPaymentExposureBatchProgress((current) => current ? { ...current, status: "error" } : null);
+    } finally {
+      if (paymentExposureBatchRun.current === runId) setPaymentExposureBatching(false);
+    }
+  };
   const runBulkPromotionCheck = async () => {
     if (!selected.size || promotionBatching) return;
     if (!confirm(`确定使用 JP 出口重新检测选中的 ${selected.size} 个账号？没有 AT 的账号会被跳过。`)) return;
@@ -1518,6 +1787,47 @@ function AdminApp() {
       setPromotionBatchProgress((current) => current ? { ...current, status: "error" } : null);
     } finally {
       if (promotionBatchRun.current === runId) setPromotionBatching(false);
+    }
+  };
+  const runBulkPaymentExposureCheck = async () => {
+    if (!selected.size || paymentExposureBatching) return;
+    if (!batchExposureRoute) {
+      setError("请先选择一个具体支付 method，再执行批量探查；不会默认探查全部 method。");
+      return;
+    }
+    if (selected.size > 24) {
+      setError("批量支付方式探查单次最多选择 24 个账号；已开通账号会自动跳过。");
+      return;
+    }
+    if (!confirm(`确定用 1 个远程批次探查选中的 ${selected.size} 个账号？仅检测当前选择的 method，模式为${batchExposurePromoMode === "one_month" ? "带 1 month 优惠" : "无优惠"}，Plus/已有账单账号自动跳过。`)) return;
+    const runId = paymentExposureBatchRun.current + 1;
+    paymentExposureBatchRun.current = runId;
+    const accountIds = [...selected];
+    setPaymentExposureBatching(true); setError(""); setNotice("");
+    setPaymentExposureBatchProgress({ total: accountIds.length, processed: 0, queued: 0, running: 0, retrying: 0, failed: 0, status: "running" });
+    try {
+      const result = await api<{ requested: number; requestedJobs: number; started: number; skipped: number; failed: number; jobs: PaymentExposureJobStatus[]; jobAccounts: Array<{ accountId: string; jobId: string }>; errors: Array<{ accountId: string; routeKey?: string; error: string; skipped?: boolean }> }>("/api/v2/admin/accounts/payment-exposure-check", {
+        method: "POST", body: JSON.stringify({ accountIds, routeKeys: [batchExposureRoute], promoMode: batchExposurePromoMode }),
+      });
+      const jobs = result.jobs || [];
+      const jobAccounts = result.jobAccounts || [];
+      const total = result.requested;
+      const skippedText = result.skipped ? ` · ${result.skipped} 个已开通账号跳过` : "";
+      setNotice(`已创建 ${result.requestedJobs} 个远程批次任务，包含 ${result.started} 个账号${skippedText}${result.failed ? ` · ${result.failed} 个失败` : ""}`);
+      const batch = { total, skipped: result.skipped, failed: result.failed, jobs: jobAccounts, savedAt: Date.now() };
+      if (jobAccounts.length) {
+        persistPaymentExposureBatch(batch);
+        await pollPaymentExposureBatch(batch, runId);
+      } else {
+        persistPaymentExposureBatch(null);
+        setPaymentExposureBatchProgress({ total, processed: total, queued: 0, running: 0, retrying: 0,
+          failed: result.failed, status: "completed" });
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setPaymentExposureBatchProgress((current) => current ? { ...current, status: "error" } : null);
+    } finally {
+      if (paymentExposureBatchRun.current === runId) setPaymentExposureBatching(false);
     }
   };
   const patchAccount = async (item: AccountSummary, patch: Record<string, unknown>, label: string) => {
@@ -1596,6 +1906,22 @@ function AdminApp() {
     } catch (reason) { copyFailed(reason, completeText); }
     finally { setCopyingAccountId(""); }
   };
+  const openCurrentMailboxLink = async (item: AccountSummary) => {
+    const target = window.open("about:blank", "_blank");
+    setError(""); setNotice("");
+    if (!target) {
+      setError("浏览器阻止了新窗口，请允许本站弹出窗口后重试");
+      return;
+    }
+    try {
+      const output = await api<CurrentCustomerExport>(`/api/v2/admin/accounts/${item.id}/current-export`);
+      if (!output.publicUrl) throw new Error("当前账号没有可打开的邮箱授权链接");
+      target.location.href = output.publicUrl;
+    } catch (reason) {
+      target.close();
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
   const copyValue: CopyHandler = async (title, value, extra = "") => {
     const completeText = String(value || "");
     setCopyFeedback(null);
@@ -1615,7 +1941,7 @@ function AdminApp() {
         method: "POST", body: JSON.stringify({ accountIds: items.map((item) => item.id) }),
       });
       const available = (data.results || []).filter((item) => item.available && item.text);
-      if (!available.length) throw new Error("选中账号都没有可复制的当前客户授权");
+      if (!available.length) throw new Error("选中账号都没有可复制的当前邮箱入口");
       completeText = joinCopyBlocks(available.map((item) => item.text));
       const receipt = await copyText(completeText);
       const skipped = (data.results || []).length - available.length;
@@ -1648,7 +1974,7 @@ function AdminApp() {
         method: "POST", body: JSON.stringify({ accountIds: items.map((item) => item.id) }),
       });
       const rows = (data.results || []).filter((item) => item.available && item.text);
-      if (!rows.length) throw new Error("选中账号都没有可导出的当前客户授权");
+      if (!rows.length) throw new Error("选中账号都没有可导出的当前邮箱入口");
       let content = "";
       let mime = "text/plain;charset=utf-8";
       let filename = "opus-mail-selected.txt";
@@ -1703,6 +2029,7 @@ function AdminApp() {
     "red-groups": "红色分组",
     import: "导入账号",
     operations: "批量与维护",
+    "mail-health": "收信状态",
     share: "分享快照",
     reviews: "待审查",
     migration: "迁移报告",
@@ -1719,11 +2046,12 @@ function AdminApp() {
     ["red-groups", "红色分组", Layers3],
     ["import", "导入账号", FileUp],
     ["operations", "批量与维护", Activity],
+    ["mail-health", "收信状态", Mail],
     ["share", "分享快照", Share2],
     ["reviews", "待审查", ShieldCheck],
     ["migration", "迁移报告", FileChartColumn],
   ] as const;
-  const listTab = !["reviews", "migration", "import", "operations", "share", "outlook-free"].includes(tab);
+  const listTab = !["reviews", "migration", "import", "operations", "share", "outlook-free", "mail-health"].includes(tab);
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const activeFilterCount = Object.entries(filters).filter(([name, value]) => value && !(name === "range" && value === "all") && !(name === "pending" && value === "exclude")).length;
   const expandedItem = accounts.find((item) => item.id === expanded) || null;
@@ -1739,9 +2067,9 @@ function AdminApp() {
 
   return <div className={`admin-app admin-theme-${theme}`}>
     <aside className="admin-sidebar">
-      <div className="sidebar-brand"><span className="sidebar-brand-mark">O</span><div><strong>Opus Mail</strong><small>V2 账号管理</small></div></div>
+      <div className="sidebar-brand"><OpusBrand /></div>
       <nav className="sidebar-nav sidebar-nav-all" aria-label="V2 功能导航">{navItems.map(([value, label, Icon]) => <button key={value} className={tab === value ? "active" : ""} onClick={() => openTab(value)}><Icon size={17} strokeWidth={1.8} /><span>{label}</span>{value === "accounts" && <small>{overviewData?.visibleAccounts || 0}</small>}{value === "icloud" && <small>{overviewData?.visibleIcloud || 0}</small>}{value === "domains" && <small>{overviewData?.visibleDomains || 0}</small>}{value === "auto" && <small>{overviewData?.visibleAuto || 0}</small>}{value === "missing-at" && <small>{overviewData?.actionableMissingAt || 0}</small>}{value === "outlook-free" && <small>{overviewData?.visibleOutlookFree || 0}</small>}{value === "deactivations" && <small>{overviewData?.deactivatedToday || 0}</small>}{value === "idle" && <small>{overviewData?.visibleUnused || 0}</small>}</button>)}</nav>
-      <div className="sidebar-status"><div><ShieldCheck size={16} /><Badge tone={overviewData?.readOnly ? "yellow" : "green"}>{overviewData?.readOnly ? "业务命令停用" : overviewData?.accountAuthority === "v1" ? "V1 账号规则已接管" : "V2 独立运行"}</Badge></div><small>{overviewData?.accountAuthority === "v1" ? "V2 提供后台；账号写入与排序来源遵循 V1" : "账号、凭证与邮件均由 V2 原生服务处理"}</small></div>
+      <div className="sidebar-status"><div><ShieldCheck size={16} /><Badge tone={overviewData?.readOnly ? "yellow" : "green"}>{overviewData?.readOnly ? "业务命令停用" : "V2 独立运行"}</Badge></div></div>
     </aside>
 
     <main className="admin-main">
@@ -1766,13 +2094,15 @@ function AdminApp() {
       </section>}
 
       {listTab && <section className={`filters ${showAdvancedFilters ? "show-advanced" : ""}`}>
-        <div className="filter-main-row"><label className="search-field"><Search size={17} /><input className="search" aria-label="搜索账号" value={filters.search} onChange={(e) => changeFilter("search", e.target.value)} placeholder="搜索邮箱、渠道或备注" /></label><div className="quick-filters"><select value={filters.range} onChange={(e) => changeFilter("range", e.target.value)}><option value="all">全部时间</option><option value="day">一天内</option><option value="week">一周内</option><option value="two_weeks">两周内</option></select><select value={filters.status} onChange={(e) => changeFilter("status", e.target.value)}><option value="">全部状态</option><option value="active">活跃</option><option value="deactivated">永久停用</option><option value="retired">历史回收</option><option value="quarantined">归属待核对</option></select><select value={filters.provider} onChange={(e) => changeFilter("provider", e.target.value)}><option value="">全部邮箱</option><option value="icloud">iCloud</option><option value="outlook">Outlook</option><option value="domain">域名邮箱</option></select><select value={filters.plan} onChange={(e) => changeFilter("plan", e.target.value)}><option value="">全部套餐</option><option value="plus">Plus</option><option value="free">Free</option></select></div><button className={`filter-toggle ${showAdvancedFilters || activeFilterCount ? "filter-active" : ""}`} onClick={() => setShowAdvancedFilters((value) => !value)}><SlidersHorizontal size={16} />筛选{activeFilterCount ? ` ${activeFilterCount}` : ""}</button><button className="reset-filter" disabled={!activeFilterCount} onClick={resetFilters}><RotateCcw size={16} />重置</button></div>
+        <div className="filter-main-row"><label className="search-field"><Search size={17} /><input className="search" aria-label="搜索账号" value={filters.search} onChange={(e) => changeFilter("search", e.target.value)} placeholder="搜索邮箱、渠道或备注" /></label><div className="quick-filters"><select value={filters.range} onChange={(e) => changeFilter("range", e.target.value)}><option value="all">全部时间</option><option value="day">一天内</option><option value="week">一周内</option><option value="two_weeks">两周内</option></select><select value={filters.status} onChange={(e) => changeFilter("status", e.target.value)}><option value="">全部状态</option><option value="active">活跃</option><option value="third_party_pending_recovery">第三方待恢复</option><option value="third_party_registered">第三方注册</option><option value="deactivated">永久停用</option><option value="retired">历史回收</option><option value="quarantined">归属待核对</option></select><select value={filters.provider} onChange={(e) => changeFilter("provider", e.target.value)}><option value="">全部邮箱</option><option value="icloud">iCloud</option><option value="outlook">Outlook</option><option value="domain">域名邮箱</option></select><select value={filters.plan} onChange={(e) => changeFilter("plan", e.target.value)}><option value="">全部套餐</option><option value="plus">Plus</option><option value="free">Free</option></select></div><button className={`filter-toggle ${showAdvancedFilters || activeFilterCount ? "filter-active" : ""}`} onClick={() => setShowAdvancedFilters((value) => !value)}><SlidersHorizontal size={16} />筛选{activeFilterCount ? ` ${activeFilterCount}` : ""}</button><button className="reset-filter" disabled={!activeFilterCount} onClick={resetFilters}><RotateCcw size={16} />重置</button></div>
         {showAdvancedFilters && <div className="filter-advanced-row"><select aria-label="支付渠道筛选" value={filters.billingChannel} onChange={(e) => changeFilter("billingChannel", e.target.value)}><option value="">全部支付渠道</option>{billingChannelFilterOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><select value={filters.credential} onChange={(e) => changeFilter("credential", e.target.value)}><option value="">全部凭证</option><option value="at">有 AT</option><option value="rt">有 RT</option><option value="missing">无 AT/RT</option></select><select value={filters.sold} onChange={(e) => changeFilter("sold", e.target.value)}><option value="">全部出售状态</option><option value="true">已售</option><option value="false">未售</option></select><select value={filters.markColor} onChange={(e) => changeFilter("markColor", e.target.value)}><option value="">全部颜色标记</option><option value="none">无标记</option>{Object.entries(markColorLabels).map(([value, label]) => <option key={value} value={value}>{label}标记</option>)}</select><button className={filters.unused ? "filter-active" : ""} onClick={() => changeFilter("unused", filters.unused ? "" : "true")}>审计后空闲</button><button className={filters.sourceStatus ? "filter-active" : ""} onClick={() => changeFilter("sourceStatus", filters.sourceStatus ? "" : "recovered")}>备份恢复</button>{tab === "red-groups" && <select value={filters.redGroup} onChange={(e) => changeFilter("redGroup", e.target.value)}><option value="">选择红色分组</option>{redGroups.map((group, index) => <option key={group.boundaryAccountId} value={group.boundaryAccountId}>第 {index + 1} 组 · {group.count} 个 · {group.boundaryEmail}</option>)}</select>}</div>}
       </section>}
 
       {tab === "red-groups" && <section className="group-grid">{redGroups.map((group, index) => <button className={filters.redGroup === group.boundaryAccountId ? "active" : ""} key={group.boundaryAccountId} onClick={() => changeFilter("redGroup", group.boundaryAccountId)}><strong>第 {index + 1} 组 · {group.count} 个</strong><span>{group.boundaryEmail}</span><small>活跃 {group.activeCount} · 停用 {group.deactivatedCount}</small><time>{fmt(group.startedAt)} → {fmt(group.endedAt)}</time></button>)}</section>}
 
-      {selected.size > 0 && listTab && <div className="selection-toolbar has-selection"><strong>已选 {selected.size} 个</strong><button className="batch-primary" onClick={() => void copySelectedExports()}>复制选中说明</button><button onClick={() => void copySelectedAccessTokens()}>复制选中 AT</button><button disabled={promotionBatching} onClick={() => void runBulkPromotionCheck()}>{promotionBatching && promotionBatchProgress ? `检测 ${promotionBatchProgress.processed}/${promotionBatchProgress.total}` : "批量检测优惠"}</button><button onClick={() => void exportSelected("txt")}>导出 TXT</button><span className="selection-divider" /><button onClick={selectAll}>{allSelected ? "取消本页" : "全选本页"}</button><button onClick={invertPageSelection}>反选本页</button><button className="toolbar-refresh" disabled={loading} onClick={() => void refreshPage()}>{loading ? "刷新中" : "刷新"}</button><button onClick={clearSelection}>清除选择</button><span className="selection-divider" /><button onClick={() => void exportSelected("csv")}>导出 CSV</button><button onClick={() => void exportSelected("json")}>导出 JSON</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("receiveDisabled", true)}>停止新邮件</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("receiveDisabled", false)}>恢复收件</button><button disabled={overviewData?.readOnly || writing} title="V2 的已售状态必须由客户授权原子创建，不能直接伪造出售记录" onClick={() => setNotice("V2 中“标记已售”必须通过生成客户授权完成，未提供直接批量伪造出售记录的操作。")}>标记已售</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("sold", false)}>恢复未售</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("hidePromotion", true)}>隐藏广告</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("hidePromotion", false)}>显示广告</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("groupBoundary", true)}>设为边界</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("groupBoundary", false)}>取消边界</button><select aria-label="批量颜色标记" value={bulkMarkColor} onChange={(event) => setBulkMarkColor(event.target.value)}><option value="yellow">黄标</option><option value="orange">橙标</option><option value="green">绿标</option><option value="blue">蓝标</option><option value="purple">紫标</option><option value="gray">灰标</option><option value="red">红标</option><option value="none">清除标记</option></select><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("markColor", bulkMarkColor === "none" ? "" : bulkMarkColor)}>应用</button><button disabled={overviewData?.readOnly || writing} className="danger" onClick={() => void runBulk("deactivate", true)}>永久停用</button><button disabled={overviewData?.readOnly || writing} className="danger" onClick={() => void runBulk("delete", true)}>删除选中</button><span className="selection-hint">拖过左侧选择点可连续多选 · 左右滑动查看更多操作</span></div>}
+      {selected.size > 0 && listTab && <div className="batch-method-selector"><strong>批量探查参数</strong><label><span>method</span><select aria-label="批量选择支付 method" value={batchExposureRoute} onChange={(event) => setBatchExposureRoute(event.target.value)} disabled={paymentExposureBatching || !batchExposureRoutes.length}><option value="">请选择一个具体 method</option>{batchExposureRoutes.map((route) => <option key={route.key} value={route.key} disabled={!route.configured}>{paymentMethodLabel(route.expectedMethod)} · {route.key}</option>)}</select></label><label><span>优惠模式</span><select aria-label="批量选择支付方式探查优惠模式" value={batchExposurePromoMode} onChange={(event) => setBatchExposurePromoMode(event.target.value as Exclude<PaymentExposurePromoMode, "unknown">)} disabled={paymentExposureBatching}><option value="none">无优惠</option><option value="one_month">带 1 month 优惠</option></select></label><small>{batchExposureRoutesError ? `资格项目读取失败：${batchExposureRoutesError}` : "只探查所选 method；蓝底表示 1 month 优惠下取得，紫底表示无优惠下取得。"}</small></div>}
+
+      {selected.size > 0 && listTab && <div className="selection-toolbar has-selection"><strong>已选 {selected.size} 个</strong><label className="batch-promo-toggle"><input type="checkbox" aria-label="批量探查使用 1 month 优惠" checked={batchExposurePromoMode === "one_month"} disabled={paymentExposureBatching} onChange={(event) => setBatchExposurePromoMode(event.target.checked ? "one_month" : "none")} /><span>本次使用 1 month 优惠</span></label><button className="batch-primary" onClick={() => void copySelectedExports()}>复制选中说明</button><button onClick={() => void copySelectedAccessTokens()}>复制选中 AT</button><button disabled={paymentExposureBatching} onClick={() => void runBulkPaymentExposureCheck()}>{paymentExposureBatching && paymentExposureBatchProgress ? `探查 ${paymentExposureBatchProgress.processed}/${paymentExposureBatchProgress.total}` : "批量探查 method"}</button><button disabled={promotionBatching} onClick={() => void runBulkPromotionCheck()}>{promotionBatching && promotionBatchProgress ? `检测 ${promotionBatchProgress.processed}/${promotionBatchProgress.total}` : "批量检测优惠"}</button><button onClick={() => void exportSelected("txt")}>导出 TXT</button><span className="selection-divider" /><button onClick={selectAll}>{allSelected ? "取消本页" : "全选本页"}</button><button onClick={invertPageSelection}>反选本页</button><button className="toolbar-refresh" disabled={loading} onClick={() => void refreshPage()}>{loading ? "刷新中" : "刷新数据"}</button><button onClick={clearSelection}>清除选择</button><span className="selection-divider" /><button onClick={() => void exportSelected("csv")}>导出 CSV</button><button onClick={() => void exportSelected("json")}>导出 JSON</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("receiveDisabled", true)}>停止新邮件</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("receiveDisabled", false)}>恢复收件</button><button disabled={overviewData?.readOnly || writing} title="V2 的已售状态必须由客户授权原子创建，不能直接伪造出售记录" onClick={() => setNotice("V2 中“标记已售”必须通过生成客户授权完成，未提供直接批量伪造出售记录的操作。")}>标记已售</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("sold", false)}>恢复未售</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("hidePromotion", true)}>隐藏广告</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("hidePromotion", false)}>显示广告</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("groupBoundary", true)}>设为边界</button><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("groupBoundary", false)}>取消边界</button><select aria-label="批量颜色标记" value={bulkMarkColor} onChange={(event) => setBulkMarkColor(event.target.value)}><option value="yellow">黄标</option><option value="orange">橙标</option><option value="green">绿标</option><option value="blue">蓝标</option><option value="purple">紫标</option><option value="gray">灰标</option><option value="red">红标</option><option value="none">清除标记</option></select><button disabled={overviewData?.readOnly || writing} onClick={() => void runBulk("markColor", bulkMarkColor === "none" ? "" : bulkMarkColor)}>应用</button><button disabled={overviewData?.readOnly || writing} className="danger" onClick={() => void runBulk("deactivate", true)}>永久停用</button><button disabled={overviewData?.readOnly || writing} className="danger" onClick={() => void runBulk("delete", true)}>删除选中</button><span className="selection-hint">拖过左侧选择点可连续多选 · 左右滑动查看更多操作</span></div>}
 
       {promotionBatchProgress && <section className={`promotion-batch-progress ${promotionBatchProgress.status}`} role="status" aria-live="polite">
         <div><span className={`status-led ${promotionBatchProgress.status === "running" ? "blue pulse" : promotionBatchProgress.status === "error" ? "red" : "green"}`} /><strong>{promotionBatchProgress.status === "running" ? "批量优惠检测进行中" : promotionBatchProgress.status === "error" ? "批量优惠检测连接中断" : "批量优惠检测完成"}</strong><span>{promotionBatchProgress.processed} / {promotionBatchProgress.total}</span><button className="promotion-batch-close" aria-label="关闭批量检测状态" onClick={() => setPromotionBatchProgress(null)}>×</button></div>
@@ -1780,24 +2110,36 @@ function AdminApp() {
         <small>{promotionBatchProgress.status === "running" ? `检测中 ${promotionBatchProgress.running} · 排队 ${promotionBatchProgress.queued} · 待复查 ${promotionBatchProgress.retrying} · 失败 ${promotionBatchProgress.failed}；结果会逐条刷新。` : promotionBatchProgress.status === "completed" ? `已完成；待复查 ${promotionBatchProgress.retrying} · 失败 ${promotionBatchProgress.failed}。此提示将自动收起。` : "进度连接已中断，可关闭后重新发起或刷新页面查看账号状态。"}</small>
       </section>}
 
+      {paymentExposureBatchProgress && <section className={`promotion-batch-progress ${paymentExposureBatchProgress.status}`} role="status" aria-live="polite">
+        <div><span className={`status-led ${paymentExposureBatchProgress.status === "running" ? "blue pulse" : paymentExposureBatchProgress.status === "error" ? "red" : "green"}`} /><strong>{paymentExposureBatchProgress.status === "running" ? "批量 method 探查进行中" : paymentExposureBatchProgress.status === "error" ? "批量 method 探查连接中断" : "批量 method 探查完成"}</strong><span>{paymentExposureBatchProgress.processed} / {paymentExposureBatchProgress.total}</span><button className="promotion-batch-close" aria-label="关闭批量 method 探查状态" onClick={() => setPaymentExposureBatchProgress(null)}>×</button></div>
+        <div className="promotion-batch-track"><i style={{ width: `${paymentExposureBatchProgress.total ? Math.round(paymentExposureBatchProgress.processed / paymentExposureBatchProgress.total * 100) : 100}%` }} /></div>
+        <small>{paymentExposureBatchProgress.status === "running" ? `同一远程批次处理中：账号执行中 ${paymentExposureBatchProgress.running} · 排队 ${paymentExposureBatchProgress.queued} · 失败 ${paymentExposureBatchProgress.failed}；结果按账号分别落库。` : paymentExposureBatchProgress.status === "completed" ? `一个远程批次已完成；失败 ${paymentExposureBatchProgress.failed}。未开通账号在“存活时间”显示 method，已开通账号仅显示账单。` : "批次进度连接已中断，可关闭后重新发起或刷新页面查看账号状态。"}</small>
+      </section>}
+
       {error && <div className="page-error">{error}</div>}{notice && <div className="page-notice">{notice}</div>}
       {tab === "import" ? <ImportWorkbench readOnly={Boolean(overviewData?.readOnly)} onRefresh={() => void load()} />
       : tab === "operations" ? <OperationsWorkbench />
+      : tab === "mail-health" ? <MailHealthPanel data={mailHealthData} />
       : tab === "share" ? <ShareWorkbench onCopy={copyValue} />
       : tab === "outlook-free" ? <OutlookFreeWorkbench />
       : tab === "reviews" ? <section className="report-panel"><h2>待人工审查</h2>{reviews.length ? reviews.map((review) => <article key={review.id}><strong>{review.candidateEmail || "未识别邮箱"}</strong><Badge tone="yellow">{review.reviewType}</Badge><p>{review.reason}</p><small>{fmt(review.createdAt)} · 账号 {review.accountId || "未关联"}</small><div className="row-actions"><button disabled={overviewData?.readOnly || writing} onClick={() => void resolveReview(review, "keep_separate")}>确认保持分离</button>{review.accountId && review.candidateEmail && <button disabled={overviewData?.readOnly || writing} onClick={() => { if (confirm("确认这是同一GPT身份的改绑？冻结和出售状态不会被清除。")) void resolveReview(review, "confirm_rebind"); }}>确认改绑</button>}<button disabled={overviewData?.readOnly || writing} onClick={() => void resolveReview(review, "dismiss")}>忽略记录</button></div></article>) : <p className="muted">当前没有待审查冲突</p>}</section>
       : tab === "migration" ? <section className="report-panel"><h2>迁移审计与独立同步报告</h2><pre>{JSON.stringify(report, null, 2)}</pre></section>
       : <section className="table-wrap">
-        <table><thead><tr><th className="select-col"><input aria-label="选择本页" type="checkbox" checked={allSelected} onChange={selectAll} /></th><th>邮箱</th><th>套餐</th><th>GPT 状态</th><th>OAuth</th><th>{tab === "deactivations" ? "封禁时间" : "试用 / 优惠"}</th><th>操作</th></tr></thead>
+        <table><thead><tr><th className="select-col"><input aria-label="选择本页" type="checkbox" checked={allSelected} onChange={selectAll} /></th><th>邮箱</th><th>套餐</th><th>存活时间</th><th>GPT 状态</th><th>OAuth</th><th>{tab === "deactivations" ? "封禁时间" : "试用 / 优惠"}</th><th>操作</th></tr></thead>
         <tbody>{accounts.map((item) => <React.Fragment key={item.id}>
-          <tr data-account-id={item.id} className={`account-table-row selection-mode ${item.deactivationLocked ? "deactivated" : ""} ${item.groupBoundary ? "group-boundary" : ""} ${selected.has(item.id) ? "selected-row" : ""}`} onClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,select,summary,details,a")) selectAccount(item.id, event.shiftKey); }}>
+          <tr data-account-id={item.id} className={`account-table-row selection-mode ${accountRowStatusClass(item)} ${item.groupBoundary ? "group-boundary" : ""} ${selected.has(item.id) ? "selected-row" : ""}`} onClick={(event) => { if (!(event.target as HTMLElement).closest("button,input,select,summary,details,a")) selectAccount(item.id, event.shiftKey); }}>
             <td className="select-col"><button type="button" className={`selection-handle ${selected.has(item.id) ? "selected" : ""}`} aria-label={`选择 ${item.primaryEmail}`} aria-pressed={selected.has(item.id)} title="按住并上下滑动可连续选择" onPointerDown={(event) => startDragSelection(event, item.id)} onClick={(event) => { event.preventDefault(); event.stopPropagation(); }}>{selected.has(item.id) ? "✓" : ""}</button></td>
             <td><div className="email-cell"><div className="account-title"><span className={`mark-dot ${item.markColor || "mark-none"}`} title={item.markColor ? `${markColorLabel(item.markColor)}标记` : "无颜色标记"} /><strong title={item.primaryEmail}>{item.primaryEmail}</strong></div><div className="email-meta"><small>{providerLabel(item.provider)} · 录入 {fmt(item.arrivedAt)}{item.sourceStatus === "recovered" ? " · 备份恢复" : ""}</small>{item.isAuto && <small className="auto-text">Auto/API</small>}{item.groupBoundary && <small className="danger-text">红色边界</small>}</div></div></td>
             <td className="plan-cell"><span className={planBadgeClassName(item)}>{planBadgeLabel(item)}</span>{!item.billingChannel && billingChannelStatus(item) && <small className="billing-channel-unconfirmed">{billingChannelStatus(item)}</small>}</td>
-            <td className="state-cell"><div><span className={`status-led ${lifecycleTone(item)}`} /><strong>{lifecycleLabel(item)}</strong></div><small>{item.quarantineReason ? `原因：${item.quarantineReason}` : item.deactivationLocked && item.bindingCount > 1 ? "停用锁已继承" : item.suspectedUnused ? "审计后空闲" : item.accountStateLabel || "账号可用"}</small></td>
+            <td className="alive-cell">{accountHasBilling(item)
+              ? item.aliveLabel ? <><strong className={`alive-status-line ${item.aliveActive ? "active" : "ended"}`} title={`起点 ${fmt(item.billingStartedAt)} · ${item.aliveActive ? "截至现在" : `结束 ${fmt(item.aliveUntil)}`}`}>{item.aliveLabel.replace(/^账单起/, "")}</strong><small>{item.aliveActive ? `起 ${fmtBeijing(item.billingStartedAt)}` : `停 ${fmtBeijing(item.aliveUntil)}`}</small></>
+                : <><strong className="alive-status-line active">已开通</strong><small>{billingChannelStatus(item) || "账单渠道待确认"}</small></>
+              : paymentExposureMethodItems(item).length ? <div className="alive-method-result" title="最近本机支付方式探查结果"><PaymentMethodChips compact items={paymentExposureMethodItems(item)} /><small>{item.paymentExposureCheckedAt ? `探查 ${fmtBeijing(item.paymentExposureCheckedAt)}` : "本机探查结果"}</small></div>
+                : <div className="alive-empty"><strong className="alive-status-line free-state">未开通</strong><small className="alive-missing"><span>暂无账单起点</span><span>暂无 method</span></small></div>}</td>
+            <td className="state-cell"><div><span className={`status-led ${lifecycleTone(item)}`} /><strong>{lifecycleLabel(item)}</strong>{item.openAiMfaEnabled ? <Badge tone="purple">MFA</Badge> : item.openAiAuthMethods.some((method) => /(?:^otp$|otp_email)/i.test(method)) ? <Badge tone="blue">邮箱 OTP</Badge> : null}</div><small>{item.quarantineReason ? `原因：${item.quarantineReason}` : item.deactivationLocked && item.bindingCount > 1 ? "停用锁已继承" : item.suspectedUnused ? "审计后空闲" : item.accountStateLabel || "账号可用"}</small></td>
             <td className="credential-cell"><Badge tone={item.hasAccessToken ? "green" : item.hasStoredAccessToken ? "red" : "gray"} title={item.hasStoredAccessToken && !item.hasAccessToken ? "AT 仍加密保存，可在详情中查看和复制" : ""}>AT {item.hasAccessToken ? "有" : item.hasStoredAccessToken ? "失效" : "无"}</Badge><Badge tone={item.hasRefreshToken ? "green" : item.hasStoredRefreshToken ? "yellow" : "gray"}>RT {item.hasRefreshToken ? "有" : item.hasStoredRefreshToken ? "不可用" : "无"}</Badge>{!item.hasAccessToken && <small className={item.internalPending ? "billing-channel-unconfirmed" : "warning-text"}>{item.credentialStateLabel}</small>}</td>
             <td className="trial-cell">{tab === "deactivations" ? <><div><span className="status-led red" /><strong>{fmtBeijing(item.deactivatedAt)}</strong></div><small>OpenAI 停用锁</small></> : <PromotionStatusCell item={item} />}</td>
-            <td><div className="row-actions"><MarkPalette value={item.markColor} disabled={Boolean(overviewData?.readOnly)} saving={markSavingIds.has(item.id)} label={item.primaryEmail} onSelect={(color) => patchMarkColor(item, color)} /><button className="copy-current" disabled={Boolean(copyingAccountId)} title="复制当前账号说明" onClick={(event) => { event.stopPropagation(); void copyCurrentExport(item); }}><ClipboardCopy size={14} />{copyingAccountId === item.id ? "复制中…" : "复制"}</button><button className="detail-toggle" onClick={(event) => { event.stopPropagation(); toggleExpanded(item.id); }}><PanelRightOpen size={14} />{expanded === item.id ? "收起" : "详情"}</button><details className="action-menu" onClick={(event) => event.stopPropagation()}><summary><MoreHorizontal size={15} /><span>更多</span><ChevronDown size={12} /></summary><div className="action-menu-panel">{item.saleStatus === "active" && !item.saleFirstUsedAt && <button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { sold: false }, "已取消未使用出售")}>恢复未售</button>}<button onClick={() => toggleExpanded(item.id)}>{item.everSold ? "出售与授权记录" : "出售设置"}</button><button disabled={overviewData?.readOnly || writing || item.promoEligible === true} onClick={() => void setAccountPromotionSuspicion(item)}>{item.promoSuspiciousOverride ? "取消人工优惠存疑" : "标记可能掉优惠"}</button><button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { hidePromotion: !item.hidePromotion }, item.hidePromotion ? "已显示广告" : "已隐藏广告")}>{item.hidePromotion ? "显示广告" : "隐藏广告"}</button><button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { groupBoundary: !item.groupBoundary }, item.groupBoundary ? "已取消边界" : "已设置边界")}>{item.groupBoundary ? "取消红色边界" : "设为红色边界"}</button><button disabled={overviewData?.readOnly || writing || item.deactivationLocked} className="quick-danger" onClick={() => void deactivateOne(item)}>永久停用</button></div></details></div></td>
+            <td><div className="row-actions"><MarkPalette value={item.markColor} disabled={Boolean(overviewData?.readOnly)} saving={markSavingIds.has(item.id)} label={item.primaryEmail} onSelect={(color) => patchMarkColor(item, color)} /><button className="copy-current" disabled={Boolean(copyingAccountId)} title="复制当前账号说明" onClick={(event) => { event.stopPropagation(); void copyCurrentExport(item); }}><ClipboardCopy size={14} />{copyingAccountId === item.id ? "复制中…" : "复制"}</button><button className="detail-toggle" onClick={(event) => { event.stopPropagation(); toggleExpanded(item.id); }}><PanelRightOpen size={14} />{expanded === item.id ? "收起" : "详情"}</button><details className="action-menu" onClick={(event) => event.stopPropagation()}><summary><MoreHorizontal size={15} /><span>更多</span><ChevronDown size={12} /></summary><div className="action-menu-panel"><button onClick={() => void openCurrentMailboxLink(item)}><Globe2 size={14} />打开邮箱链接</button>{item.saleStatus === "active" && !item.saleFirstUsedAt && <button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { sold: false }, "已取消未使用出售")}>恢复未售</button>}<button onClick={() => toggleExpanded(item.id)}>{item.everSold ? "出售与授权记录" : "出售设置"}</button><button disabled={overviewData?.readOnly || writing || item.promoEligible === true} onClick={() => void setAccountPromotionSuspicion(item)}>{item.promoSuspiciousOverride ? "取消人工优惠存疑" : "标记可能掉优惠"}</button><button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { hidePromotion: !item.hidePromotion }, item.hidePromotion ? "已显示广告" : "已隐藏广告")}>{item.hidePromotion ? "显示广告" : "隐藏广告"}</button><button disabled={overviewData?.readOnly || writing} onClick={() => void patchAccount(item, { groupBoundary: !item.groupBoundary }, item.groupBoundary ? "已取消边界" : "已设置边界")}>{item.groupBoundary ? "取消红色边界" : "设为红色边界"}</button><button disabled={overviewData?.readOnly || writing || item.deactivationLocked} className="quick-danger" onClick={() => void deactivateOne(item)}>永久停用</button></div></details></div></td>
           </tr>
         </React.Fragment>)}</tbody></table>
         <div className="pagination"><span className="pagination-total">{tab === "deactivations" ? `共 ${total} 条 · 按封禁时间从新到旧` : `共 ${total} 条 · 新账号在上、旧账号在下；停用、归档和回收不会改变原始到达顺序`}</span><div><button disabled={page === 0} onClick={() => goToPage(0)}>首页</button><button disabled={page === 0} onClick={() => goToPage(Math.max(0, page - 1))}>上一页</button><span>第 {page + 1} / {totalPages} 页</span><button disabled={page + 1 >= totalPages} onClick={() => goToPage(page + 1)}>下一页</button><button disabled={page + 1 >= totalPages} onClick={() => goToPage(totalPages - 1)}>末页</button></div></div>
@@ -1806,7 +2148,7 @@ function AdminApp() {
     {expanded && <div className="detail-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setExpanded(""); }}>
       <aside className="detail-drawer" role="dialog" aria-modal="true" aria-label={`${expandedItem?.primaryEmail || "账号"}详情`}>
         <header className="detail-drawer-header"><div><span>账号详情</span><strong>{expandedItem?.primaryEmail || "正在读取账号"}</strong><small>绑定 · 授权 · 生命周期 · 支付检查</small>{expandedItem && <div className="detail-drawer-badges"><Badge tone={expandedItem.plan === "plus" ? "green" : "gray"}>{expandedItem.accountStateLabel || (expandedItem.plan === "plus" ? "Plus" : "Free")}</Badge><Badge tone="blue">{providerLabel(expandedItem.provider)}</Badge>{expandedItem.isAuto && <Badge tone="purple">Auto/API</Badge>}<Badge tone={expandedItem.deactivationLocked || expandedItem.identityStatus === "conflict" ? "red" : !expandedItem.hasAccessToken ? "yellow" : "green"}>{expandedItem.deactivationLocked ? "已停用" : expandedItem.identityStatus === "conflict" ? "身份待核对" : !expandedItem.hasAccessToken ? "待补 AT" : "健康"}</Badge></div>}</div><button aria-label="关闭账号详情" onClick={() => setExpanded("")}>×</button></header>
-        <div className="detail-drawer-scroll"><AccountExpanded id={expanded} readOnly={Boolean(overviewData?.readOnly)} commandWriter={String(overviewData?.commandWriter || "v2")} onRefresh={load} onCopy={copyValue} /></div>
+        <div className="detail-drawer-scroll"><AccountExpanded key={expanded} id={expanded} readOnly={Boolean(overviewData?.readOnly)} commandWriter={String(overviewData?.commandWriter || "v2")} onRefresh={load} onCopy={copyValue} /></div>
       </aside>
     </div>}
     <CopyFeedbackToast feedback={copyFeedback} onClose={() => setCopyFeedback(null)} onPreview={() => setCopyPreviewOpen(true)} />
@@ -1821,19 +2163,12 @@ function ShareSnapshotApp() {
   useEffect(() => {
     api(`/api/share/snapshot?t=${encodeURIComponent(token)}`).then(setData).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [token]);
-  return <main className="share-snapshot"><header><div><span className="sidebar-brand-mark">O</span><div><h1>{data?.label || "账号概览"}</h1><p>{data ? `${data.count} 个账号 · 剩余 ${data.remainingViews}/${data.maxViews} 次查看` : "正在读取快照"}</p></div></div></header>
+  return <main className="share-snapshot"><header><div><OpusBrand compact /><div><h1>{data?.label || "账号概览"}</h1><p>{data ? `${data.count} 个账号 · 剩余 ${data.remainingViews}/${data.maxViews} 次查看` : "正在读取快照"}</p></div></div></header>
     {error && <div className="error">{error}</div>}
     {data && <section className="share-snapshot-table"><table><thead><tr><th>邮箱</th><th>套餐 / 渠道</th><th>邮箱类型</th><th>状态</th></tr></thead><tbody>{data.results.map((item: any, index: number) => <tr key={`${item.emailMasked}-${index}`}><td><strong>{item.emailMasked}</strong></td><td>{item.billingChannel || (item.hasPlus ? "Plus" : "Free")}</td><td>{providerLabel(item.mailboxType)}</td><td>{item.hasDeactivation ? "已停用" : "可用"}</td></tr>)}</tbody></table></section>}
   </main>;
 }
 
 const rootElement = document.getElementById("root")!;
-if (!location.pathname.startsWith("/adminshare") && !location.pathname.startsWith("/admin")) {
-  const legacyMailbox = new URL("https://legacy-mail.example.com/");
-  legacyMailbox.search = location.search;
-  legacyMailbox.hash = location.hash;
-  location.replace(legacyMailbox.toString());
-} else {
-  const root = createRoot(rootElement);
-  root.render(location.pathname.startsWith("/adminshare") ? <ShareSnapshotApp /> : <AdminApp />);
-}
+const root = createRoot(rootElement);
+root.render(location.pathname.startsWith("/adminshare") ? <ShareSnapshotApp /> : <AdminApp />);

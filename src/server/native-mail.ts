@@ -1,7 +1,11 @@
 import { emailHash, normalizeEmail } from "./association.js";
 import { db } from "./db.js";
+import { decryptSecret } from "./crypto.js";
+import { MailReadError, type D1MailReader } from "./cf-mail.js";
+import { isDeactivationSubject, isVerificationMail } from "./mail-classification.js";
+import { fetchExternalMessage } from "./external-mailbox.js";
 import { isStrictPlusEvidenceSubject } from "./plus-evidence.js";
-import { fetchOutlookMessage, fetchSharedMessage, listOutlookManagerAccounts, listOutlookManagerMails } from "./upstream-mail.js";
+import { fetchOutlookMessage, fetchSharedMessage, listOutlookManagerAccounts, listOutlookManagerMails, sharedMailReader, stripHtml } from "./upstream-mail.js";
 
 function integer(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = Number(value);
@@ -27,8 +31,9 @@ export function listAdminAccountMails(accountId: string, offsetInput: unknown, l
 
 async function outlookMailboxForProvider(provider: string): Promise<string> {
   const hash = provider.replace(/^outlook:/, "");
-  const accounts = await listOutlookManagerAccounts();
-  return normalizeEmail(accounts.find((item) => emailHash(normalizeEmail(item?.email)) === hash)?.email || "");
+  const connection = db.prepare(`SELECT manager_email_enc FROM mailbox_connections
+    WHERE provider='outlook-manager' AND external_account_id=? AND status='active' LIMIT 1`).get(hash) as any;
+  return connection?.manager_email_enc ? normalizeEmail(decryptSecret(connection.manager_email_enc)) : "";
 }
 
 export async function adminAccountMailDetail(accountId: string, messageId: string): Promise<Record<string, unknown> | null> {
@@ -36,19 +41,33 @@ export async function adminAccountMailDetail(accountId: string, messageId: strin
     WHERE oc.account_id=? AND m.id=? LIMIT 1`).get(accountId, messageId) as any;
   if (!row) return null;
   let text = "";
+  let html = "";
   if (String(row.provider) === "shared-mail-api") {
-    text = String((await fetchSharedMessage(String(row.provider_message_id)).catch(() => null))?.text || "");
+    const detail = await fetchSharedMessage(String(row.provider_message_id), row.recipient_enc ? decryptSecret(row.recipient_enc) : "");
+    if (!detail) throw new MailReadError("mail_upstream_missing", 404);
+    text = detail.text;
+    html = detail.html;
   } else if (String(row.provider).startsWith("outlook:")) {
     const mailbox = await outlookMailboxForProvider(String(row.provider));
-    text = String((await fetchOutlookMessage(mailbox, String(row.provider_message_id), String(row.folder || "inbox")).catch(() => null))?.text || "");
+    const detail = await fetchOutlookMessage(mailbox, String(row.provider_message_id), String(row.folder || "inbox"));
+    if (!detail) throw new MailReadError("mail_upstream_missing", 404);
+    text = detail.text;
+    html = detail.html;
+  } else if (String(row.provider).startsWith("external:")) {
+    const detail = await fetchExternalMessage(accountId, messageId);
+    if (!detail) throw new MailReadError("mail_upstream_missing", 404);
+    text = detail.text;
+    html = detail.html;
+  } else {
+    throw new MailReadError("mail_provider_unsupported");
   }
-  return { ok: true, mail: { id: row.id, from: row.sender, subject: row.subject, created_at: row.received_at, folder: row.folder, text } };
+  return { ok: true, mail: { id: row.id, from: row.sender, subject: row.subject, created_at: row.received_at, folder: row.folder, text, html } };
 }
 
 export function extractVerificationCode(value: Record<string, unknown>): string {
-  const content = `${String(value.subject || "")}\n${String(value.text || "")}`;
+  const content = `${String(value.subject || "")}\n${String(value.text || "")}\n${stripHtml(String(value.html || ""))}`;
   const patterns = [
-    /(?:verification|login|temporary|one[- ]time|security|验证码|驗證碼|登录代码|登入代碼|認証コード|確認コード|検証コード|一時検証コード|一時的な認証コード)[^0-9]{0,120}([0-9]{6})(?![0-9])/i,
+    /(?:verification|login|temporary|one[- ]time|security|验证码|驗證碼|登录代码|登入代碼|認証コード|確認コード|検証コード|一時検証コード|一時的な認証コード|この一時検証コードを入力して続行)[^0-9]{0,120}([0-9]{6})(?![0-9])/i,
     /(^|[^0-9])([0-9]{6})(?![0-9])/,
   ];
   for (const pattern of patterns) {
@@ -59,22 +78,99 @@ export function extractVerificationCode(value: Record<string, unknown>): string 
 }
 
 function likelyVerificationMail(value: Record<string, unknown>): boolean {
-  const subject = String(value.subject || "");
+  const subject = String(value.subject || "").replace(/\s+/g, " ").trim();
   const sender = String(value.from || "");
-  return /(?:openai|chatgpt).*(?:code|verify|verification|login|登录|登入|验证码|驗證碼|認証|検証)/i.test(subject)
+  return isVerificationMail(subject, sender)
+    || /(?:openai|chatgpt).*(?:code|verify|verification|login|登录|登入|验证码|驗證碼|認証|検証)/i.test(subject)
     || /(?:temporary|one[- ]time|security|verification).*(?:code|login)/i.test(subject)
+    || /(?:一時的な認証コード|一時検証コード|検証コード|認証コード)/.test(subject)
     || /(?:noreply|no-reply).*openai/i.test(sender);
 }
 
-export async function accountVerificationCode(accountId: string): Promise<Record<string, unknown>> {
-  const page = listAdminAccountMails(accountId, 0, 20) as any;
-  for (const candidate of (page.results || []).filter(likelyVerificationMail).slice(0, 8)) {
-    const detail = await adminAccountMailDetail(accountId, String(candidate.id));
+const verificationResults = new Map<string, { expiresAt: number; result: Record<string, unknown> }>();
+const verificationPending = new Map<string, Promise<Record<string, unknown>>>();
+
+export interface VerificationCodeOptions { bindingId?: string; ignoreAccessWindow?: boolean }
+
+type AccountMailDetailReader = typeof adminAccountMailDetail;
+
+function verificationCandidates(accountId: string, options: VerificationCodeOptions): { binding: any; rows: any[] } {
+  const binding = options.bindingId
+    ? db.prepare("SELECT * FROM email_bindings WHERE id=? AND account_id=?").get(options.bindingId, accountId) as any
+    : db.prepare("SELECT * FROM email_bindings WHERE account_id=? ORDER BY is_current DESC, valid_from DESC LIMIT 1").get(accountId) as any;
+  if (!binding) return { binding: null, rows: [] };
+  const rows = db.prepare(`SELECT DISTINCT m.id,m.sender AS "from",m.subject,m.received_at AS created_at,m.folder,m.category,m.indexed_at
+    FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
+    WHERE c.account_id=? AND c.binding_id=? AND m.received_at<>''
+      AND NOT EXISTS(SELECT 1 FROM mail_ownership_claims other WHERE other.message_id=m.id AND other.account_id<>?)
+      AND (?=1 OR ((?='' OR m.received_at>=?) AND (?='' OR m.received_at<?)
+        AND (?='' OR m.received_at<=?)))
+    ORDER BY m.received_at DESC,m.id DESC LIMIT 20`).all(accountId, binding.id, accountId, Number(options.ignoreAccessWindow === true),
+    binding.valid_from, binding.valid_from, binding.valid_to, binding.valid_to,
+    binding.receive_disabled_at, binding.receive_disabled_at) as any[];
+  return { binding, rows };
+}
+
+async function readAccountVerificationCode(accountId: string, rows: any[], detailReader: AccountMailDetailReader): Promise<Record<string, unknown>> {
+  for (const candidate of rows.filter(likelyVerificationMail).slice(0, 8)) {
+    const detail = await detailReader(accountId, String(candidate.id));
     const mail = (detail as any)?.mail || candidate;
     const verificationCode = extractVerificationCode(mail);
-    if (verificationCode) return { ok: true, item: { ...mail, verificationCode } };
+    if (verificationCode) return { ok: true, item: { id: candidate.id, from: candidate.from, subject: candidate.subject,
+      created_at: candidate.created_at, folder: candidate.folder, category: candidate.category, verificationCode } };
   }
   return { ok: true, item: null };
+}
+
+export function accountVerificationCode(accountId: string, options: VerificationCodeOptions = {}, detailReader: AccountMailDetailReader = adminAccountMailDetail): Promise<Record<string, unknown>> {
+  const { binding, rows } = verificationCandidates(accountId, options);
+  const key = JSON.stringify([accountId, binding?.id || "", binding?.valid_from || "", binding?.valid_to || "",
+    binding?.receive_disabled_at || "", options.ignoreAccessWindow === true, rows.map((row) => [row.id, row.indexed_at])]);
+  const cached = verificationResults.get(key);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.result);
+  const pending = verificationPending.get(key);
+  if (pending) return pending;
+  const task = readAccountVerificationCode(accountId, rows, detailReader).then((result) => {
+    for (const [entry, value] of verificationResults) if (value.expiresAt <= Date.now()) verificationResults.delete(entry);
+    verificationResults.set(key, { expiresAt: Date.now() + 60_000, result });
+    return result;
+  }).finally(() => verificationPending.delete(key));
+  verificationPending.set(key, task);
+  return task;
+}
+
+export async function pendingMailboxVerificationCode(emailInput: unknown, reader: Pick<D1MailReader, "byId"> = sharedMailReader): Promise<Record<string, unknown>> {
+  const email = normalizeEmail(emailInput);
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new MailReadError("invalid_mailbox_email", 400);
+  const pending = db.prepare("SELECT id,created_at FROM pending_mailboxes WHERE email_hash=?").get(emailHash(email)) as any;
+  if (!pending) throw new MailReadError("pending_mailbox_not_found", 404);
+  const rows = db.prepare(`SELECT m.* FROM mail_messages m JOIN pending_mail_claims c ON c.message_id=m.id
+    WHERE c.pending_id=? AND m.received_at>=datetime(?,'-5 minutes')
+      AND (m.received_at>=? OR c.created_at>=?)
+    ORDER BY m.received_at DESC,m.id DESC LIMIT 20`)
+    .all(pending.id, pending.created_at, pending.created_at, pending.created_at) as any[];
+  const key = `pending:${pending.id}:${pending.created_at}:${rows[0]?.id || ""}:${rows[0]?.indexed_at || ""}`;
+  const cached = verificationResults.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.result;
+  const inflight = verificationPending.get(key);
+  if (inflight) return inflight;
+  const task = (async () => {
+    for (const candidate of rows.filter((row) => likelyVerificationMail({ subject: row.subject, from: row.sender })).slice(0, 8)) {
+      if (candidate.provider !== "shared-mail-api") continue;
+      const detail = await fetchSharedMessage(String(candidate.provider_message_id), email, reader);
+      if (!detail) continue;
+      const verificationCode = extractVerificationCode(detail as unknown as Record<string, unknown>);
+      if (verificationCode) return { ok: true, item: { id: candidate.id, from: candidate.sender,
+        subject: candidate.subject, created_at: candidate.received_at, folder: candidate.folder, verificationCode } };
+    }
+    return { ok: true, item: null };
+  })().then((result) => {
+    for (const [entry, value] of verificationResults) if (value.expiresAt <= Date.now()) verificationResults.delete(entry);
+    verificationResults.set(key, { expiresAt: Date.now() + 60_000, result });
+    return result;
+  }).finally(() => verificationPending.delete(key));
+  verificationPending.set(key, task);
+  return task;
 }
 
 interface OutlookPoolCache {
@@ -85,7 +181,7 @@ interface OutlookPoolCache {
 let outlookPoolCache: OutlookPoolCache | null = null;
 
 function classifySubjects(subjects: string[]): Record<string, unknown> {
-  const hasDeactivation = subjects.some((subject) => /access deactivated|访问权限已停用|账号已停用|アクセスが無効/i.test(subject));
+  const hasDeactivation = subjects.some(isDeactivationSubject);
   const hasPlus = subjects.some(isStrictPlusEvidenceSubject);
   const hasActivity = subjects.some((subject) => /new sign-in|login code|verification|welcome to (?:chatgpt|openai)|登录|验证码/i.test(subject));
   const opened = hasDeactivation || hasPlus || hasActivity;

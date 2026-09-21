@@ -19,7 +19,10 @@
     "backup": "node dist/server/server/backup.js",
     "migrate:v1": "tsx src/server/migrate-v1.ts",
     "audit": "tsx scripts/audit-production.ts",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "test:offline": "node scripts/test-offline.mjs",
+    "validate:mailbox-batch-copy": "tsx scripts/validate-mailbox-batch-copy.ts",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc --noEmit"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

@@ -47,7 +47,12 @@ test("支付方式检查按 OpenAI subject hash 批量匹配并安全 upsert", a
   assert.equal(account.paymentExposureUnknownCount, 0);
 
   const changed = repository.ingestPaymentExposureChecks([{
-    ...checks[0], openaiSubjectHash: subjectHash, exposed: false, matchedMethods: [], promoEligible: false,
+    ...checks[0], openaiSubjectHash: subjectHash, exposed: false, availableMethods: ["apple_pay"], matchedMethods: [],
+    paymentMethods: [
+      { type: "card", displayName: "Card", source: "oaics" },
+      { type: "apple_pay", displayName: "Apple Pay", source: "oaics" },
+    ],
+    promoEligible: false,
   }]);
   assert.deepEqual(changed, { accepted: 1, updated: 1, errors: [] });
 
@@ -55,6 +60,12 @@ test("支付方式检查按 OpenAI subject hash 批量匹配并安全 upsert", a
   assert.ok(detail);
   assert.equal(detail.paymentExposureChecks.length, 3);
   assert.equal(detail.paymentExposureChecks.find((check) => check.target === "ideal")?.exposed, false);
-  assert.equal(detail.paymentExposureChecks.find((check) => check.target === "ideal")?.paymentMethods[1]?.id, "cpmt_1togstc6h1nxgoi3wuvey2cj");
+  const ideal = detail.paymentExposureChecks.find((check) => check.target === "ideal");
+  assert.deepEqual(ideal?.availableMethods, ["card", "ideal", "apple_pay"]);
+  assert.deepEqual(ideal?.matchedMethods, ["ideal"]);
+  assert.equal(ideal?.paymentMethods[1]?.id, "cpmt_1togstc6h1nxgoi3wuvey2cj");
+  assert.deepEqual(ideal?.paymentMethods.find((method) => method.type === "card")?.sources, ["stripe", "oaics"]);
+  assert.equal(ideal?.paymentMethods.filter((method) => method.type === "card").length, 1);
+  assert.equal(ideal?.paymentMethods.some((method) => method.type === "apple_pay"), true);
   assert.equal(detail.paymentExposureChecks.find((check) => check.target === "ideal")?.trialStatus, "observed");
 });

@@ -283,13 +283,17 @@ class PromotionCheckNotNeededError extends Error {
   }
 }
 
+export function promotionLifecycleEligible(status: unknown): boolean {
+  return ["active", "third_party_registered"].includes(String(status || ""));
+}
+
 function assertPromotionCheckNeeded(accountId: string): void {
   const account = db.prepare(`SELECT lifecycle_status, deactivation_locked, plan, deleted_at
     FROM gpt_accounts WHERE id=?`).get(accountId) as any;
   if (!account || String(account.deleted_at || "")) {
     throw new PromotionCheckNotNeededError("missing", "账号不存在或已删除，已跳过优惠检测");
   }
-  if (String(account.lifecycle_status || "") !== "active" || Number(account.deactivation_locked || 0)) {
+  if (!promotionLifecycleEligible(account.lifecycle_status) || Number(account.deactivation_locked || 0)) {
     throw new PromotionCheckNotNeededError("inactive", "账号已停用或不再活跃，无需检测优惠");
   }
   if (String(account.plan || "").trim().toLowerCase() === "plus") {
@@ -355,7 +359,7 @@ export function scheduleDuePromotionChecks(now = new Date()): { queued: number }
     FROM gpt_accounts a
     JOIN account_current_credentials cc ON cc.account_id=a.id
     JOIN credential_versions cv ON cv.id=cc.credential_version_id
-    WHERE a.deleted_at='' AND a.lifecycle_status='active' AND a.deactivation_locked=0
+    WHERE a.deleted_at='' AND a.lifecycle_status IN ('active','third_party_registered') AND a.deactivation_locked=0
       AND lower(trim(a.plan))!='plus' AND cv.access_token_enc!=''
       AND cv.validity_status NOT IN ('invalid','conflict') AND cv.first_seen_at<=?
       AND NOT EXISTS(SELECT 1 FROM promotion_jobs j WHERE j.account_id=a.id AND j.credential_version_id=cv.id
@@ -394,7 +398,8 @@ export async function runPromotionQueue(limit = config.autoTrialBatchSize, concu
     next_retry_at='', finished_at=?, updated_at=?
     WHERE status IN ('queued','retry_wait') AND EXISTS(SELECT 1 FROM gpt_accounts a
       WHERE a.id=promotion_jobs.account_id AND
-      (a.deleted_at!='' OR a.lifecycle_status!='active' OR a.deactivation_locked=1 OR lower(trim(a.plan))='plus'))`).run(now, now);
+      (a.deleted_at!='' OR a.lifecycle_status NOT IN ('active','third_party_registered')
+        OR a.deactivation_locked=1 OR lower(trim(a.plan))='plus'))`).run(now, now);
   const rows = db.prepare(`SELECT * FROM promotion_jobs WHERE
       status='queued' OR (status='retry_wait' AND next_retry_at!='' AND next_retry_at<=?)
     ORDER BY CASE WHEN check_kind='manual' THEN 0 ELSE 1 END, due_at ASC LIMIT ?`).all(now, limit) as any[];

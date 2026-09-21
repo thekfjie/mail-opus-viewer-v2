@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 import {
   isPlanOrderSubject,
@@ -18,5 +19,13 @@ test("V2 只把严格激活、续费或付款主题作为 Plus 证据", () => {
 test("V2 单独识别新套餐候选与免费/零元主题", () => {
   assert.equal(isPlanOrderSubject("ChatGPT - 你的新套餐"), true);
   assert.equal(isTrialOrZeroChargeSubject("ChatGPT Plus 初月無料"), true);
+  assert.equal(isTrialOrZeroChargeSubject("ChatGPT Plus Tháng đầu tiên miễn phí"), true);
   assert.equal(isTrialOrZeroChargeSubject("ChatGPT Plus receipt - 0.00 USD"), true);
+
+  const subscriptionContract = fs.readFileSync(
+    new URL("../docs/openai-subscription-contract.md", import.meta.url), "utf8",
+  );
+  assert.match(subscriptionContract, /\/backend-api\/subscriptions\?account_id=/);
+  assert.match(subscriptionContract, /`active_until`[\s\S]*Plus retention period 截止时间/);
+  assert.match(subscriptionContract, /`grace_period_end_timestamp`/);
 });

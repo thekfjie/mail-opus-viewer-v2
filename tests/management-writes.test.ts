@@ -4,20 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-test("API 与 Worker 的 SQLite 写入等待完整 V1 投影完成", () => {
+test("API 与 Worker 的 SQLite 写入保留有界 busy timeout", () => {
   const configSource = fs.readFileSync(path.join(process.cwd(), "src/server/config.ts"), "utf8");
   const dbSource = fs.readFileSync(path.join(process.cwd(), "src/server/db.ts"), "utf8");
   assert.match(configSource, /V2_SQLITE_BUSY_TIMEOUT_MS\s*\|\|\s*30_000/);
   assert.match(dbSource, /busy_timeout = \$\{config\.sqliteBusyTimeoutMs\}/);
 });
 
-test("单账号凭证保存允许 V1 写入成功后后台投影，避免阻塞弹窗", () => {
-  const source = fs.readFileSync(path.join(process.cwd(), "src/server/v1-compat.ts"), "utf8");
+test("单账号凭证保存直接调用本地领域服务，不异步投影旧状态", () => {
   const server = fs.readFileSync(path.join(process.cwd(), "src/server/server.ts"), "utf8");
-  assert.match(source, /proxyV1AndScheduleSync/);
-  assert.match(source, /setTimeout\(\(\) =>/);
-  assert.match(source, /syncPending: true/);
-  assert.match(server, /proxyV1AndScheduleSync/);
+  assert.match(server, /return saveAccountCredentials\(accountId, body\)/);
+  assert.doesNotMatch(server, /proxyV1AndScheduleSync|syncPending/);
 });
 
 test("导入、永久停用、改绑、授权截止和回收保持账号隔离", async (t) => {
@@ -59,7 +56,21 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
     idToken: "",
     sessionToken: "",
     openaiPassword: "",
+    totpSecret: "",
   });
+  const automaticExport = repository.provisionCurrentCustomerExport(account.id);
+  assert.equal(automaticExport?.available, true);
+  assert.ok(automaticExport?.publicUrl.startsWith("https://mail.example.test/#m="));
+  const automaticToken = new URL(String(automaticExport?.publicUrl)).hash.replace(/^#m=/, "");
+  assert.ok(repository.grantByPublicToken(automaticToken));
+  assert.deepEqual(
+    db.prepare("SELECT sold FROM gpt_accounts WHERE id=?").get(account.id),
+    { sold: 0 },
+  );
+  assert.deepEqual(
+    db.prepare("SELECT sale_id,active,scope FROM access_grants WHERE account_id=? AND active=1 AND scope='current' AND sale_id IS NULL LIMIT 1").get(account.id),
+    { sale_id: null, active: 1, scope: "current" },
+  );
   const manuallySaved = repository.saveAccountCredentials(account.id, {
     accessToken: "manual-at", refreshToken: "manual-rt", idToken: "", sessionToken: "", openaiPassword: "manual-password",
   });
@@ -73,10 +84,17 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   assert.ok(grant.publicUrl.startsWith("https://mail.example.test/#m="));
   assert.equal(grant.password, "customer-password");
   assert.ok(repository.grantByPublicToken(grant.publicToken));
+  const parallelGrant = repository.createCustomerGrant(account.id, oldBinding.id, { password: "parallel-customer-password" });
+  assert.ok(repository.grantByPublicToken(grant.publicToken));
+  assert.ok(repository.grantByPublicToken(parallelGrant.publicToken));
+  assert.equal((db.prepare("SELECT COUNT(*) n FROM access_grants WHERE account_id=? AND active=1 AND scope='current'").get(account.id) as any).n, 3);
 
   repository.deactivateAccount(account.id, "detected_bad");
+  assert.deepEqual(db.prepare("SELECT scope,visible_to,active FROM access_grants WHERE id=?").get(grant.grantId),
+    { scope: "current", visible_to: "", active: 1 });
+  assert.ok(repository.grantByPublicToken(grant.publicToken));
   const rebound = repository.importAccounts([{
-    email: "locked+oai@example.com",
+    email: "locked+oai@ai-mail.tech",
     accessToken: "new-at",
     refreshToken: "new-rt",
     openaiSubject: "openai-user-1",
@@ -102,13 +120,15 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
     idToken: "",
     sessionToken: "",
     openaiPassword: "",
+    totpSecret: "",
   });
   assert.equal((db.prepare(`SELECT count(*) count FROM credential_versions
     WHERE account_id=? AND retired_reason='superseded'`).get(account.id) as any).count, 2);
   assert.equal(repository.getCurrentCustomerExport(account.id)?.available, false);
-  assert.throws(() => repository.createCustomerGrant(account.id, newBinding.id, { password: "new-customer-password" }), /不能出售/);
+  const reboundGrant = repository.createCustomerGrant(account.id, newBinding.id, { password: "new-customer-password" });
+  assert.ok(repository.grantByPublicToken(reboundGrant.publicToken));
 
-  const recycled = repository.recycleAccount(account.id, "fresh-child@example.net", "free");
+  const recycled = repository.recycleAccount(account.id, "fresh-child@kfjie.me", "free");
   assert.equal(recycled.previous.lifecycleStatus, "deactivated");
   assert.equal(recycled.previous.deactivationLocked, true);
   assert.equal(recycled.replacement.lifecycleStatus, "active");
@@ -116,6 +136,9 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   const oldRow = db.prepare("SELECT retired_at, deleted_at FROM gpt_accounts WHERE id=?").get(account.id) as any;
   assert.ok(oldRow.retired_at);
   assert.equal(oldRow.deleted_at, "");
+  assert.equal(repository.grantByPublicToken(grant.publicToken), null);
+  assert.equal(repository.grantById(grant.grantId), null);
+  assert.equal((db.prepare("SELECT COUNT(*) n FROM access_grants WHERE account_id=? AND scope!='admin_only' AND active=1").get(account.id) as any).n, 0);
   assert.equal(db.prepare("SELECT 1 FROM credentials WHERE account_id=?").get(recycled.replacement.id), undefined);
   const replacementGrants = db.prepare("SELECT scope, active FROM access_grants WHERE account_id=?").all(recycled.replacement.id) as any[];
   assert.ok(replacementGrants.length >= 1);
@@ -124,13 +147,13 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
     account.id, recycled.replacement.id,
   ) as any).count), 1);
 
-  const reboundReplacement = repository.createRebind(recycled.replacement.id, "fresh-child@example.com");
+  const reboundReplacement = repository.createRebind(recycled.replacement.id, "fresh-child@ai-mail.tech");
   assert.equal(reboundReplacement.id, recycled.replacement.id);
   assert.equal(reboundReplacement.bindingCount, 2);
   assert.equal(reboundReplacement.deactivationLocked, false);
   assert.equal(repository.revealCredentials(recycled.replacement.id), null);
   const credentialImport = repository.importAccounts([{
-    email: "fresh-child@example.com",
+    email: "fresh-child@ai-mail.tech",
     accessToken: "fresh-at",
     refreshToken: "fresh-rt",
     openaiSubject: "openai-user-2",
@@ -147,9 +170,9 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   assert.ok(repository.grantByPublicToken(replacementGrant.publicToken));
   const currentExport = repository.getCurrentCustomerExport(recycled.replacement.id);
   assert.equal(currentExport?.available, true);
-  assert.equal(currentExport?.currentEmail, "fresh-child@example.com");
+  assert.equal(currentExport?.currentEmail, "fresh-child@ai-mail.tech");
   assert.ok(currentExport?.publicUrl.startsWith("https://mail.example.test/#m="));
-  assert.equal(currentExport?.text, `ai账号：fresh-child@example.com\n邮箱验证码：${currentExport?.publicUrl}`);
+  assert.equal(currentExport?.text, `ai账号：fresh-child@ai-mail.tech | 邮箱验证码：${currentExport?.publicUrl}`);
   assert.ok(currentExport?.text.endsWith(String(currentExport?.publicUrl)));
   assert.throws(() => repository.updateAccount(recycled.replacement.id, { sold: false }), /不能恢复未售/);
   assert.throws(() => repository.createRebind(recycled.replacement.id, "fresh-child@icloud.com"), /已售且未停用/);
@@ -163,7 +186,7 @@ test("导入、永久停用、改绑、授权截止和回收保持账号隔离",
   assert.equal(Number((db.prepare("SELECT COUNT(*) count FROM lifecycle_events WHERE account_id=? AND event_type='account_deactivated'").get(account.id) as any).count), 1);
 
   const conflicting = repository.importAccounts([{
-    email: "fresh-child@example.com",
+    email: "fresh-child@ai-mail.tech",
     accessToken: "wrong-at",
     openaiSubject: "openai-user-1",
   }]);

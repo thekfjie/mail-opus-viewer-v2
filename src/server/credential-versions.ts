@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { db } from "./db.js";
 import { encryptSecret } from "./crypto.js";
+import { quarantineAccount } from "./account-transitions.js";
 
 export interface CredentialObservationInput {
   accountId: string;
@@ -168,9 +169,7 @@ export function observeCredentialVersion(input: CredentialObservationInput): Cre
         ? "新凭证 subject 与管理员确认的付费账号冲突，版本已保留且未切换当前指针"
         : "新凭证 subject 与账号当前凭证冲突，版本已保留但未切换当前指针";
       if (!protectedPaidAccount) {
-        db.prepare(`UPDATE gpt_accounts SET lifecycle_status=CASE WHEN deactivation_locked=1 THEN 'deactivated' ELSE 'quarantined' END,
-          identity_status='conflict', quarantined_at=CASE WHEN quarantined_at='' THEN ? ELSE quarantined_at END,
-          quarantine_reason=?, updated_at=? WHERE id=?`).run(observedAt, reason, observedAt, input.accountId);
+        quarantineAccount(input.accountId, reason, input.source, { versionId, bindingId });
       }
       db.prepare(`INSERT OR IGNORE INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, evidence_json, created_at, updated_at)
         VALUES(?, 'credential_subject_conflict', ?, ?, ?, ?, ?, ?)`).run(

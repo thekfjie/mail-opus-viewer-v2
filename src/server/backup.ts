@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { config } from "./config.js";
-import { db } from "./db.js";
 
-const backupDirectory = process.env.V2_BACKUP_DIRECTORY || "/var/backups/mail-opus-v2";
+const db = new Database(config.databasePath, { readonly: true, fileMustExist: true });
+
+const backupDirectory = process.env.V2_BACKUP_DIRECTORY || path.join(config.projectRoot, ".state", "backups");
 const retention = Math.max(7, Math.min(180, Number(process.env.V2_BACKUP_RETENTION || 45)));
 fs.mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
 for (const name of fs.readdirSync(backupDirectory).filter((entry) => /\.sqlite\.tmp(?:-wal|-shm)?$/.test(entry))) {

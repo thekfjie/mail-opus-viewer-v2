@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS gpt_accounts (
   lifecycle_status TEXT NOT NULL DEFAULT 'active',
   deactivation_locked INTEGER NOT NULL DEFAULT 0,
   deactivated_at TEXT NOT NULL DEFAULT '',
+  admin_deactivated_at TEXT NOT NULL DEFAULT '',
   retired_at TEXT NOT NULL DEFAULT '',
   quarantined_at TEXT NOT NULL DEFAULT '',
   quarantine_reason TEXT NOT NULL DEFAULT '',
@@ -51,6 +52,8 @@ CREATE TABLE IF NOT EXISTS gpt_accounts (
   mark_color TEXT NOT NULL DEFAULT '',
   group_boundary INTEGER NOT NULL DEFAULT 0,
   source_status TEXT NOT NULL DEFAULT 'current',
+  openai_mfa_enabled INTEGER NOT NULL DEFAULT 0,
+  openai_auth_methods_json TEXT NOT NULL DEFAULT '[]',
   arrived_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -190,6 +193,7 @@ CREATE TABLE IF NOT EXISTS payment_exposure_checks (
   detail TEXT NOT NULL DEFAULT '',
   promo_eligible INTEGER NOT NULL DEFAULT -1,
   promo_campaign TEXT NOT NULL DEFAULT '',
+  promo_mode TEXT NOT NULL DEFAULT 'unknown',
   observed_at TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'automyai',
   created_at TEXT NOT NULL,
@@ -199,6 +203,7 @@ CREATE TABLE IF NOT EXISTS payment_exposure_checks (
 
 CREATE TABLE IF NOT EXISTS payment_exposure_jobs (
   job_id TEXT PRIMARY KEY,
+  remote_job_id TEXT NOT NULL DEFAULT '',
   account_id TEXT NOT NULL REFERENCES gpt_accounts(id),
   route_key TEXT NOT NULL,
   target TEXT NOT NULL,
@@ -208,6 +213,7 @@ CREATE TABLE IF NOT EXISTS payment_exposure_jobs (
   job_kind TEXT NOT NULL DEFAULT 'manual',
   access_token_fingerprint TEXT NOT NULL DEFAULT '',
   scheduled_at TEXT NOT NULL DEFAULT '',
+  promo_mode TEXT NOT NULL DEFAULT 'none',
   status TEXT NOT NULL DEFAULT 'queued',
   last_error TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL DEFAULT '',
@@ -340,11 +346,14 @@ ensureColumn("access_grants", "revoked_at", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("access_grants", "revoke_reason", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("payment_exposure_checks", "payment_methods_json", "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn("payment_exposure_checks", "trial_status", "TEXT NOT NULL DEFAULT 'unknown'");
+ensureColumn("payment_exposure_checks", "promo_mode", "TEXT NOT NULL DEFAULT 'unknown'");
 ensureColumn("credentials", "access_token_fingerprint", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("credentials", "access_token_first_seen_at", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("payment_exposure_jobs", "job_kind", "TEXT NOT NULL DEFAULT 'manual'");
 ensureColumn("payment_exposure_jobs", "access_token_fingerprint", "TEXT NOT NULL DEFAULT ''");
 ensureColumn("payment_exposure_jobs", "scheduled_at", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("payment_exposure_jobs", "remote_job_id", "TEXT NOT NULL DEFAULT ''");
+ensureColumn("payment_exposure_jobs", "promo_mode", "TEXT NOT NULL DEFAULT 'none'");
 
 db.exec("CREATE INDEX IF NOT EXISTS idx_grants_sale ON access_grants(sale_id, active)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_payment_exposure_jobs_dedupe ON payment_exposure_jobs(account_id, job_kind, access_token_fingerprint, status)");

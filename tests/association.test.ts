@@ -9,7 +9,7 @@ function record(id: string, email: string, extra: Partial<LegacyRecord> = {}): L
 test("完整本地部分相同但没有身份或显式关系时保持两个账号", () => {
   const graph = buildAssociationGraph([
     record("1", "okays_hymn.8n@icloud.com"),
-    record("2", "okays_hymn.8n@example.com"),
+    record("2", "okays_hymn.8n@ai-mail.tech"),
   ], new Set());
   assert.equal(graph.groups.size, 2);
   assert.equal(graph.inferredRebindPairs.length, 0);
@@ -18,7 +18,7 @@ test("完整本地部分相同但没有身份或显式关系时保持两个账�
 test("不同+oai后缀永远不能按基础前缀合并", () => {
   const graph = buildAssociationGraph([
     record("1", "todo.leavers_0u+oaiqaparr@icloud.com"),
-    record("2", "todo.leavers_0u+oaizgumpg@example.com"),
+    record("2", "todo.leavers_0u+oaizgumpg@ai-mail.tech"),
   ], new Set());
   assert.equal(graph.groups.size, 2);
   assert.equal(graph.inferredRebindPairs.length, 0);
@@ -46,7 +46,7 @@ test("历史 mail 别名显式列入路由集合时同样不参与账号关联",
 test("只有备份中找回的同名记录不会静默并入当前账号", () => {
   const graph = buildAssociationGraph([
     record("1", "name@icloud.com"),
-    record("2", "name@example.com", { __sourceStatus: "recovered", __sourcePath: "/backup" }),
+    record("2", "name@ai-mail.tech", { __sourceStatus: "recovered", __sourcePath: "/backup" }),
   ], new Set());
   assert.equal(graph.groups.size, 2);
 });
@@ -54,7 +54,7 @@ test("只有备份中找回的同名记录不会静默并入当前账号", () =>
 test("显式改绑关系优先，可关联备份恢复记录", () => {
   const graph = buildAssociationGraph([
     record("1", "name@icloud.com", { rebindNextId: "2", rebindChangedAt: "2026-08-21T00:00:00.000Z" }),
-    record("2", "name@example.com", { __sourceStatus: "recovered", __sourcePath: "/backup", rebindPreviousId: "1" }),
+    record("2", "name@ai-mail.tech", { __sourceStatus: "recovered", __sourcePath: "/backup", rebindPreviousId: "1" }),
   ], new Set());
   assert.equal(graph.groups.size, 1);
   assert.equal(graph.inferredRebindPairs[0]?.method, "legacy_explicit_rebind");
@@ -63,7 +63,7 @@ test("显式改绑关系优先，可关联备份恢复记录", () => {
 test("可信域同前缀但OpenAI身份冲突时禁止合并", () => {
   const graph = buildAssociationGraph([
     record("1", "same@icloud.com", { __identityKey: "identity-a" }),
-    record("2", "same@example.com", { __identityKey: "identity-b" }),
+    record("2", "same@ai-mail.tech", { __identityKey: "identity-b" }),
   ], new Set());
   assert.equal(graph.groups.size, 2);
   assert.equal(graph.inferredRebindPairs.length, 0);
@@ -73,7 +73,7 @@ test("可信域同前缀但OpenAI身份冲突时禁止合并", () => {
 test("回收前后即使同前缀也不能重新合并", () => {
   const graph = buildAssociationGraph([
     record("1", "same@icloud.com", { recycledToId: "2" }),
-    record("2", "same@example.com", { recycledFromId: "1" }),
+    record("2", "same@ai-mail.tech", { recycledFromId: "1" }),
   ], new Set());
   assert.equal(graph.groups.size, 2);
   assert.equal(graph.inferredRebindPairs.length, 0);
@@ -82,7 +82,7 @@ test("回收前后即使同前缀也不能重新合并", () => {
 test("Outlook与自有域不依靠同前缀自动合并", () => {
   const graph = buildAssociationGraph([
     record("1", "same@outlook.com"),
-    record("2", "same@example.net"),
+    record("2", "same@kfjie.me"),
   ], new Set());
   assert.equal(graph.groups.size, 2);
 });

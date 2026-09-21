@@ -10,7 +10,7 @@ function identityHash(value: string): string {
   return crypto.createHash("sha256").update(value).digest("base64url");
 }
 
-test("V1 权威模式下 Sub2API 不建账号、不隔离 V1 身份", async (t) => {
+test("只读迁移核对下 Sub2API 不建账号、不隔离已有身份", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mail-opus-v1-authority-"));
   const metadata = [
     { id: 1, name: "conflict", platform: "openai", status: "active", updated_at: "2026-09-02T00:00:00.000Z", credentials: { email: "kept@icloud.com" } },
@@ -38,7 +38,7 @@ test("V1 权威模式下 Sub2API 不建账号、不隔离 V1 身份", async (t) 
   process.env.DATABASE_PATH = path.join(directory, "test.sqlite");
   process.env.V2_SESSION_SECRET = "authority-session";
   process.env.CREDENTIAL_ENCRYPTION_KEY = "authority-encryption";
-  process.env.V2_READ_ONLY = "false";
+  process.env.V2_READ_ONLY = "true";
   process.env.V2_ACCOUNT_AUTHORITY = "v1";
   process.env.SUB2API_API_URL = `http://127.0.0.1:${address.port}/api/v1`;
   process.env.SUB2API_ADMIN_TOKEN = "test-token";

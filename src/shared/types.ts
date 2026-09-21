@@ -1,7 +1,30 @@
-export type LifecycleStatus = "active" | "deactivated" | "retired" | "quarantined" | "deleted";
+export type LifecycleStatus = "active" | "third_party_registered" | "third_party_pending_recovery" | "deactivated" | "retired" | "quarantined" | "deleted";
 export type RelationType = "email_rebind" | "mailbox_recycle" | "replacement_account" | "possible_duplicate";
 export type GrantScope = "current" | "historical" | "admin_only";
 export type SaleStatus = "none" | "active" | "closed" | "cancelled";
+
+export type RecycleMode = "deactivated" | "untagged_free" | "invalid_at" | "alias_rotate";
+export interface RecycleModeEligibility {
+  eligible: boolean;
+  reason: string;
+  eligibleAt: string;
+  trigger: "admin_only";
+}
+export interface RecycleEligibility {
+  accountId: string;
+  generation: number;
+  maxGeneration: number;
+  waitMs: number;
+  checkedAt: string;
+  account: { lifecycleStatus: string; deactivationLocked: boolean; deactivatedAt: string;
+    retired: boolean; deleted: boolean; sold: boolean; customerOpened: boolean };
+  evidence: { tokenPlan: "free" | "paid" | "unknown"; hasAccessToken: boolean; invalidAT: boolean;
+    mailVerifiedNoPlus: boolean; hasPlusEvidence: boolean; isAuto: boolean; sharedMailbox: boolean;
+    specialMarkerCount: number; reusableNoATAutoICloud: boolean };
+  modes: Record<RecycleMode, RecycleModeEligibility>;
+}
+
+export type PaymentExposurePromoMode = "none" | "one_month" | "unknown";
 
 export interface PaymentExposureCheck {
   id: string;
@@ -20,6 +43,7 @@ export interface PaymentExposureCheck {
   detail: string;
   promoEligible: boolean | null;
   promoCampaign: string;
+  promoMode?: PaymentExposurePromoMode;
   observedAt: string;
   updatedAt: string;
 }
@@ -32,6 +56,14 @@ export interface PaymentExposureMethod {
   code: string;
   displayName: string;
   source: string;
+  sources?: string[];
+  promoMode?: PaymentExposurePromoMode;
+}
+
+export interface PaymentExposureMethodSummary {
+  method: string;
+  sources: string[];
+  promoMode?: PaymentExposurePromoMode;
 }
 
 export interface PaymentExposureRoute {
@@ -81,6 +113,7 @@ export interface PaymentExposureJobStatus {
   routeKey: string;
   jobKind: string;
   scheduledAt: string;
+  promoMode?: PaymentExposurePromoMode;
   route: PaymentExposureRoute;
   status: string;
   total: number;
@@ -104,6 +137,7 @@ export interface AccountSummary {
   lifecycleStatus: LifecycleStatus;
   quarantineReason: string;
   deactivationLocked: boolean;
+  retiredAt?: string;
   deactivatedAt: string;
   sold: boolean;
   everSold: boolean;
@@ -122,6 +156,8 @@ export interface AccountSummary {
   provider: string;
   domainMailbox: boolean;
   isAuto: boolean;
+  openAiMfaEnabled: boolean;
+  openAiAuthMethods: string[];
   suspectedUnused: boolean;
   hasAccessToken: boolean;
   hasRefreshToken: boolean;
@@ -141,6 +177,8 @@ export interface AccountSummary {
   latestMailAt: string;
   paymentExposureStatus: string;
   paymentExposureSummary: string;
+  paymentExposureMethods: string[];
+  paymentExposureMethodDetails: PaymentExposureMethodSummary[];
   paymentExposureCount: number;
   paymentExposureExposedCount: number;
   paymentExposureUnknownCount: number;
@@ -162,6 +200,11 @@ export interface AccountSummary {
   promotionCheckErrorClass: string;
   promotionCheckErrorDetail: string;
   promotionCheckNextRetryAt: string;
+  billingStartedAt: string;
+  aliveUntil: string;
+  aliveMs: number;
+  aliveLabel: string;
+  aliveActive: boolean;
 }
 
 export interface CredentialVersionSummary {

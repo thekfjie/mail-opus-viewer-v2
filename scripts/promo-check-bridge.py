@@ -7,8 +7,6 @@ import uuid
 from typing import Any
 from urllib.parse import urlencode
 
-sys.path.insert(0, "/opt/payment-checker/tools")
-
 from chatgpt_promo_check import (  # noqa: E402
     build_check_headers,
     cffi_requests,

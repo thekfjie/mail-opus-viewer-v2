@@ -1,7 +1,11 @@
 import { config } from "./config.js";
 import { simpleParser } from "mailparser";
+import { gunzipSync } from "node:zlib";
+import { db } from "./db.js";
+import { D1MailReader, MailReadError, type SharedMailRow } from "./cf-mail.js";
+import { normalizeEmail, splitEmail } from "./association.js";
 
-function stripHtml(value: string): string {
+export function stripHtml(value: string): string {
   return value
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -16,55 +20,99 @@ function stripHtml(value: string): string {
     .trim();
 }
 
-export async function fetchSharedMailPage(offset: number, limit: number): Promise<any> {
-  if (!config.mailAdminAuth) throw new Error("邮件服务后台口令未配置");
-  const response = await fetch(`${config.mailApiBase}/admin/mails?limit=${limit}&offset=${offset}`, {
-    headers: { "x-admin-auth": config.mailAdminAuth, "content-type": "application/json" },
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!response.ok) throw new Error(`邮件服务返回 ${response.status}`);
-  return response.json();
-}
+export const sharedMailReader = new D1MailReader(db, {
+  accountId: config.cfAccountId, databaseId: config.cfD1DatabaseId,
+  readToken: config.cfD1ReadToken, timeIndex: config.cfD1TimeIndex, leaseWaitMs: 5_000,
+});
 
-let newestCache: { id: number; expiresAt: number } = { id: 0, expiresAt: 0 };
-
-async function newestSharedId(): Promise<number> {
-  if (newestCache.id && newestCache.expiresAt > Date.now()) return newestCache.id;
-  const data = await fetchSharedMailPage(0, 1);
-  const id = Number(data?.results?.[0]?.id || 0);
-  newestCache = { id, expiresAt: Date.now() + 30_000 };
-  return id;
-}
-
-export async function fetchSharedMessage(messageId: string): Promise<{ text: string } | null> {
-  const numericId = Number(messageId);
-  if (!Number.isFinite(numericId) || numericId <= 0) return null;
-  const newestId = await newestSharedId();
-  if (!newestId) return null;
-  let offset = Math.max(0, newestId - numericId);
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const data = await fetchSharedMailPage(offset, 5);
-    const results = Array.isArray(data?.results) ? data.results : [];
-    const hit = results.find((mail: any) => String(mail.id) === String(messageId));
-    if (hit) {
-      const text = String(hit.text || hit.body || "");
-      const html = String(hit.html || "");
-      const raw = String(hit.raw || "");
-      let rawText = "";
-      if (raw) {
-        const parsed = await simpleParser(raw, { skipHtmlToText: false, skipTextToHtml: true });
-        rawText = String(parsed.text || "").trim() || stripHtml(String(parsed.html || ""));
-      }
-      return { text: text.trim() || stripHtml(html) || rawText };
-    }
-    if (!results.length) return null;
-    const first = Number(results[0]?.id || 0);
-    const last = Number(results[results.length - 1]?.id || 0);
-    if (numericId > first) offset = Math.max(0, offset - 5);
-    else if (numericId < last) offset += 5;
-    else return null;
+export function sharedMailRaw(mail: SharedMailRow): string {
+  if (mail.raw) {
+    if (Buffer.byteLength(mail.raw) > 8 * 1024 * 1024) throw new MailReadError("mail_content_too_large", 413);
+    return mail.raw;
   }
-  return null;
+  if (!mail.raw_blob) return "";
+  try {
+    const compressed = Array.isArray(mail.raw_blob) ? Buffer.from(mail.raw_blob) : Buffer.from(mail.raw_blob, "base64");
+    return gunzipSync(compressed, { maxOutputLength: 8 * 1024 * 1024 }).toString("utf8");
+  } catch { throw new MailReadError("mail_content_decode_failed"); }
+}
+
+export interface SharedMessageDetail {
+  text: string; html: string; from: string; to: string; subject: string; receivedAt: string;
+  recipients?: string[];
+}
+
+function inlineEmbeddedImages(htmlInput: string, attachments: any[]): string {
+  let html = htmlInput;
+  let embeddedBytes = 0;
+  const allowed = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const attachment of attachments) {
+    const content = Buffer.isBuffer(attachment?.content) ? attachment.content : null;
+    const contentType = String(attachment?.contentType || "").toLowerCase();
+    if (!content || !allowed.has(contentType) || content.byteLength > 2 * 1024 * 1024
+      || embeddedBytes + content.byteLength > 4 * 1024 * 1024) continue;
+    const references = [
+      { value: String(attachment?.contentId || "").replace(/^<|>$/g, ""), cid: true },
+      { value: String(attachment?.contentLocation || ""), cid: false },
+    ].filter((reference) => reference.value);
+    if (!references.length) continue;
+    const dataUrl = `data:${contentType};base64,${content.toString("base64")}`;
+    for (const reference of references) {
+      const candidates = reference.cid ? [`cid:${reference.value}`, `cid:%3C${reference.value}%3E`] : [reference.value];
+      for (const candidate of candidates) html = html.replace(new RegExp(escapeRegex(candidate), "gi"), dataUrl);
+    }
+    embeddedBytes += content.byteLength;
+  }
+  return html;
+}
+
+const EMAIL_ADDRESS_RE = /[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+
+function addressCandidates(value: unknown): string[] {
+  const input = String(value || "");
+  const matches = input.match(EMAIL_ADDRESS_RE) || [];
+  return [...new Set((matches.length ? matches : [input]).map(normalizeEmail).filter(Boolean))];
+}
+
+function recipientMatchesExpected(actualInput: string, expectedInput: string): boolean {
+  const actualCandidates = addressCandidates(actualInput);
+  const expectedCandidates = addressCandidates(expectedInput);
+  if (!actualCandidates.length || !expectedCandidates.length) return false;
+  return expectedCandidates.some((expected) => actualCandidates.some((actual) => recipientAddressMatches(actual, expected)));
+}
+
+function recipientAddressMatches(actual: string, expected: string): boolean {
+  if (actual === expected) return true;
+  const actualParts = splitEmail(actual);
+  const expectedParts = splitEmail(expected);
+  if (expectedParts.domain !== actualParts.domain
+    || (expectedParts.domain !== "icloud.com" && !expectedParts.domain.endsWith(".icloud.com"))) return false;
+  const actualPlus = actualParts.localPart.includes("+");
+  const expectedPlus = expectedParts.localPart.includes("+");
+  if (actualPlus === expectedPlus) return false;
+  const actualBase = actualPlus ? actualParts.localPart.split("+", 1)[0] : actualParts.localPart;
+  const expectedBase = expectedPlus ? expectedParts.localPart.split("+", 1)[0] : expectedParts.localPart;
+  return actualBase === expectedBase;
+}
+
+export async function fetchSharedMessage(messageId: string, expectedRecipient = "", reader: Pick<D1MailReader, "byId"> = sharedMailReader): Promise<SharedMessageDetail | null> {
+  const row = await reader.byId(messageId);
+  if (!row) return null;
+  const parsed = await simpleParser(sharedMailRaw(row), { skipHtmlToText: false, skipTextToHtml: true });
+  const recipients = [String(row.address || ""), ...parsed.headerLines
+      .filter((header) => ["to", "cc", "received", "delivered-to", "x-original-to", "x-forwarded-to", "x-envelope-to", "envelope-to", "resent-to", "apparently-to", "x-icloud-hme"].includes(header.key))
+      .map((header) => header.line)].join("\n").match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || [];
+  if (expectedRecipient) {
+    if (!recipients.some((recipient) => recipientMatchesExpected(recipient, expectedRecipient))) {
+      throw new MailReadError("mail_recipient_mismatch", 403);
+    }
+  }
+  const html = inlineEmbeddedImages(String(parsed.html || row.html || ""), parsed.attachments || []);
+  return { text: String(parsed.text || row.text || "").trim() || stripHtml(html), html,
+    from: String(parsed.from?.text || row.source || ""), to: String(row.address || ""),
+    subject: String(parsed.subject || row.subject || ""), receivedAt: String(row.created_at || ""),
+    recipients: [...new Set(recipients.map(normalizeEmail))] };
 }
 
 interface OutlookSession {
@@ -127,8 +175,7 @@ export async function outlookManagerFetch(path: string, options: OutlookRequestO
   }
   const payload = await response.json().catch(() => ({})) as any;
   if (!response.ok || payload?.success === false) {
-    const detail = String(payload?.error?.message || payload?.error || payload?.message || response.status);
-    throw new Error(`Outlook 管理服务返回 ${detail}`);
+    throw new MailReadError(`outlook_upstream_${response.status === 200 ? "rejected" : response.status}`);
   }
   return payload;
 }

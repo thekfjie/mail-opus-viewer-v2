@@ -5,6 +5,7 @@ import test from "node:test";
 
 const mainSource = fs.readFileSync(path.resolve("web/src/main.tsx"), "utf8");
 const styleSource = fs.readFileSync(path.resolve("web/src/styles.css"), "utf8");
+const accountStatusSource = fs.readFileSync(path.resolve("web/src/account-status.ts"), "utf8");
 
 test("V2 所有默认时间展示统一使用北京时间，底层时间仍保持 ISO", () => {
   assert.match(mainSource, /const BEIJING_TIME_ZONE = "Asia\/Shanghai"/);
@@ -12,18 +13,27 @@ test("V2 所有默认时间展示统一使用北京时间，底层时间仍保�
   assert.doesNotMatch(mainSource, /date\.toLocaleString\("zh-CN", \{ hour12: false \}\)/);
 });
 
-test("V2 不再提供客户邮箱页面，客户入口固定回到兼容服务", () => {
+test("V2 客户与管理员入口均留在独立服务", () => {
   const serverSource = fs.readFileSync(path.resolve("src/server/server.ts"), "utf8");
-  const mailNginx = fs.readFileSync(path.resolve("deploy/mail-opus-viewer-v2.nginx.conf"), "utf8");
-  const legacyNginx = fs.readFileSync(path.resolve("deploy/mail-opus-viewer-v2-cutover.nginx.conf"), "utf8");
+  const mailNginx = fs.readFileSync(path.resolve("deploy/mail.opus.sryze.cc.nginx.conf"), "utf8");
+  const cloudNginx = fs.readFileSync(path.resolve("deploy/cloud.opus.sryze.cc.cutover.nginx.conf"), "utf8");
   assert.doesNotMatch(mainSource, /function CustomerApp/);
   assert.doesNotMatch(mainSource, /className="mailbox-app"/);
   assert.doesNotMatch(styleSource, /\.mailbox-app\s*\{/);
-  assert.doesNotMatch(serverSource, /app\.get\("\/api\/mail-detail"/);
-  assert.doesNotMatch(serverSource, /app\.get\("\/api\/mails"/);
-  assert.match(mainSource, /location\.replace\(legacyMailbox\.toString\(\)\)/);
-  assert.match(mailNginx, /location \/ \{ return 302 https:\/\/legacy-mail\.example\.com\$request_uri; \}/);
-  assert.match(legacyNginx, /location \/ \{[\s\S]*?proxy_pass http:\/\/127\.0\.0\.1:8789;/);
+  assert.doesNotMatch(mainSource, /legacyMailbox|https:\/\/cloud\.opus\.sryze\.cc/);
+  assert.doesNotMatch(mailNginx + cloudNginx, /127\.0\.0\.1:8789/);
+  assert.match(mailNginx, /location \/ \{ proxy_pass http:\/\/127\.0\.0\.1:8790; \}/);
+  assert.match(cloudNginx, /location \/ \{ proxy_pass http:\/\/127\.0\.0\.1:8790; \}/);
+  assert.match(serverSource, /customer/i);
+});
+
+test("后台登录、侧栏和分享头部统一使用信封品牌标识", () => {
+  assert.match(mainSource, /function OpusBrand/);
+  assert.match(mainSource, /className="opus-brand-icon"/);
+  assert.match(mainSource, /<OpusBrand className="admin-login-brand"/);
+  assert.match(mainSource, /<div className="sidebar-brand"><OpusBrand/);
+  assert.doesNotMatch(mainSource, /brand-mark">O|sidebar-brand-mark">O/);
+  assert.match(styleSource, /\.opus-brand-icon::before, \.opus-brand-icon::after/);
 });
 
 test("多选工具栏是真正的固定浮层并包含刷新", () => {
@@ -80,10 +90,12 @@ test("V2 可以单独筛选欧洲 iDEAL，且不排除停用记录", () => {
 test("V2 主列表压缩为核心字段且保持原始到达顺序", () => {
   const repositorySource = fs.readFileSync(path.resolve("src/server/repository.ts"), "utf8");
   assert.match(mainSource, /新账号在上、旧账号在下；停用、归档和回收不会改变原始到达顺序/);
-  assert.match(mainSource, /<th>邮箱<\/th><th>套餐<\/th><th>GPT 状态<\/th><th>OAuth<\/th><th>\{tab === "deactivations" \? "封禁时间" : "试用 \/ 优惠"\}<\/th><th>操作<\/th>/);
+  assert.match(mainSource, /<th>邮箱<\/th><th>套餐<\/th><th>存活时间<\/th><th>GPT 状态<\/th><th>OAuth<\/th><th>\{tab === "deactivations" \? "封禁时间" : "试用 \/ 优惠"\}<\/th><th>操作<\/th>/);
   assert.doesNotMatch(mainSource, /<th>客户状态<\/th>/);
   assert.doesNotMatch(mainSource, /className="customer-cell"/);
   assert.match(mainSource, /<span className=\{planBadgeClassName\(item\)\}>\{planBadgeLabel\(item\)\}<\/span>/);
+  assert.match(mainSource, /className="alive-cell"/);
+  assert.match(mainSource, /暂无账单起点/);
   assert.doesNotMatch(mainSource, /<th>支付检查<\/th>/);
   assert.doesNotMatch(mainSource, /<th>时间<\/th>/);
   assert.doesNotMatch(mainSource, /className="payment-check-toggle"/);
@@ -147,9 +159,17 @@ test("工作台使用紧凑信息架构和 24 条明确分页", () => {
   assert.match(mainSource, /className="metric-grid" aria-label="账号概览"/);
   assert.equal((mainSource.match(/className="metric-card /g) || []).length, 6);
   assert.match(mainSource, /className="quick-filters"/);
+  assert.match(mainSource, /value="third_party_pending_recovery">第三方待恢复<\/option><option value="third_party_registered">第三方注册/);
+  assert.match(mainSource, /item\.openAiMfaEnabled[\s\S]*MFA[\s\S]*openAiAuthMethods[\s\S]*邮箱 OTP/);
   assert.match(mainSource, /className="search-field"/);
   assert.match(mainSource, /<SlidersHorizontal size=\{16\}/);
   assert.match(styleSource, /\.admin-app th \{[^}]*position:\s*sticky;/);
+});
+
+test("账号概览支持 q 查询参数中的完整加号邮箱", () => {
+  assert.match(mainSource, /function initialAccountFilters\(\)/);
+  assert.match(mainSource, /accountSearchFromQuery\(window\.location\.search\)/);
+  assert.match(mainSource, /useState\(initialAccountFilters\)/);
 });
 
 test("移动导航可横滑访问全部入口且账号卡片保持紧凑", () => {
@@ -203,7 +223,8 @@ test("批量优惠检测显示实时进度、完成后自动收起并支持掉�
   assert.match(mainSource, /promotionCheckErrorDetail/);
   assert.match(repositorySource, /promotion_check_status/);
   assert.match(serverSource, /void runPromotionQueue\(500\)/);
-  assert.match(mainSource, /Plus 已开通，无需检测优惠/);
+  assert.match(accountStatusSource, /Plus 已开通，无需检测优惠/);
+  assert.match(accountStatusSource, /\["active", "third_party_registered"\]/);
   assert.match(mainSource, /Plus\/停用账号已跳过/);
   assert.match(mainSource, /promotionUnavailableReason \? "无需检测"/);
 });
@@ -247,19 +268,47 @@ test("详情操作使用结构化反馈并迁移 V1 打开邮箱快捷入口", (
   assert.match(styleSource, /\.action-result-card \{/);
 });
 
-test("优惠检测与支付方式探测使用独立面板且空 POST 不伪装 JSON", () => {
+test("账号行更多菜单可直接打开当前邮箱链接", () => {
+  assert.match(mainSource, /const openCurrentMailboxLink = async \(item: AccountSummary\)/);
+  assert.match(mainSource, /window\.open\("about:blank", "_blank"\)/);
+  assert.match(mainSource, /target\.location\.href = output\.publicUrl/);
+  assert.match(mainSource, /onClick=\{\(\) => void openCurrentMailboxLink\(item\)\}[\s\S]{0,100}打开邮箱链接/);
+});
+
+test("优惠检测与本机支付方式探测使用独立面板且空 POST 不伪装 JSON", () => {
   assert.match(mainSource, /className="promotion-detection-panel"/);
   assert.match(mainSource, /className="payment-method-panel"/);
-  assert.match(mainSource, /支付资格接口检测/);
-  assert.match(mainSource, /不会创建 Checkout，也不会访问 Stripe 支付流程/);
-  assert.match(mainSource, /check\.checkoutType === "eligibility_api"/);
-  assert.match(mainSource, /读取完整当前配置/);
+  assert.match(mainSource, /可选择无优惠或带 1 month 优惠/);
+  assert.match(mainSource, /不创建 PaymentMethod，不 confirm 或 approve/);
+  assert.match(mainSource, /\["eligibility_api", "local_extractor"\]/);
+  assert.match(mainSource, /代理跟随提炼侧配置/);
   assert.doesNotMatch(mainSource, /选择支付检查 IP 出口/);
   const serverSource = fs.readFileSync(path.resolve("src/server/server.ts"), "utf8");
   assert.match(serverSource, /payment-exposure\/api\/reveal/);
   assert.match(serverSource, /Cache-Control", "no-store"/);
   assert.match(mainSource, /options\.body !== undefined && options\.body !== null/);
   assert.match(styleSource, /\.promotion-detection-panel, \.payment-method-panel/);
+});
+
+test("批量支付方式探查最多支持24个账号，未开通显示method、已开通只显示账单", () => {
+  const serverSource = fs.readFileSync(path.resolve("src/server/server.ts"), "utf8");
+  const exposureSource = fs.readFileSync(path.resolve("src/server/payment-exposure.ts"), "utf8");
+  assert.match(serverSource, /accounts\/payment-exposure-check/);
+  assert.match(serverSource, /body\.accountIds\.length > 24/);
+  assert.match(exposureSource, /slice\(0, 24\)/);
+  assert.match(exposureSource, /routeKeys\.length !== 1/);
+  assert.match(serverSource, /body\.routeKeys\.length !== 1/);
+  assert.match(mainSource, /批量选择支付 method/);
+  assert.match(mainSource, /请选择一个具体 method/);
+  assert.match(mainSource, /routeKeys: \[batchExposureRoute\]/);
+  assert.match(mainSource, /promoMode: batchExposurePromoMode/);
+  assert.match(mainSource, /蓝底表示 1 month 优惠下取得，紫底表示无优惠下取得/);
+  assert.match(mainSource, /批量探查 method/);
+  assert.match(mainSource, /accountHasBilling\(item\)/);
+  assert.match(mainSource, /PaymentMethodChips compact items=\{paymentExposureMethodItems\(item\)\}/);
+  assert.match(mainSource, /accounts\/payment-exposure-check\/status/);
+  assert.match(mainSource, /billingKnown=\{accountHasBilling\(detail\)\}/);
+  assert.match(mainSource, /!billingKnown && <section className="payment-method-panel"/);
 });
 
 test("单账号可以直接编辑 AT RT，批量收件开关保持 V1 功能", () => {
@@ -270,12 +319,12 @@ test("单账号可以直接编辑 AT RT，批量收件开关保持 V1 功能", (
   assert.match(mainSource, /credential-modal-backdrop/);
   assert.match(mainSource, /role="dialog" aria-modal="true"/);
   assert.match(mainSource, /setCredentialEditorOpen\(false\)/);
-  assert.match(mainSource, /凭证已保存到 V1，V2 正在后台同步/);
+  assert.match(mainSource, /凭证已保存，后台正在更新状态/);
   assert.match(mainSource, /credential-save-feedback/);
   assert.match(mainSource, /runBulk\("receiveDisabled", true\)/);
   assert.match(mainSource, /runBulk\("receiveDisabled", false\)/);
   assert.match(serverSource, /accounts\/:id\/credentials/);
-  assert.match(serverSource, /mappings\/\$\{encodeURIComponent\(legacyId\)\}\/oauth/);
+  assert.match(serverSource, /saveAccountCredentials\(accountId, body\)/);
   assert.match(styleSource, /\.credential-editor/);
   assert.match(styleSource, /\.credential-modal-backdrop\s*\{[^}]*position:\s*fixed/);
   assert.match(mainSource, /onCopy\(`\$\{label\} 复制成功`/);
@@ -289,9 +338,10 @@ test("凭证列区分从未入库与已保存但失效", () => {
   assert.match(repositorySource, /result_status IN \('eligible','ineligible'\)/);
 });
 
-test("兼容权威模式下外层复制沿用当前邮箱说明", () => {
+test("客户导出使用 V2 本地授权与公共地址", () => {
   const repositorySource = fs.readFileSync(path.resolve("src/server/repository.ts"), "utf8");
-  assert.match(repositorySource, /config\.accountAuthority === "v1"/);
-  assert.match(repositorySource, /https:\/\/legacy-mail\.example\.com\/\?m=/);
-  assert.match(repositorySource, /ai账号：\$\{currentEmail\} \| 邮箱验证码：\$\{publicUrl\}/);
+  assert.doesNotMatch(repositorySource, /config\.accountAuthority === "v1"/);
+  assert.match(repositorySource, /\$\{config\.publicOrigin\}\/#m=/);
+  assert.match(repositorySource, /formatCurrentCustomerExportText\(currentEmail, base\.loginIdentifier, publicUrl(?:, credentials)?\)/);
+  assert.match(repositorySource, /return fields\.join\(" \| "\)/);
 });

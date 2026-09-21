@@ -17,3 +17,7 @@ dist/
 backups/
 artifacts/
 coverage/
+__pycache__/
+*.py[cod]
+.state/
+.venv/

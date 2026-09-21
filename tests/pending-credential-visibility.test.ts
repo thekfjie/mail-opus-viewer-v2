@@ -19,7 +19,7 @@ test("V2 does not project task placeholders as accounts and keeps actionable mis
     },
     {
       id: "rebind-pending",
-      email: "rebind@example.com",
+      email: "rebind@ai-mail.tech",
       note: "automyai OpenAI email rebind target pending",
       rebindTargetPending: true,
       domainMailbox: true,

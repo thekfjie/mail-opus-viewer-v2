@@ -15,21 +15,21 @@ function identityHash(value: string): string {
 test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mail-opus-sub2api-"));
   const metadata: Item[] = [
-    { id: 1, name: "same-local", platform: "openai", status: "active", created_at: "2026-08-20T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "same+oai@example.com" } },
-    { id: 2, name: "different-local", platform: "openai", status: "active", created_at: "2026-08-20T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "different@example.com" } },
-    { id: 3, name: "brand-new", platform: "openai", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "brand-new@example.net" } },
-    { id: 4, name: "broken", platform: "openai", status: "error", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "broken@example.net" } },
-    { id: 5, name: "not-openai", platform: "anthropic", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "claude@example.net" } },
-    { id: 6, name: "identity-conflict", platform: "openai", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "conflict@example.net" } },
+    { id: 1, name: "same-local", platform: "openai", status: "active", created_at: "2026-08-20T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "same+oai@ai-mail.tech" } },
+    { id: 2, name: "different-local", platform: "openai", status: "active", created_at: "2026-08-20T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "different@ai-mail.tech" } },
+    { id: 3, name: "brand-new", platform: "openai", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "brand-new@kfjie.me" } },
+    { id: 4, name: "broken", platform: "openai", status: "error", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "broken@kfjie.me" } },
+    { id: 5, name: "not-openai", platform: "anthropic", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "claude@kfjie.me" } },
+    { id: 6, name: "identity-conflict", platform: "openai", status: "active", created_at: "2026-08-21T00:00:00.000Z", updated_at: "2026-08-22T00:00:00.000Z", credentials: { email: "conflict@kfjie.me" } },
     { id: 7, name: "stale-rebind", platform: "openai", status: "active", created_at: "2026-08-20T00:00:00.000Z", updated_at: "2026-08-20T12:00:00.000Z", credentials: { email: "stale-rebind@icloud.com" } },
   ];
   const exported: Item[] = [
-    { name: "same-local", platform: "openai", credentials: { email: "same+oai@example.com", chatgpt_user_id: "identity-a", access_token: "at-a", refresh_token: "rt-a", plan_type: "plus" } },
-    { name: "different-local", platform: "openai", credentials: { email: "different@example.com", chatgpt_user_id: "identity-b", access_token: "at-b", refresh_token: "rt-b", plan_type: "free" } },
-    { name: "brand-new", platform: "openai", credentials: { email: "brand-new@example.net", chatgpt_user_id: "identity-c", access_token: "at-c", refresh_token: "rt-c", plan_type: "plus" } },
-    { name: "broken", platform: "openai", credentials: { email: "broken@example.net", chatgpt_user_id: "identity-d", access_token: "at-d", refresh_token: "rt-d" } },
-    { name: "not-openai", platform: "anthropic", credentials: { email: "claude@example.net", access_token: "at-e" } },
-    { name: "identity-conflict", platform: "openai", credentials: { email: "conflict@example.net", chatgpt_user_id: "identity-new", access_token: "at-new" } },
+    { name: "same-local", platform: "openai", credentials: { email: "same+oai@ai-mail.tech", chatgpt_user_id: "identity-a", access_token: "at-a", refresh_token: "rt-a", plan_type: "plus" } },
+    { name: "different-local", platform: "openai", credentials: { email: "different@ai-mail.tech", chatgpt_user_id: "identity-b", access_token: "at-b", refresh_token: "rt-b", plan_type: "free" } },
+    { name: "brand-new", platform: "openai", credentials: { email: "brand-new@kfjie.me", chatgpt_user_id: "identity-c", access_token: "at-c", refresh_token: "rt-c", plan_type: "plus" } },
+    { name: "broken", platform: "openai", credentials: { email: "broken@kfjie.me", chatgpt_user_id: "identity-d", access_token: "at-d", refresh_token: "rt-d" } },
+    { name: "not-openai", platform: "anthropic", credentials: { email: "claude@kfjie.me", access_token: "at-e" } },
+    { name: "identity-conflict", platform: "openai", credentials: { email: "conflict@kfjie.me", chatgpt_user_id: "identity-new", access_token: "at-new" } },
     { name: "stale-rebind", platform: "openai", credentials: { email: "stale-rebind@icloud.com", chatgpt_user_id: "identity-stale-rebind", access_token: "at-stale", refresh_token: "rt-stale", plan_type: "free" } },
   ];
 
@@ -93,9 +93,9 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
 
   seed("account-a", "same+oai@icloud.com", "identity-a", true);
   seed("account-b", "old-local@icloud.com", "identity-b");
-  seed("account-conflict", "conflict@example.net", "identity-old");
+  seed("account-conflict", "conflict@kfjie.me", "identity-old");
   seed("stale-account", "stale@icloud.com", "identity-stale", false, "sub2api-active");
-  seed("stale-rebind-account", "stale-rebind@example.com", "identity-stale-rebind");
+  seed("stale-rebind-account", "stale-rebind@ai-mail.tech", "identity-stale-rebind");
   db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
   db.prepare("UPDATE email_bindings SET valid_from='2026-08-21T00:00:00.000Z' WHERE account_id='stale-rebind-account'").run();
   db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
@@ -120,7 +120,7 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
 
   const stopped = db.prepare("SELECT lifecycle_status, deactivation_locked, plan FROM gpt_accounts WHERE id='account-a'").get() as any;
   assert.deepEqual(stopped, { lifecycle_status: "deactivated", deactivation_locked: 1, plan: "plus" });
-  const rebind = db.prepare("SELECT id, is_current FROM email_bindings WHERE account_id='account-a' AND email_hash=?").get(emailHash("same+oai@example.com")) as any;
+  const rebind = db.prepare("SELECT id, is_current FROM email_bindings WHERE account_id='account-a' AND email_hash=?").get(emailHash("same+oai@ai-mail.tech")) as any;
   assert.ok(rebind);
   assert.equal(rebind.is_current, 1);
   const newGrant = db.prepare("SELECT scope, active FROM access_grants WHERE binding_id=?").get(rebind.id) as any;
@@ -138,11 +138,16 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
   assert.equal(created.lifecycle_status, "active");
   const createdGrant = db.prepare("SELECT scope, active FROM access_grants WHERE account_id=?").get(created.id) as any;
   assert.deepEqual(createdGrant, { scope: "admin_only", active: 0 });
-  assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE email_hash=?").get(emailHash("broken@example.net")) as any).count), 0);
+  db.prepare("UPDATE gpt_accounts SET plan='free' WHERE id=?").run(created.id);
+  db.prepare(`INSERT INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
+    VALUES('trial-only-correction', ?, 'plus_trial_only_corrected', ?, 'test', '{}', ?)`).run(created.id, now, now);
+  await syncSub2ApiAlive();
+  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id=?").get(created.id) as any).plan, "free");
+  assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE email_hash=?").get(emailHash("broken@kfjie.me")) as any).count), 0);
   const staleRebind = db.prepare(`SELECT b.domain, b.is_current, a.plan
     FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
     WHERE a.id='stale-rebind-account' ORDER BY b.is_current DESC LIMIT 1`).get() as any;
-  assert.deepEqual(staleRebind, { domain: "example.com", is_current: 1, plan: "plus" });
+  assert.deepEqual(staleRebind, { domain: "ai-mail.tech", is_current: 1, plan: "plus" });
   const staleRebindCredential = db.prepare("SELECT access_token_enc, refresh_token_enc FROM credentials WHERE account_id='stale-rebind-account'").get() as any;
   assert.equal(decryptSecret(staleRebindCredential.access_token_enc), "fresh-target-at");
   assert.equal(decryptSecret(staleRebindCredential.refresh_token_enc), "fresh-target-rt");
@@ -168,6 +173,16 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
   await syncSub2ApiAlive();
   assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
 
+  // Mail-confirmed Plus is authoritative even when the account has no useful
+  // Sub2API plan snapshot. The sync may refresh credentials, but it cannot
+  // downgrade a mail-confirmed paid result.
+  db.prepare(`INSERT OR IGNORE INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
+    VALUES('plus-mail-authority', 'stale-rebind-account', 'plus_activated_by_mail', ?, 'test', ?, ?)`)
+    .run(now, JSON.stringify({ messageId: 'mail-plus-authority', evidence: 'account_level_subscription_body' }), now);
+  db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
+  await syncSub2ApiAlive();
+  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
+
   db.prepare(`INSERT INTO mail_messages(
     id, provider, provider_message_id, sender, subject, received_at, category, indexed_at
   ) VALUES('strict-plus-receipt', 'shared-mail-api', 'strict-plus-receipt', 'OpenAI', 'Welcome to ChatGPT Plus', ?, 'billing', ?)`)
@@ -181,8 +196,10 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
   assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
 
   const conflict = db.prepare("SELECT lifecycle_status, identity_status FROM gpt_accounts WHERE id='account-conflict'").get() as any;
-  assert.deepEqual(conflict, { lifecycle_status: "quarantined", identity_status: "conflict" });
+  assert.deepEqual(conflict, { lifecycle_status: "active", identity_status: "unknown" });
   assert.equal((db.prepare("SELECT access_token_alive FROM credentials WHERE account_id='account-conflict'").get() as any).access_token_alive, 0);
+  assert.equal((db.prepare("SELECT COUNT(*) n FROM lifecycle_events WHERE account_id='account-conflict' AND event_type='account_quarantined'").get() as any).n, 0);
+  assert.equal((db.prepare("SELECT COUNT(*) n FROM pending_reviews WHERE account_id='account-conflict' AND status='pending'").get() as any).n, 1);
 
   const stale = db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='stale-account'").get() as any;
   assert.deepEqual(stale, { access_token_alive: 0, refresh_token_alive: 0 });

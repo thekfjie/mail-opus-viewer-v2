@@ -5,11 +5,11 @@ import { encryptSecret } from "./crypto.js";
 import { db } from "./db.js";
 import { observeCredentialVersion } from "./credential-versions.js";
 import { isStrictPlusEvidenceSubject } from "./plus-evidence.js";
+import { hasActiveTrialOnlyCorrection } from "./plus-plan-state.js";
 import {
   rebindAccountTransition,
   recordIdentityObservation,
   resolveAccountMatch,
-  quarantineAccount,
 } from "./account-transitions.js";
 
 type JsonObject = Record<string, any>;
@@ -72,10 +72,27 @@ function matchMetadata(item: JsonObject, byKey: Map<string, JsonObject[]>): Json
       candidates.set(String(candidate.id || candidate.name), candidate);
     }
   }
-  if (candidates.size === 1) return [...candidates.values()][0];
+  // Names are operator labels and can be duplicated. A complete address is
+  // stronger evidence; use the name only to distinguish duplicate exports
+  // for that same address, never to replace a contradictory address.
+  const email = normalizeEmail(item.credentials?.email);
   const name = String(item.name || "").trim().toLowerCase();
+  if (email) {
+    const exactEmail = [...candidates.values()].filter((candidate) => normalizeEmail(candidate.credentials?.email) === email);
+    if (exactEmail.length === 1) return exactEmail[0];
+    if (exactEmail.length > 1) {
+      const exactPair = exactEmail.filter((candidate) => String(candidate.name || "").trim().toLowerCase() === name);
+      return exactPair.length === 1 ? exactPair[0] : null;
+    }
+  }
+  if (candidates.size === 1) {
+    const candidate = [...candidates.values()][0];
+    const candidateEmail = normalizeEmail(candidate.credentials?.email);
+    return email && candidateEmail && email !== candidateEmail ? null : candidate;
+  }
   if (name) {
-    const exactName = [...candidates.values()].filter((candidate) => String(candidate.name || "").trim().toLowerCase() === name);
+    const exactName = [...candidates.values()].filter((candidate) => String(candidate.name || "").trim().toLowerCase() === name
+      && (!email || !normalizeEmail(candidate.credentials?.email) || normalizeEmail(candidate.credentials?.email) === email));
     if (exactName.length === 1) return exactName[0];
   }
   return null;
@@ -88,11 +105,47 @@ function provider(email: string): string {
   return "domain";
 }
 
-function identityMaterial(item: JsonObject): { identityHash: string; email: string } {
+function jwtIdentityClaims(token: unknown): JsonObject {
+  try {
+    const claims = JSON.parse(Buffer.from(String(token || "").split(".")[1] || "", "base64url").toString("utf8"));
+    return claims && typeof claims === "object" && !Array.isArray(claims) ? claims : {};
+  } catch { return {}; }
+}
+
+export function isSub2ApiMailboxAccount(item: JsonObject): boolean {
+  const type = String(item.type || "").trim().toLowerCase();
+  // platform=openai includes arbitrary OpenAI-compatible API gateways.
+  // Their API keys and names do not describe a customer ChatGPT mailbox.
+  return String(item.platform || "").toLowerCase() === "openai" && (!type || type === "oauth");
+}
+
+export function sub2ApiIdentityMaterial(item: JsonObject): { identityHash: string; email: string; conflictingAccountIds: string[] } {
   const credentials = item.credentials || {};
-  const identity = String(credentials.chatgpt_user_id || credentials.user_id || credentials.sub || "");
-  const email = normalizeEmail(credentials.email || item.extra?.email || item.name);
-  return { identityHash: identity ? sha256(identity) : "", email };
+  const accessClaims = jwtIdentityClaims(credentials.access_token);
+  const claims = Object.keys(accessClaims).length ? accessClaims : jwtIdentityClaims(credentials.id_token);
+  const auth = claims["https://api.openai.com/auth"] || {};
+  const profile = claims["https://api.openai.com/profile"] || {};
+  // V1 imported account_user_id, while older tokens sometimes only had sub.
+  // Distinct fields in the same token are aliases, not different people.
+  // Reuse an existing hash only when this token proves it and the complete
+  // alias set identifies one local account. Never infer this from an email.
+  const identities = [...new Set([auth.chatgpt_account_user_id, auth.chatgpt_user_id,
+    claims.sub, auth.user_id, claims.user_id].map((value) => String(value || "")).filter(Boolean))];
+  const fallbackIdentity = String(credentials.chatgpt_user_id || credentials.user_id || credentials.sub || "");
+  const hashes = identities.map(sha256);
+  const identityRows = hashes.length ? db.prepare(`SELECT account_id, openai_subject_hash subject_hash FROM credentials
+      WHERE openai_subject_hash IN (${hashes.map(() => "?").join(",")})
+    UNION SELECT account_id, subject_hash FROM openai_identity_observations
+      WHERE status='confirmed' AND subject_hash IN (${hashes.map(() => "?").join(",")})`).all(...hashes, ...hashes) as Array<{ account_id: string; subject_hash: string }> : [];
+  const accountIds = [...new Set(identityRows.map((row) => row.account_id))];
+  const current = accountIds.length === 1
+    ? db.prepare("SELECT openai_subject_hash FROM credentials WHERE account_id=?").get(accountIds[0]) as { openai_subject_hash: string } | undefined
+    : undefined;
+  const identityHash = accountIds.length === 1
+    ? current && hashes.includes(current.openai_subject_hash) ? current.openai_subject_hash : identityRows[0].subject_hash
+    : hashes[0] || (fallbackIdentity ? sha256(fallbackIdentity) : "");
+  const email = normalizeEmail(credentials.email || item.extra?.email || profile.email || claims.email || item.name);
+  return { identityHash, email, conflictingAccountIds: accountIds.length > 1 ? accountIds : [] };
 }
 
 function addPendingReview(accountId: string | null, email: string, reason: string, evidence: JsonObject): void {
@@ -132,7 +185,10 @@ function ensureAdminOnlyGrant(accountId: string, bindingId: string, email: strin
   );
 }
 
-function hasPlusActivationMailEvidence(accountId: string): boolean {
+function hasAuthoritativePlusEvidence(accountId: string): boolean {
+  const event = db.prepare(`SELECT 1 FROM lifecycle_events
+    WHERE account_id=? AND event_type='plus_activated_by_mail' LIMIT 1`).get(accountId);
+  if (event) return true;
   const rows = db.prepare(`SELECT m.subject
     FROM mail_messages m
     JOIN mail_ownership_claims oc ON oc.message_id=m.id
@@ -155,28 +211,40 @@ function updateCredential(accountId: string, item: JsonObject, metadata: JsonObj
       subjectHash: identityHash, source: "sub2api-active", observedAt: String(metadata.updated_at || now),
       validityStatus: accessToken ? "alive" : "unknown", evidence: { sub2apiId: metadata.id || "" },
       observationKey: String(metadata.id || item.name || ""),
-      allowAccountMutation: config.accountAuthority !== "v1",
+      allowAccountMutation: !config.readOnly,
     });
   }
-  if (!config.readOnly && config.accountAuthority !== "v1" && credentials.plan_type) {
+  if (!config.readOnly && credentials.plan_type) {
     const incomingPlan = String(credentials.plan_type).toLowerCase();
-    const current = db.prepare("SELECT plan, billing_channel, billing_channel_override FROM gpt_accounts WHERE id=?").get(accountId) as any;
-    // Sub2API can report a stale Free snapshot after Plus was activated. A
-    // persisted activation receipt is stronger evidence than that snapshot,
-    // so never downgrade a mailbox with a confirmed Plus mail or an explicit
-    // administrator-confirmed billing channel.
-    const protectedPlus = String(current?.plan || "") === "plus"
-      && Boolean(String(current?.billing_channel_override || current?.billing_channel || ""));
-    const plan = incomingPlan === "plus" || protectedPlus || hasPlusActivationMailEvidence(accountId) ? "plus" : incomingPlan;
-    db.prepare("UPDATE gpt_accounts SET plan=?, updated_at=? WHERE id=?").run(plan, now, accountId);
+    const current = db.prepare("SELECT plan FROM gpt_accounts WHERE id=?").get(accountId) as any;
+    const currentPlan = String(current?.plan || "unknown").toLowerCase();
+    const paidPlans = new Set(["plus", "pro", "team", "business", "enterprise", "edu"]);
+    const durablePlus = paidPlans.has(currentPlan) || hasAuthoritativePlusEvidence(accountId);
+    // Sub2API is a credential/identity source, not the authority for a
+    // downgrade. A Free/unknown snapshot must never erase a mail-confirmed
+    // Plus result, and an account outside Sub2API remains mail-driven.
+    const plan = hasActiveTrialOnlyCorrection(db, accountId)
+      ? "free"
+      : incomingPlan === "plus"
+      ? "plus"
+      : durablePlus
+        ? (paidPlans.has(currentPlan) ? currentPlan : "plus")
+        : currentPlan === "unknown" ? incomingPlan : currentPlan;
+    if (plan !== currentPlan) db.prepare("UPDATE gpt_accounts SET plan=?, updated_at=? WHERE id=?").run(plan, now, accountId);
   }
 }
 
 function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { accountId: string; created: boolean; rebind: boolean; conflict: boolean; skipped: boolean } {
   const credentials = item.credentials || {};
-  const { email, identityHash } = identityMaterial(item);
+  const { email, identityHash, conflictingAccountIds } = sub2ApiIdentityMaterial(item);
   const parts = splitEmail(email);
-  const topologyWritable = !config.readOnly && config.accountAuthority !== "v1";
+  const topologyWritable = !config.readOnly;
+  if (conflictingAccountIds.length) {
+    if (topologyWritable) addPendingReview(null, email, "同一凭证中的身份字段命中不同GPT账号，禁止自动关联", {
+      sub2apiId: metadata.id, candidateAccountIds: conflictingAccountIds, matchMethod: "identity_alias_conflict",
+    });
+    return { accountId: "", created: false, rebind: false, conflict: true, skipped: false };
+  }
   if (!parts.localPart || !parts.domain) {
     const identityOnly = identityHash ? resolveAccountMatch(identityHash, "") : null;
     if (!identityOnly || identityOnly.kind !== "account") return { accountId: "", created: false, rebind: false, conflict: Boolean(identityOnly?.kind === "conflict"), skipped: true };
@@ -191,10 +259,12 @@ function ensureSub2ApiAccount(item: JsonObject, metadata: JsonObject): { account
   const match = resolveAccountMatch(identityHash, email);
   const now = new Date().toISOString();
   if (match.kind === "conflict") {
-    if (topologyWritable && match.accountId && ["identity_email_conflict", "contradictory_identity", "trusted_local_identity_conflict"].includes(match.method)) {
-      quarantineAccount(match.accountId, match.reason, "sub2api", { sub2apiId: metadata.id, identityHash, email, candidateAccountIds: match.candidateAccountIds });
-    }
     if (topologyWritable) {
+      // Sub2API is a volatile credential projection. A contradictory snapshot
+      // must not mutate an already-established account or revoke customer
+      // mailbox access. Keep the candidate out of the credential chain and
+      // require review; an explicit/admin import can still quarantine after a
+      // separately verified conflict.
       addPendingReview(match.accountId || null, email, match.reason, {
         sub2apiId: metadata.id, identityHash, candidateAccountIds: match.candidateAccountIds, matchMethod: match.method,
       });
@@ -318,7 +388,7 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
         metadataByKey.set(key, list);
       }
     }
-    const active = metadata.filter((item) => String(item.platform || "").toLowerCase() === "openai" && String(item.status || "").toLowerCase() === "active").length;
+    const active = metadata.filter((item) => isSub2ApiMailboxAccount(item) && String(item.status || "").toLowerCase() === "active").length;
     let matched = 0, created = 0, rebinds = 0, conflicts = 0, processedActive = 0;
     const handledMetadata = new Set<string>();
     const transaction = db.transaction(() => {
@@ -332,13 +402,13 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
       db.prepare("UPDATE pending_reviews SET status='resolved', updated_at=? WHERE review_type LIKE 'sub2api_%' AND status='pending'")
         .run(new Date().toISOString());
       for (const item of rawAccounts) {
-        if (String(item.platform || "").toLowerCase() !== "openai") continue;
+        if (!isSub2ApiMailboxAccount(item)) continue;
         const meta = matchMetadata(item, metadataByKey);
-        if (!meta || String(meta.status || "").toLowerCase() !== "active") continue;
+        if (!meta || !isSub2ApiMailboxAccount(meta) || String(meta.status || "").toLowerCase() !== "active") continue;
         handledMetadata.add(String(meta.id || meta.name));
         const result = ensureSub2ApiAccount(item, meta);
         if (result.skipped) {
-          if (!config.readOnly && config.accountAuthority !== "v1") addUnresolvedReview(meta, "Sub2API活账号缺少可定位邮箱，且OpenAI身份无法唯一匹配现有GPT账号");
+          if (!config.readOnly) addUnresolvedReview(meta, "Sub2API活账号缺少可定位邮箱，且OpenAI身份无法唯一匹配现有GPT账号");
           continue;
         }
         processedActive += 1;
@@ -348,9 +418,9 @@ export async function syncSub2ApiAlive(): Promise<{ total: number; active: numbe
         conflicts += result.conflict ? 1 : 0;
       }
       for (const meta of metadata) {
-        if (String(meta.platform || "").toLowerCase() !== "openai" || String(meta.status || "").toLowerCase() !== "active") continue;
+        if (!isSub2ApiMailboxAccount(meta) || String(meta.status || "").toLowerCase() !== "active") continue;
         if (handledMetadata.has(String(meta.id || meta.name))) continue;
-        if (!config.readOnly && config.accountAuthority !== "v1") addUnresolvedReview(meta, "Sub2API活账号无法与原始凭证导出唯一匹配，已禁止自动导入");
+        if (!config.readOnly) addUnresolvedReview(meta, "Sub2API活账号无法与原始凭证导出唯一匹配，已禁止自动导入");
       }
       const now = new Date().toISOString();
       db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('sub2api_active_count', ?, ?)

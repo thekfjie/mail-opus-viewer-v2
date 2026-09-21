@@ -15,14 +15,14 @@ test("取得新 AT 的域名换绑目标按完成时间排序，预创建占位�
       email: "scree_yonder.0j@icloud.com",
       lifecycleStatus: "retired",
       rebindNextId: "target-1",
-      rebindNextEmail: "scree_yonder.0j@example.com",
+      rebindNextEmail: "scree_yonder.0j@ai-mail.tech",
       rebindChangedAt: "2026-08-29T14:00:00.000Z",
       createdAt: "2026-08-20T00:00:00.000Z",
       updatedAt: "2026-08-29T14:00:01.000Z",
     },
     {
       id: "target-1",
-      email: "scree_yonder.0j@example.com",
+      email: "scree_yonder.0j@ai-mail.tech",
       domainMailbox: true,
       rebindPreviousId: "source-1",
       rebindPreviousEmail: "scree_yonder.0j@icloud.com",
@@ -33,7 +33,7 @@ test("取得新 AT 的域名换绑目标按完成时间排序，预创建占位�
     },
     {
       id: "other-1",
-      email: "other@example.com",
+      email: "other@ai-mail.tech",
       domainMailbox: true,
       createdAt: "2026-08-28T12:00:00.000Z",
       updatedAt: "2026-08-28T12:00:00.000Z",
@@ -63,8 +63,8 @@ test("取得新 AT 的域名换绑目标按完成时间排序，预创建占位�
   syncFromV1();
   const domainRows = repository.listAccounts({ provider: "domain", limit: 10 }).results;
   assert.deepEqual(domainRows.slice(0, 2).map((item) => item.primaryEmail), [
-    "scree_yonder.0j@example.com",
-    "other@example.com",
+    "scree_yonder.0j@ai-mail.tech",
+    "other@ai-mail.tech",
   ]);
   assert.equal(domainRows[0].arrivedAt, "2026-08-29T14:00:00.000Z");
   assert.equal(repository.revealCredentials(domainRows[0].id)?.accessToken, "fresh-target-at");

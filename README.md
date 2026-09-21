@@ -28,7 +28,7 @@ Opus Mail V2 是面向账号运营团队的管理后台，用于统一处理账�
 
 ## 产品边界
 
-本仓库交付管理员后台、管理 API 和后台 Worker，不提供客户邮箱页面。既有客户链接和客户邮件 API 由单独部署的兼容服务承载；Nginx 示例保留了两者的路由边界。
+本仓库交付管理员后台、管理 API、客户邮箱页面和后台 Worker。旧客户链接及兼容邮件 API 由 V2 本地实现，并继续在管理员鉴权、客户授权和公开读取之间保持严格边界。
 
 ## 安全设计
 
@@ -92,11 +92,11 @@ curl --fail http://127.0.0.1:8790/health
 | `CREDENTIAL_ENCRYPTION_KEY` | 敏感业务字段加密密钥 | 无 |
 | `VIEWER_ADMIN_PASSWORD` | 管理后台登录口令 | 无 |
 | `V2_READ_ONLY` | 是否锁定原生写操作 | `false` |
-| `V2_ACCOUNT_AUTHORITY` | 账号写入权威模式：`v1` 或 `v2` | `v1` |
+| `V2_ACCOUNT_AUTHORITY` | 账号写入权威模式：`v1` 或 `v2` | `v2` |
 | `V2_SYNC_INTERVAL_MS` | 后台同步间隔，单位为毫秒 | `60000` |
 | `V2_SHARED_MAIL_SYNC_ENABLED` | 是否启用共享邮件同步 | `false` |
 | `V2_OUTLOOK_MAIL_SYNC_ENABLED` | 是否启用 Outlook 邮件同步 | `false` |
-| `V2_AUTO_TRIAL_ENABLED` | 是否启用自动促销资格检查 | `true` |
+| `V2_AUTO_TRIAL_ENABLED` | 是否启用自动促销资格检查 | `false` |
 
 外部服务按需配置：
 

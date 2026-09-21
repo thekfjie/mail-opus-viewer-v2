@@ -20,25 +20,25 @@ test("同一秒内仍按毫秒保持新账号在上，状态变化不参与排�
   t.after(() => db.close());
 
   repository.importAccounts([
-    { email: "older@example.com", arrivedAt: "2026-08-29T06:14:41.058Z", plan: "free" },
-    { email: "newer@example.com", arrivedAt: "2026-08-29T06:14:41.681Z", plan: "plus" },
+    { email: "older@ai-mail.tech", arrivedAt: "2026-08-29T06:14:41.058Z", plan: "free" },
+    { email: "newer@ai-mail.tech", arrivedAt: "2026-08-29T06:14:41.681Z", plan: "plus" },
   ]);
 
-  const exact = repository.listAccounts({ search: " NEWER@example.com ", limit: 10 });
+  const exact = repository.listAccounts({ search: " NEWER@AI-MAIL.TECH ", limit: 10 });
   assert.equal(exact.total, 1);
-  assert.equal(exact.results[0]?.primaryEmail, "newer@example.com");
+  assert.equal(exact.results[0]?.primaryEmail, "newer@ai-mail.tech");
 
   const newer = repository.listAccounts({ search: "newer", limit: 10 }).results[0];
   assert.ok(newer);
   repository.deactivateAccount(newer.id, "排序回归测试");
 
   const rows = repository.listAccounts({ limit: 10 }).results;
-  assert.deepEqual(rows.map((item) => item.primaryEmail), ["newer@example.com", "older@example.com"]);
+  assert.deepEqual(rows.map((item) => item.primaryEmail), ["newer@ai-mail.tech", "older@ai-mail.tech"]);
   assert.equal(rows[0].lifecycleStatus, "deactivated");
 
   const todayDeactivations = repository.listAccounts({ workbench: "deactivations", deactivationWindow: "today", limit: 10 });
   assert.equal(todayDeactivations.total, 1);
-  assert.equal(todayDeactivations.results[0]?.primaryEmail, "newer@example.com");
+  assert.equal(todayDeactivations.results[0]?.primaryEmail, "newer@ai-mail.tech");
 });
 
 test("北京时间封禁窗口使用自然日边界", async () => {

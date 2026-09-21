@@ -1,8 +1,10 @@
 import crypto from "node:crypto";
+import { customerGrantBlockReason } from "../shared/customer-access-policy.js";
 import { emailHash, normalizeEmail, splitEmail, stableId } from "./association.js";
 import { config } from "./config.js";
 import { decryptSecret, digestToken, encryptSecret, hashPassword } from "./crypto.js";
 import { db } from "./db.js";
+import { LEGACY_RELAY_SENDER_PATTERN, mailboxRecipientPattern } from "./business-evidence.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -13,11 +15,6 @@ function boolean(value: unknown): boolean {
 function nowIso(value = ""): string {
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString();
-}
-
-function cutoffAfter(value: string): string {
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? new Date(parsed + 1).toISOString() : nowIso();
 }
 
 export function mailboxProvider(email: string): string {
@@ -67,20 +64,15 @@ function closeSale(accountId: string, cutoff: string, reason: string): void {
     WHERE account_id=? AND status='active'`).run(cutoff, reason, cutoff, accountId);
 }
 
-function closeCustomerAccess(accountId: string, cutoff: string, reason: string, bindingId = ""): void {
-  const clause = bindingId ? "binding_id=?" : "account_id=?";
-  const target = bindingId || accountId;
+function preserveHistoricalCustomerAccess(bindingId: string, cutoff: string): void {
+  // A rebind ends this mailbox window, but does not revoke its existing link.
+  // This also applies before the customer's first visit. No grant moves to
+  // the replacement binding; only an explicit reclaim/revoke ends access.
   db.prepare(`UPDATE access_grants SET
-      scope=CASE WHEN first_used_at!='' AND (visible_from='' OR julianday(visible_from)<julianday(?)) THEN 'historical' ELSE scope END,
-      visible_to=CASE WHEN first_used_at!='' AND (visible_from='' OR julianday(visible_from)<julianday(?))
-        AND (visible_to='' OR julianday(visible_to)>julianday(?)) THEN ? ELSE visible_to END,
-      active=CASE WHEN first_used_at='' OR (visible_from!='' AND julianday(visible_from)>=julianday(?)) THEN 0 ELSE active END,
-      revoked_at=CASE WHEN (first_used_at='' OR (visible_from!='' AND julianday(visible_from)>=julianday(?))) AND revoked_at='' THEN ? ELSE revoked_at END,
-      revoke_reason=CASE WHEN (first_used_at='' OR (visible_from!='' AND julianday(visible_from)>=julianday(?))) AND revoke_reason='' THEN ? ELSE revoke_reason END,
+      scope='historical',
+      visible_to=CASE WHEN visible_to='' OR julianday(visible_to)>julianday(?) THEN ? ELSE visible_to END,
       updated_at=?
-    WHERE ${clause} AND active=1 AND scope!='admin_only'`).run(
-    cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, reason, cutoff, target,
-  );
+    WHERE binding_id=? AND active=1 AND scope!='admin_only'`).run(cutoff, cutoff, cutoff, bindingId);
 }
 
 function revokeActiveCustomerAccess(accountId: string, at: string, reason: string): void {
@@ -227,19 +219,32 @@ export function quarantineAccount(accountId: string, reason: string, source = "s
   })();
 }
 
-export function freezeAccountTransition(accountId: string, reason = "admin_manual", source = "v2-admin", triggerReceivedAt = ""): void {
+export function freezeAccountTransition(accountId: string, reason = "admin_manual", source = "v2-admin", triggerReceivedAt?: string): void {
   const account = db.prepare("SELECT * FROM gpt_accounts WHERE id=? AND deleted_at='' ").get(accountId) as any;
   if (!account) throw new Error("账号不存在");
   const alreadyLocked = boolean(account.deactivation_locked);
-  const occurredAt = alreadyLocked ? nowIso(String(account.deactivated_at || triggerReceivedAt)) : nowIso(triggerReceivedAt);
-  const cutoff = triggerReceivedAt ? cutoffAfter(occurredAt) : occurredAt;
+  const administratorInitiated = source === "v2-admin" || source.startsWith("v2-admin:");
+  const alreadyAdministratorStopped = Boolean(String(account.admin_deactivated_at || ""));
+  const confirmedTimes = [account.deactivated_at, triggerReceivedAt].map((value) => Date.parse(String(value || ""))).filter(Number.isFinite);
+  const now = nowIso();
+  const occurredAt = confirmedTimes.length ? new Date(Math.min(...confirmedTimes)).toISOString()
+    : alreadyLocked || triggerReceivedAt !== undefined ? "" : now;
   db.transaction(() => {
-    closeCustomerAccess(accountId, cutoff, "account_deactivated");
-    closeSale(accountId, cutoff, "account_deactivated");
-    if (alreadyLocked) return;
     db.prepare(`UPDATE gpt_accounts SET lifecycle_status='deactivated', deactivation_locked=1,
-      deactivated_at=CASE WHEN deactivated_at='' THEN ? ELSE deactivated_at END, updated_at=? WHERE id=?`).run(occurredAt, occurredAt, accountId);
-    addEvent(accountId, null, "account_deactivated", occurredAt, source, { immutable: true, reason: String(reason).slice(0, 500), customerCutoff: cutoff });
+      deactivated_at=?, admin_deactivated_at=CASE WHEN ?=1 AND admin_deactivated_at='' THEN ? ELSE admin_deactivated_at END,
+      updated_at=? WHERE id=?`).run(occurredAt, Number(administratorInitiated), now, now, accountId);
+    // A manual administrator stop is the customer mailbox boundary. Existing
+    // messages remain visible, while mail received after this exact action is
+    // excluded from both list and detail APIs.
+    if (administratorInitiated) {
+      db.prepare(`UPDATE email_bindings SET receive_disabled_at=CASE
+          WHEN receive_disabled_at='' OR julianday(receive_disabled_at)>julianday(?) THEN ? ELSE receive_disabled_at END,
+        updated_at=? WHERE account_id=? AND is_current=1`).run(now, now, now, accountId);
+    }
+    if (alreadyLocked && (!administratorInitiated || alreadyAdministratorStopped)) return;
+    addEvent(accountId, null, "account_deactivated", occurredAt, source,
+      { immutable: true, reason: String(reason).slice(0, 500), administratorInitiated,
+        customerAccessPreserved: true, customerMailStoppedAt: administratorInitiated ? now : "" });
   })();
 }
 
@@ -270,6 +275,7 @@ export interface RebindOptions {
   associationMethod?: string;
   changedAt?: string;
   evidence?: JsonObject;
+  explicitPreviousEmail?: string;
 }
 
 export function rebindAccountTransition(accountId: string, newEmailInput: string, options: RebindOptions = {}): { bindingId: string; changed: boolean } {
@@ -281,7 +287,9 @@ export function rebindAccountTransition(accountId: string, newEmailInput: string
   const current = db.prepare("SELECT * FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId) as any;
   if (!current) throw new Error("账号没有当前邮箱绑定");
   if (String(current.email_hash) === emailHash(newEmail)) return { bindingId: String(current.id), changed: false };
-  if (String(current.local_part) !== parts.localPart) throw new Error("完整本地部分不一致，不能改绑");
+  const explicitPrevious = normalizeEmail(options.explicitPreviousEmail || "");
+  if (explicitPrevious && emailHash(explicitPrevious) !== String(current.email_hash)) throw new Error("明确改绑来源不是当前邮箱");
+  if (String(current.local_part) !== parts.localPart && !explicitPrevious) throw new Error("完整本地部分不一致，不能改绑");
   if (boolean(account.sold) && !boolean(account.deactivation_locked)) throw new Error("已售且未停用的GPT账号不允许改绑；请先人工确认异常");
   const owners = db.prepare("SELECT DISTINCT account_id FROM email_bindings WHERE email_hash=?").all(emailHash(newEmail)) as Array<{ account_id: string }>;
   if (owners.some((row) => String(row.account_id) !== accountId)) throw new Error("新邮箱属于其他GPT账号，禁止改绑");
@@ -294,7 +302,7 @@ export function rebindAccountTransition(accountId: string, newEmailInput: string
   db.transaction(() => {
     db.prepare("UPDATE email_bindings SET is_current=0, valid_to=CASE WHEN valid_to='' THEN ? ELSE valid_to END, updated_at=? WHERE id=?")
       .run(changedAt, changedAt, current.id);
-    closeCustomerAccess(accountId, changedAt, "email_rebind", String(current.id));
+    preserveHistoricalCustomerAccess(String(current.id), changedAt);
     closeSale(accountId, changedAt, "email_rebind");
     db.prepare(`INSERT OR IGNORE INTO mailbox_families(id, provider, canonical_address_enc, canonical_address_hash, created_at, updated_at)
       VALUES(?, ?, ?, ?, ?, ?)`).run(familyId, provider, encryptSecret(newEmail), emailHash(newEmail), changedAt, changedAt);
@@ -332,26 +340,47 @@ export function recycleAccountTransition(accountId: string, newEmailInput: strin
   const replacementId = crypto.randomUUID();
   const bindingId = crypto.randomUUID();
   const provider = mailboxProvider(newEmail);
-  const familyId = stableId("mailbox-family", provider, emailHash(newEmail));
+  const previousEmail = decryptSecret(String(current.email_enc));
+  const previousParts = splitEmail(previousEmail);
+  const canonical = provider === "icloud" ? `${previousParts.localPart.split("+")[0]}@${previousParts.domain}` : newEmail;
+  const familyId = stableId("mailbox-family", provider, emailHash(canonical));
+  const previousRules = db.prepare("SELECT DISTINCT sender_pattern FROM mail_routing_rules WHERE binding_id=?").all(current.id) as Array<{ sender_pattern: string }>;
+  const senders = previousRules.length ? previousRules.map((rule) => rule.sender_pattern) : [LEGACY_RELAY_SENDER_PATTERN];
+  let compatibility: Record<string, any> = {};
+  try { compatibility = JSON.parse(String(current.source_json || "{}"))?.compatibility || {}; } catch {}
   const allowedPlans = new Set(["free", "plus", "pro", "team", "business", "unknown"]);
   const plan = allowedPlans.has(String(planInput).toLowerCase()) ? String(planInput).toLowerCase() : "free";
   db.transaction(() => {
-    db.prepare("UPDATE email_bindings SET is_current=0, valid_to=CASE WHEN valid_to='' THEN ? ELSE valid_to END, updated_at=? WHERE account_id=? AND is_current=1")
-      .run(now, now, accountId);
-    closeCustomerAccess(accountId, now, "mailbox_recycle");
+    db.prepare(`UPDATE email_bindings SET is_current=0,
+      valid_to=CASE WHEN valid_to='' THEN ? ELSE valid_to END,
+      receive_disabled_at=CASE WHEN receive_disabled_at='' THEN ? ELSE receive_disabled_at END,
+      updated_at=? WHERE account_id=? AND is_current=1`).run(now, now, now, accountId);
+    db.prepare("UPDATE mail_routing_rules SET valid_to=CASE WHEN valid_to='' THEN ? ELSE valid_to END, updated_at=? WHERE binding_id=?")
+      .run(now, now, current.id);
+    // Reclaim is the explicit boundary: old links and existing sessions must
+    // stop immediately, including grants from historical bindings.
+    revokeActiveCustomerAccess(accountId, now, "mailbox_recycle");
     closeSale(accountId, now, "mailbox_recycle");
     db.prepare(`UPDATE gpt_accounts SET lifecycle_status=CASE WHEN deactivation_locked=1 THEN 'deactivated' ELSE 'retired' END,
-      retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END, updated_at=? WHERE id=?`).run(now, now, accountId);
+      admin_deactivated_at=CASE WHEN admin_deactivated_at='' THEN ? ELSE admin_deactivated_at END,
+      retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END, updated_at=? WHERE id=?`).run(now, now, now, accountId);
     db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, plan, domain_mailbox, identity_status, source_status, arrived_at, created_at, updated_at)
       VALUES(?, 'active', ?, ?, 'unknown', 'v2', ?, ?, ?)`).run(replacementId, plan, provider === "domain" ? 1 : 0, now, now, now);
     db.prepare(`INSERT OR IGNORE INTO mailbox_families(id, provider, canonical_address_enc, canonical_address_hash, created_at, updated_at)
-      VALUES(?, ?, ?, ?, ?, ?)`).run(familyId, provider, encryptSecret(newEmail), emailHash(newEmail), now, now);
+      VALUES(?, ?, ?, ?, ?, ?)`).run(familyId, provider, encryptSecret(canonical), emailHash(canonical), now, now);
     db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
       valid_from, is_current, association_method, legacy_mapping_id, source_json, created_at, updated_at)
-      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'admin_explicit_recycle', ?, '{}', ?, ?)`).run(
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'admin_explicit_recycle', ?, ?, ?, ?)`).run(
       bindingId, replacementId, familyId, encryptSecret(newEmail), emailHash(newEmail), parts.localPart, parts.domain, provider,
-      now, `v2:${bindingId}`, now, now,
+      now, `v2:${bindingId}`, JSON.stringify({ compatibility: { sourceEmail: String(compatibility.sourceEmail || "").slice(0, 320),
+        toEmail: newEmail, internalStatusMessage: "" } }), now, now,
     );
+    const insertRule = db.prepare(`INSERT INTO mail_routing_rules(id,binding_id,sender_pattern,recipient_pattern,
+      valid_from,source,priority,created_at,updated_at) VALUES(?,?,?,?,?,'v2-recycle',?,?,?)`);
+    for (const [fromIndex, sender] of senders.entries()) for (const [toIndex, recipient] of [...new Set([newEmail, canonical])].entries()) {
+      insertRule.run(stableId("recycle-mail-rule", bindingId, String(fromIndex), String(toIndex)), bindingId,
+        sender, mailboxRecipientPattern(recipient), now, 100 - fromIndex - toIndex, now, now);
+    }
     insertAdminOnlyGrant(replacementId, bindingId, newEmail, now);
     db.prepare(`INSERT INTO account_relations(id, relation_type, from_account_id, to_account_id, changed_at, association_method, evidence_json, created_at)
       VALUES(?, 'mailbox_recycle', ?, ?, ?, 'admin_explicit_recycle', ?, ?)`).run(
@@ -375,49 +404,46 @@ export interface CustomerGrantSecret {
 }
 
 export function issueCustomerGrant(accountId: string, bindingId: string, input: JsonObject = {}): CustomerGrantSecret {
-  const row = db.prepare(`SELECT b.*, a.lifecycle_status, a.deactivation_locked, a.identity_status, a.sold
+  const row = db.prepare(`SELECT b.*, a.lifecycle_status, a.retired_at, a.quarantine_reason, a.identity_status, a.sold
     FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
     WHERE b.id=? AND b.account_id=? AND a.deleted_at=''`).get(bindingId, accountId) as any;
   if (!row) throw new Error("邮箱绑定不存在");
   if (!boolean(row.is_current)) throw new Error("只能为当前邮箱绑定生成客户权限");
-  if (String(row.lifecycle_status) !== "active" || boolean(row.deactivation_locked)) throw new Error("停用、历史或隔离账号不能出售");
-  if (String(row.identity_status) === "conflict") throw new Error("账号存在OpenAI身份冲突，不能出售");
+  const blocked = customerGrantBlockReason({ lifecycleStatus: row.lifecycle_status, retiredAt: row.retired_at,
+    quarantineReason: row.quarantine_reason, identityStatus: row.identity_status });
+  if (blocked) throw new Error(`${blocked}，不能生成客户授权`);
   const actualEmail = normalizeEmail(String(input.loginIdentifier || "")) || normalizeEmail(decryptSecret(String(row.email_enc || "")));
   if (!splitEmail(actualEmail).localPart) throw new Error("登录标识必须是有效邮箱");
   const existingLogin = db.prepare("SELECT account_id FROM access_grants WHERE login_identifier_hash=? AND active=1 AND scope!='admin_only'")
     .all(emailHash(actualEmail)) as Array<{ account_id: string }>;
   if (existingLogin.some((grant) => String(grant.account_id) !== accountId)) throw new Error("该登录邮箱已分配给其他账号");
+  const trackSale = input.trackSale !== false;
   const existingSale = db.prepare("SELECT * FROM sales WHERE account_id=?").get(accountId) as any;
-  if (boolean(row.sold) && !existingSale) throw new Error("历史记录表明该GPT身份已经出售，不能再次出售；请回收为新账号");
-  if (existingSale && String(existingSale.status) !== "active" && String(existingSale.first_used_at || "")) {
-    throw new Error("这个GPT身份已经正式出售过，不能二次出售；请回收为新账号");
-  }
   const now = new Date().toISOString();
-  const saleId = existingSale ? String(existingSale.id) : crypto.randomUUID();
+  const saleId = trackSale ? (existingSale ? String(existingSale.id) : crypto.randomUUID()) : "";
   const password = String(input.password || crypto.randomBytes(18).toString("base64url"));
   if (password.length < 10) throw new Error("接码密码至少10位");
   const publicToken = crypto.randomBytes(24).toString("base64url");
   const grantId = crypto.randomUUID();
   db.transaction(() => {
-    db.prepare(`UPDATE access_grants SET active=0, revoked_at=CASE WHEN revoked_at='' THEN ? ELSE revoked_at END,
-      revoke_reason=CASE WHEN revoke_reason='' THEN 'grant_rotated' ELSE revoke_reason END, updated_at=?
-      WHERE account_id=? AND active=1 AND scope!='admin_only'`).run(now, now, accountId);
-    if (existingSale) {
+    // Every issued link is an independent mailbox entrance. Creating another
+    // entrance must not rotate or revoke links already handed to other users.
+    if (trackSale && existingSale) {
       db.prepare(`UPDATE sales SET binding_id=?, status='active', started_at=CASE WHEN first_used_at='' THEN ? ELSE started_at END,
         ended_at='', end_reason='', updated_at=? WHERE id=?`).run(bindingId, now, now, saleId);
-    } else {
+    } else if (trackSale) {
       db.prepare(`INSERT INTO sales(id, account_id, binding_id, status, started_at, created_at, updated_at)
         VALUES(?, ?, ?, 'active', ?, ?, ?)`).run(saleId, accountId, bindingId, now, now, now);
     }
     db.prepare(`INSERT INTO access_grants(id, account_id, binding_id, sale_id, public_token_hash, public_token_enc,
       login_identifier_hash, login_identifier_enc, password_hash, password_plain_enc, scope, visible_from, active, created_at, updated_at)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, 1, ?, ?)`).run(
-      grantId, accountId, bindingId, saleId, digestToken(publicToken), encryptSecret(publicToken), emailHash(actualEmail), encryptSecret(actualEmail),
+      grantId, accountId, bindingId, saleId || null, digestToken(publicToken), encryptSecret(publicToken), emailHash(actualEmail), encryptSecret(actualEmail),
       hashPassword(password), encryptSecret(password), String(row.valid_from || now), now, now,
     );
-    db.prepare("UPDATE gpt_accounts SET sold=1, updated_at=? WHERE id=?").run(now, accountId);
-    addEvent(accountId, bindingId, existingSale ? "customer_grant_rotated" : "account_sold", now, "v2-admin",
-      { saleId, grantId, previousGrantInvalidated: true });
+    if (trackSale) db.prepare("UPDATE gpt_accounts SET sold=1, updated_at=? WHERE id=?").run(now, accountId);
+    addEvent(accountId, bindingId, trackSale ? (existingSale ? "customer_access_added" : "account_sold") : "mailbox_access_link_created",
+      now, "v2-admin", { saleId: saleId || null, grantId, previousGrantsPreserved: true, trackSale });
   })();
   return { grantId, saleId, publicToken, loginIdentifier: actualEmail, password, scope: "current" };
 }
@@ -446,7 +472,9 @@ export function revokeGrantTransition(accountId: string, grantId: string): boole
       .run(now, now, grantId);
     if (grant.sale_id) {
       const sale = db.prepare("SELECT * FROM sales WHERE id=?").get(grant.sale_id) as any;
-      if (sale && String(sale.status) === "active") {
+      const otherActive = db.prepare(`SELECT 1 FROM access_grants
+        WHERE sale_id=? AND id!=? AND active=1 AND scope!='admin_only' LIMIT 1`).get(grant.sale_id, grantId);
+      if (!otherActive && sale && String(sale.status) === "active") {
         const status = String(sale.first_used_at || "") ? "closed" : "cancelled";
         db.prepare("UPDATE sales SET status=?, ended_at=?, end_reason='grant_revoked', updated_at=? WHERE id=?").run(status, now, now, sale.id);
         if (status === "cancelled") db.prepare("UPDATE gpt_accounts SET sold=0, updated_at=? WHERE id=?").run(now, accountId);

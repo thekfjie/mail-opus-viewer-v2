@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-test("支付资格只请求一次接口且只保存管理员选择的字段", async (t) => {
+test("所有支付资格统一请求本机无优惠观察且只保存管理员选择的方式", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mail-opus-eligibility-"));
   const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
   const server = http.createServer(async (request, response) => {
@@ -13,20 +13,14 @@ test("支付资格只请求一次接口且只保存管理员选择的字段", as
     for await (const chunk of request) raw += String(chunk);
     requests.push({ url: String(request.url || ""), body: JSON.parse(raw || "{}") });
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({
-      token_ok: true,
-      eligible: true,
-      promo_id: "plus-1-month-free",
-      ideal_eligible: true,
-      ideal_eligible_reason: "eligible",
-      gcash_eligible: true,
-      gopay_eligible: true,
-      upi_eligible: true,
-      kakao_eligible: true,
-      naver_eligible: true,
-      gcash_pm_eligible: null,
-      gcash_pm_eligible_reason: "not-requested",
-    }));
+    response.statusCode = 202;
+    response.end(JSON.stringify({ ok: true, job: {
+      id: "ext-ideal-local-fixture", status: "completed",
+      startedAt: "2026-09-14T02:00:00.000Z", finishedAt: "2026-09-14T02:00:01.000Z",
+      items: [{ index: 1, status: "succeeded", finishedAt: "2026-09-14T02:00:01.000Z", result: {
+        paymentExposure: [{ target: "ideal", status: "complete", exposed: true, detail: "已暴露 ideal；methods=card,ideal" }],
+      } }],
+    } }));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
@@ -39,8 +33,8 @@ test("支付资格只请求一次接口且只保存管理员选择的字段", as
     V2_SESSION_SECRET: "eligibility-test-session",
     CREDENTIAL_ENCRYPTION_KEY: "eligibility-test-encryption",
     V2_READ_ONLY: "true",
-    PAYMENT_ELIGIBILITY_API_URL: `http://127.0.0.1:${address.port}/api/v1/check`,
-    PAYMENT_ELIGIBILITY_API_TOKEN: "",
+    PAYMENT_METHOD_EXTRACT_API_BASE: `http://127.0.0.1:${address.port}`,
+    PAYMENT_METHOD_EXTRACT_API_KEY: "",
   });
 
   const [{ db }, repository, paymentExposure] = await Promise.all([
@@ -57,22 +51,34 @@ test("支付资格只请求一次接口且只保存管理员选择的字段", as
     plan: "free",
   }]);
   const account = repository.listAccounts({ limit: 5 }).results[0];
+  const routes = paymentExposure.listPaymentExposureRoutes();
+  assert.deepEqual(routes.map((route) => route.target), ["ideal", "gcash", "upi", "gopay", "kakao", "naver", "momo"]);
+  assert.equal(routes.every((route) => route.configured && route.addressDisplay === "本机提炼服务"), true);
+  await assert.rejects(() => paymentExposure.startPaymentExposureBatch([account.id]), /必须先选择一个具体 method/);
+  await assert.rejects(() => paymentExposure.startPaymentExposureBatch([account.id], ["nl_ideal", "vn_momo"]), /必须先选择一个具体 method/);
+  await assert.rejects(() => paymentExposure.startPaymentExposureBatch(Array.from({ length: 25 }, (_, index) => `account-${index}`), ["vn_momo"]), /最多选择 24 个账号/);
   const result = await paymentExposure.startPaymentExposureCheck(account.id, "nl_ideal");
 
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].url, "/api/v1/check");
-  assert.equal(requests[0].body.token, "fake-access-token-for-test");
-  assert.equal(requests[0].body.check_gcash_pm, false);
-  assert.equal(JSON.stringify(requests[0].body).includes("checkout"), false);
+  assert.equal(requests[0].url, "/api/extract/jobs");
+  assert.equal(requests[0].body.method, "payment_exposure");
+  assert.equal(requests[0].body.input, "fake-access-token-for-test");
+  const options = requests[0].body.options as Record<string, unknown>;
+  assert.equal(options.usePromo, false);
+  assert.equal(Object.prototype.hasOwnProperty.call(options, "proxy"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(options, "promoCampaign"), false);
+  assert.deepEqual(options.paymentExposureTargets, [{
+    target: "ideal", ipCountry: "NL", billingCountry: "NL", billingCurrency: "EUR", expectedMethod: "ideal",
+  }]);
   assert.equal(result.status, "completed");
   assert.equal(result.items[0].paymentExposure.length, 1);
   assert.equal(result.items[0].paymentExposure[0].target, "ideal");
   assert.equal(result.items[0].paymentExposure[0].exposed, true);
   assert.equal(JSON.stringify(result).includes("fake-access-token-for-test"), false);
 
-  const saved = repository.listPaymentExposureChecks(account.id).filter((item) => item.checkoutType === "eligibility_api");
+  const saved = repository.listPaymentExposureChecks(account.id).filter((item) => item.checkoutType === "local_extractor");
   assert.equal(saved.length, 1);
   assert.equal(saved[0].target, "ideal");
   assert.deepEqual(saved[0].availableMethods, ["ideal"]);
-  assert.equal(saved.some((item) => ["gcash", "gopay", "upi", "kakao", "naver"].includes(item.target)), false);
+  assert.equal(saved.some((item) => ["gcash", "gopay", "upi", "kakao", "naver", "momo"].includes(item.target)), false);
 });

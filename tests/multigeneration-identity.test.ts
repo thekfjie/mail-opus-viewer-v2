@@ -12,7 +12,7 @@ test("回收各代保持独立，未完成换绑目标不建账号映射", async
   fs.mkdirSync(backupsDirectory, { recursive: true });
 
   const sourceEmail = "genes.folds-37+oai8hoaaw@icloud.com";
-  const targetEmail = "genes.folds-37+oai8hoaaw@example.com";
+  const targetEmail = "genes.folds-37+oai8hoaaw@ai-mail.tech";
   const laterEmail = "genes.folds-37+oai0l5pop@icloud.com";
   fs.writeFileSync(configFile, JSON.stringify([{
     id: "generation-two",

@@ -3,7 +3,8 @@ const TRIAL_OR_ZERO_CHARGE_PATTERNS = [
   /\b(?:first|initial)\s+month.{0,24}\bfree\b/i,
   /(?:免费|免費|無料)(?:试用|試用|体验|體驗|体験|トライアル)?/i,
   /(?:首月|首个一月|最初の一か月|初月).{0,16}(?:免费|免費|無料)/i,
-  /(?:^|\D)(?:0|0\.00)\s*(?:USD|EUR|JPY|CNY|元|円|美元|欧元)(?:\D|$)/i,
+  /(?:tháng\s+đầu(?:\s+tiên)?).{0,16}(?:miễn\s+phí|free)/i,
+  /(?:^|\D)(?:0|0\.00)\s*(?:USD|EUR|JPY|CNY|VND|元|円|₫|美元|欧元)(?:\D|$)/i,
 ];
 
 const STRICT_ACTIVE_SUBJECT_PATTERNS = [
@@ -18,6 +19,7 @@ const PLAN_ORDER_SUBJECT_PATTERNS = [
   /^ChatGPT\s*-\s*Your new plan$/i,
   /^ChatGPT\s*-\s*你的新(?:套餐|方案|[计計][划劃])$/i,
   /^ChatGPT\s*-\s*新しいプラン$/i,
+  /^ChatGPT\s*-\s*Kế hoạch mới của bạn$/i,
 ];
 
 function normalizedSubject(value: unknown): string {

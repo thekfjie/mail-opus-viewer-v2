@@ -1,12 +1,19 @@
 import crypto from "node:crypto";
+import { customerGrantBlockReason } from "../shared/customer-access-policy.js";
+import { mailboxBindingBatchSql } from "./mailbox-batch.js";
 import fs from "node:fs";
 import path from "node:path";
-import { AccountDetail, AccountSummary, PaymentExposureCheck } from "../shared/types.js";
+import { AccountDetail, AccountSummary, PaymentExposureCheck, PaymentExposureMethodSummary, PaymentExposurePromoMode } from "../shared/types.js";
 import { emailHash, normalizeEmail, parseJwtSubject, splitEmail, stableId } from "./association.js";
 import { config } from "./config.js";
 import { decryptSecret, digestToken, encryptSecret, hashPassword, verifyPassword } from "./crypto.js";
 import { db } from "./db.js";
 import { credentialHistory, observeCredentialVersion } from "./credential-versions.js";
+import { assertRecycleEligibility, recycleEligibilityAudit } from "./recycle-eligibility.js";
+import { isPlanOrderSubject, isStrictPlusEvidenceSubject } from "./plus-evidence.js";
+import type { RecycleMode } from "../shared/types.js";
+export { getRecycleEligibility } from "./recycle-eligibility.js";
+export type { RecycleMode } from "../shared/types.js";
 import {
   cancelUnusedSale,
   freezeAccountTransition,
@@ -56,6 +63,59 @@ function promotionCampaignIds(value: unknown): string[] {
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("base64url");
+}
+
+function formatAliveDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const totalMinutes = Math.floor(ms / 60_000);
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}天${hours}小时`;
+  if (hours > 0) return `${hours}小时${minutes}分`;
+  return `${Math.max(minutes, 0)}分`;
+}
+
+export function computeAliveInfo(billingStartedAt: string, deactivatedAt: string, nowMs = Date.now()): {
+  billingStartedAt: string; aliveUntil: string; aliveMs: number; aliveLabel: string; aliveActive: boolean;
+} {
+  const startMs = Date.parse(String(billingStartedAt || ""));
+  if (!Number.isFinite(startMs)) return { billingStartedAt: "", aliveUntil: "", aliveMs: 0, aliveLabel: "", aliveActive: false };
+  const deactivatedMs = Date.parse(String(deactivatedAt || ""));
+  const hasDeactivation = Number.isFinite(deactivatedMs) && deactivatedMs >= startMs;
+  const endMs = hasDeactivation ? deactivatedMs : Math.max(startMs, nowMs);
+  const aliveMs = Math.max(0, endMs - startMs);
+  const duration = formatAliveDuration(aliveMs);
+  return {
+    billingStartedAt: new Date(startMs).toISOString(),
+    aliveUntil: new Date(endMs).toISOString(),
+    aliveMs,
+    aliveLabel: hasDeactivation ? `账单起存活 ${duration}（已停用）` : `账单起已活 ${duration}`,
+    aliveActive: !hasDeactivation,
+  };
+}
+
+export function billingStartedAtFromMails(
+  rows: Array<{ subject?: string; received_at?: string }>, plan: string, billingChannel: string,
+): string {
+  if (plan.toLowerCase() !== "plus") return "";
+  // The generic plan-order subject is a valid start anchor once Plus is
+  // already established. Channel extraction can be unavailable from an
+  // index-only read, and must not hide the billing start date itself.
+  for (const row of rows) {
+    const subject = String(row.subject || "");
+    if (isStrictPlusEvidenceSubject(subject) || isPlanOrderSubject(subject)) return String(row.received_at || "");
+  }
+  return "";
+}
+
+function billingStartedAtForAccount(accountId: string, plan: string, billingChannel: string, persisted = ""): string {
+  const rows = db.prepare(`SELECT DISTINCT m.id,m.subject,m.received_at
+    FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id
+    WHERE oc.account_id=? AND m.received_at!='' ORDER BY datetime(m.received_at) ASC`).all(accountId) as Array<{ subject?: string; received_at?: string }>;
+  const derived = billingStartedAtFromMails(rows, plan, billingChannel);
+  const values = [persisted, derived].filter((value) => Number.isFinite(Date.parse(value)));
+  return values.sort((left, right) => Date.parse(left) - Date.parse(right))[0] || "";
 }
 
 function mailboxProvider(email: string): string {
@@ -128,11 +188,27 @@ function accountRowToSummary(row: any): AccountSummary {
   const firstSeenMs = Date.parse(accessTokenFirstSeenAt);
   const autoTrialDueAt = Number.isFinite(firstSeenMs)
     ? new Date(firstSeenMs + config.autoTrialDelayMs).toISOString() : "";
+  const billingStartedAt = billingStartedAtForAccount(
+    String(row.id), String(row.plan || ""), String(row.billing_channel || ""), String(row.billing_started_at || ""),
+  );
+  const alive = computeAliveInfo(billingStartedAt, String(row.deactivated_at || ""));
+  const openAiAuthMethods = (() => {
+    try {
+      const value = JSON.parse(String(row.openai_auth_methods_json || "[]"));
+      return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+    } catch { return []; }
+  })();
+  const paymentExposureMethods = String(row.payment_exposure_methods || "").split(",").map((item) => item.trim()).filter(Boolean);
+  const paymentExposureMethodDetails = paymentMethodSummaries(
+    paymentExposureMethods,
+    jsonMethodArray(row.payment_exposure_method_details_json),
+  );
   return {
     id: String(row.id),
     primaryEmail,
     primaryEmailMasked: maskEmail(primaryEmail),
     lifecycleStatus: row.lifecycle_status,
+    retiredAt: String(row.retired_at || ""),
     quarantineReason: String(row.quarantine_reason || ""),
     deactivationLocked: boolean(row.deactivation_locked),
     deactivatedAt: String(row.deactivated_at || ""),
@@ -141,12 +217,11 @@ function accountRowToSummary(row: any): AccountSummary {
     saleStatus: String(row.sale_status || "none") as AccountSummary["saleStatus"],
     saleId: String(row.sale_id || ""),
     saleFirstUsedAt: String(row.sale_first_used_at || ""),
-    sellable: String(row.lifecycle_status) === "active" && !boolean(row.deactivation_locked)
-      && String(row.identity_status || "unknown") !== "conflict" && !boolean(row.sold) && !credentials.internalPending,
+    sellable: !customerGrantBlockReason({ lifecycleStatus: row.lifecycle_status, retiredAt: row.retired_at,
+      quarantineReason: row.quarantine_reason, identityStatus: row.identity_status }) && !boolean(row.sold) && !credentials.internalPending,
     sellBlockers: [
-      ...(boolean(row.deactivation_locked) ? ["永久停用"] : []),
-      ...(String(row.lifecycle_status) !== "active" ? [String(row.lifecycle_status) === "quarantined" ? "归属待核对" : "非活跃账号"] : []),
-      ...(String(row.identity_status || "unknown") === "conflict" ? ["OpenAI身份冲突"] : []),
+      ...[customerGrantBlockReason({ lifecycleStatus: row.lifecycle_status, retiredAt: row.retired_at,
+        quarantineReason: row.quarantine_reason, identityStatus: row.identity_status })].filter(Boolean),
       ...(boolean(row.sold) ? ["该GPT身份已经出售"] : []),
       ...(credentials.internalPending ? [credentials.label] : []),
     ],
@@ -160,6 +235,8 @@ function accountRowToSummary(row: any): AccountSummary {
     provider: String(row.provider || "unknown"),
     domainMailbox: boolean(row.domain_mailbox),
     isAuto: boolean(row.is_auto),
+    openAiMfaEnabled: boolean(row.openai_mfa_enabled),
+    openAiAuthMethods,
     suspectedUnused: boolean(row.suspected_unused),
     hasAccessToken: boolean(row.has_access_token),
     hasRefreshToken: boolean(row.has_refresh_token),
@@ -179,6 +256,8 @@ function accountRowToSummary(row: any): AccountSummary {
     latestMailAt: String(row.latest_mail_at || ""),
     paymentExposureStatus,
     paymentExposureSummary: String(row.payment_exposure_summary || ""),
+    paymentExposureMethods,
+    paymentExposureMethodDetails,
     paymentExposureCount,
     paymentExposureExposedCount,
     paymentExposureUnknownCount,
@@ -200,6 +279,11 @@ function accountRowToSummary(row: any): AccountSummary {
     promotionCheckErrorClass: String(row.promotion_check_error_class || ""),
     promotionCheckErrorDetail: String(row.promotion_check_error_detail || ""),
     promotionCheckNextRetryAt: String(row.promotion_check_next_retry_at || ""),
+    billingStartedAt: alive.billingStartedAt,
+    aliveUntil: alive.aliveUntil,
+    aliveMs: alive.aliveMs,
+    aliveLabel: alive.aliveLabel,
+    aliveActive: alive.aliveActive,
   };
 }
 
@@ -219,11 +303,17 @@ SELECT a.*,
   (SELECT COUNT(*) FROM account_relations r WHERE r.from_account_id=a.id OR r.to_account_id=a.id) AS relation_count,
   (SELECT COUNT(*) FROM access_grants g WHERE g.account_id=a.id AND g.active=1 AND g.scope!='admin_only') AS customer_grant_count,
   COALESCE((SELECT MAX(m.received_at) FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE oc.account_id=a.id), '') AS latest_mail_at,
-  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type='eligibility_api') AS payment_exposure_count,
-  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type='eligibility_api' AND p.exposed=1 AND p.status='complete') AS payment_exposure_exposed_count,
-  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type='eligibility_api' AND p.status='unknown') AS payment_exposure_unknown_count,
-  COALESCE((SELECT GROUP_CONCAT(p.target || ':' || p.status, ', ') FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type='eligibility_api'), '') AS payment_exposure_summary,
-  COALESCE((SELECT MAX(p.updated_at) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type='eligibility_api'), '') AS payment_exposure_checked_at,
+  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor')) AS payment_exposure_count,
+  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor') AND p.exposed=1 AND p.status='complete') AS payment_exposure_exposed_count,
+  (SELECT COUNT(*) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor') AND p.status='unknown') AS payment_exposure_unknown_count,
+  COALESCE((SELECT GROUP_CONCAT(p.target || ':' || p.status, ', ') FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor')), '') AS payment_exposure_summary,
+  COALESCE((SELECT GROUP_CONCAT(DISTINCT jm.value) FROM payment_exposure_checks p, json_each(
+    CASE WHEN json_valid(p.available_methods_json) THEN p.available_methods_json ELSE '[]' END
+  ) jm WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor') AND TRIM(jm.value)!=''), '') AS payment_exposure_methods,
+  COALESCE((SELECT json_group_array(json(jm.value)) FROM payment_exposure_checks p, json_each(
+    CASE WHEN json_valid(p.payment_methods_json) THEN p.payment_methods_json ELSE '[]' END
+  ) jm WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor') AND json_type(jm.value)='object'), '[]') AS payment_exposure_method_details_json,
+  COALESCE((SELECT MAX(p.updated_at) FROM payment_exposure_checks p WHERE p.account_id=a.id AND p.checkout_type IN ('eligibility_api','local_extractor')), '') AS payment_exposure_checked_at,
   COALESCE((SELECT po.result_status FROM promotion_observations po WHERE po.account_id=a.id AND po.result_status IN ('eligible','ineligible') ORDER BY po.checked_at DESC, po.id DESC LIMIT 1), 'unknown') AS latest_trial_status,
   COALESCE((SELECT po.eligible FROM promotion_observations po WHERE po.account_id=a.id AND po.result_status IN ('eligible','ineligible') ORDER BY po.checked_at DESC, po.id DESC LIMIT 1), -1) AS latest_promo_eligible,
   COALESCE((SELECT po.campaign FROM promotion_observations po WHERE po.account_id=a.id AND po.result_status IN ('eligible','ineligible') ORDER BY po.checked_at DESC, po.id DESC LIMIT 1), '') AS latest_promo_campaign,
@@ -233,6 +323,7 @@ SELECT a.*,
   COALESCE((SELECT po.evidence_json FROM promotion_observations po WHERE po.account_id=a.id AND po.eligible=1 ORDER BY po.checked_at DESC, po.id DESC LIMIT 1), '{}') AS latest_eligible_promo_evidence_json,
   COALESCE((SELECT po.checked_at FROM promotion_observations po WHERE po.account_id=a.id AND po.result_status IN ('eligible','ineligible') ORDER BY po.checked_at DESC, po.id DESC LIMIT 1), '') AS latest_trial_checked_at,
   COALESCE(c.access_token_first_seen_at, '') AS access_token_first_seen_at,
+  COALESCE(e.billing_started_at, '') AS billing_started_at,
   COALESCE((SELECT pj.status FROM promotion_jobs pj WHERE pj.account_id=a.id AND pj.check_kind='auto' ORDER BY pj.created_at DESC, pj.id DESC LIMIT 1), '') AS auto_trial_status,
   COALESCE((SELECT pj.status FROM promotion_jobs pj WHERE pj.account_id=a.id ORDER BY pj.created_at DESC, pj.id DESC LIMIT 1), '') AS promotion_check_status,
   COALESCE((SELECT pj.started_at FROM promotion_jobs pj WHERE pj.account_id=a.id ORDER BY pj.created_at DESC, pj.id DESC LIMIT 1), '') AS promotion_check_started_at,
@@ -245,6 +336,7 @@ LEFT JOIN email_bindings cb ON cb.id=(
   SELECT b2.id FROM email_bindings b2 WHERE b2.account_id=a.id ORDER BY b2.is_current DESC, b2.valid_from DESC, b2.created_at DESC LIMIT 1
 )
 LEFT JOIN credentials c ON c.account_id=a.id
+LEFT JOIN account_business_evidence e ON e.account_id=a.id
 LEFT JOIN sales s ON s.account_id=a.id`;
 
 export interface AccountFilters {
@@ -401,7 +493,9 @@ export function listPendingReviews(): Array<Record<string, unknown>> {
     id: String(row.id),
     reviewType: String(row.review_type),
     accountId: String(row.account_id || ""),
-    candidateEmail: decryptSecret(String(row.candidate_email_enc || "")),
+    candidateEmail: decryptSecret(String(row.candidate_email_enc || "")) || (row.review_type === "mail_ownership_ambiguous"
+      ? decryptSecret(String((db.prepare("SELECT recipient_enc FROM mail_messages WHERE id=?")
+        .get(JSON.parse(String(row.evidence_json || "{}")).messageId || "") as any)?.recipient_enc || "")) : ""),
     reason: String(row.reason || ""),
     evidence: JSON.parse(String(row.evidence_json || "{}")),
     createdAt: String(row.created_at || ""),
@@ -449,8 +543,9 @@ export function migrationReport(): Record<string, unknown> {
       WHERE a.deleted_at='' AND a.lifecycle_status='active'
       AND NOT EXISTS(SELECT 1 FROM email_bindings b WHERE b.account_id=a.id AND b.is_current=1)`).get() as any).count || 0),
     selfReferentialAccountRelations: Number((db.prepare("SELECT COUNT(*) count FROM account_relations WHERE from_account_id=to_account_id").get() as any).count || 0),
-    frozenWithUnboundedCurrentGrant: Number((db.prepare(`SELECT COUNT(DISTINCT a.id) AS count FROM gpt_accounts a
-      JOIN access_grants g ON g.account_id=a.id WHERE a.deactivation_locked=1 AND g.active=1 AND g.scope='current' AND g.visible_to=''`).get() as any).count || 0),
+    revokedOrDeletedWithActiveCustomerGrant: Number((db.prepare(`SELECT COUNT(DISTINCT a.id) AS count FROM gpt_accounts a
+      JOIN access_grants g ON g.account_id=a.id WHERE g.active=1 AND g.scope!='admin_only'
+        AND (g.revoked_at!='' OR g.revoke_reason!='' OR a.deleted_at!='')`).get() as any).count || 0),
     accountsWithMultipleCurrentBindings: Number((db.prepare(`SELECT COUNT(*) AS count FROM (
       SELECT account_id FROM email_bindings WHERE is_current=1 GROUP BY account_id HAVING COUNT(*)>1)`).get() as any).count || 0),
     currentGrantsOnHistoricalBindings: Number((db.prepare(`SELECT COUNT(*) AS count FROM access_grants g JOIN email_bindings b ON b.id=g.binding_id
@@ -506,14 +601,142 @@ function jsonStringArray(value: unknown): string[] {
   }
 }
 
+function normalizedUniqueStrings(values: unknown[], limit = 64): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const item = String(value ?? "").trim().toLowerCase();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    result.push(item);
+    if (result.length >= limit) break;
+  }
+  return result;
+}
+
+function normalizePaymentExposurePromoMode(value: unknown): PaymentExposurePromoMode {
+  const mode = String(value || "").trim().toLowerCase();
+  return mode === "one_month" || mode === "1month" || mode === "1_month" || mode === "promo"
+    ? "one_month" : mode === "none" || mode === "no_promo" ? "none" : "unknown";
+}
+
+function mergePaymentExposurePromoMode(existing: PaymentExposurePromoMode, incoming: PaymentExposurePromoMode): PaymentExposurePromoMode {
+  if (existing === "one_month" || incoming === "one_month") return "one_month";
+  if (existing === "none" || incoming === "none") return "none";
+  return "unknown";
+}
+
+function paymentMethodSources(method: Partial<PaymentExposureCheck["paymentMethods"][number]>): string[] {
+  const sources = Array.isArray(method.sources) ? method.sources : [];
+  return normalizedUniqueStrings([
+    ...sources,
+    ...String(method.source || "").split(/[,|>→]+/),
+  ], 16);
+}
+
+function normalizePaymentMethod(method: Partial<PaymentExposureCheck["paymentMethods"][number]>): PaymentExposureCheck["paymentMethods"][number] {
+  const sources = paymentMethodSources(method);
+  return {
+    id: String(method.id || "").trim().slice(0, 128),
+    type: String(method.type || "").trim().toLowerCase().slice(0, 64),
+    provider: String(method.provider || "").trim().toLowerCase().slice(0, 64),
+    name: String(method.name || "").trim().slice(0, 128),
+    code: String(method.code || "").trim().slice(0, 128),
+    displayName: String(method.displayName || "").trim().slice(0, 128),
+    source: sources[0] || "",
+    sources,
+    promoMode: normalizePaymentExposurePromoMode(method.promoMode),
+  };
+}
+
+function paymentMethodStableKey(method: PaymentExposureCheck["paymentMethods"][number]): string {
+  const identity = method.type || method.code.toLowerCase() || method.name.toLowerCase()
+    || method.displayName.toLowerCase() || method.id.toLowerCase() || method.provider;
+  return identity ? `method:${identity}:promo:${normalizePaymentExposurePromoMode(method.promoMode)}` : "";
+}
+
+export function mergePaymentExposureObservation(
+  existing: Pick<PaymentExposureCheck, "availableMethods" | "matchedMethods" | "paymentMethods">,
+  incoming: Pick<PaymentExposureCheck, "availableMethods" | "matchedMethods" | "paymentMethods">,
+): Pick<PaymentExposureCheck, "availableMethods" | "matchedMethods" | "paymentMethods"> {
+  const paymentMethods: PaymentExposureCheck["paymentMethods"] = [];
+  const indexByKey = new Map<string, number>();
+  for (const raw of [...(existing.paymentMethods || []), ...(incoming.paymentMethods || [])]) {
+    const method = normalizePaymentMethod(raw);
+    const key = paymentMethodStableKey(method);
+    if (!key) continue;
+    let index = indexByKey.get(key);
+    if (index === undefined && method.promoMode !== "unknown") {
+      const identity = method.type || method.code.toLowerCase() || method.name.toLowerCase()
+        || method.displayName.toLowerCase() || method.id.toLowerCase() || method.provider;
+      index = indexByKey.get(`method:${identity}:promo:unknown`);
+      if (index !== undefined) indexByKey.set(key, index);
+    }
+    if (index === undefined && method.promoMode === "unknown") {
+      const identity = method.type || method.code.toLowerCase() || method.name.toLowerCase()
+        || method.displayName.toLowerCase() || method.id.toLowerCase() || method.provider;
+      index = paymentMethods.findIndex((candidate) => {
+        const candidateIdentity = candidate.type || candidate.code.toLowerCase() || candidate.name.toLowerCase()
+          || candidate.displayName.toLowerCase() || candidate.id.toLowerCase() || candidate.provider;
+        return candidateIdentity === identity;
+      });
+      if (index < 0) index = undefined;
+    }
+    if (index === undefined) {
+      indexByKey.set(key, paymentMethods.length);
+      paymentMethods.push(method);
+      continue;
+    }
+    const previous = paymentMethods[index];
+    const sources = normalizedUniqueStrings([...paymentMethodSources(previous), ...paymentMethodSources(method)], 16);
+    paymentMethods[index] = {
+      id: previous.id || method.id,
+      type: previous.type || method.type,
+      provider: previous.provider || method.provider,
+      name: previous.name || method.name,
+      code: previous.code || method.code,
+      displayName: previous.displayName || method.displayName,
+      source: sources[0] || "",
+      sources,
+      promoMode: method.promoMode !== "unknown" ? method.promoMode : previous.promoMode,
+    };
+  }
+  return {
+    availableMethods: normalizedUniqueStrings([...(existing.availableMethods || []), ...(incoming.availableMethods || [])]),
+    matchedMethods: normalizedUniqueStrings([...(existing.matchedMethods || []), ...(incoming.matchedMethods || [])]),
+    paymentMethods: paymentMethods.slice(0, 128),
+  };
+}
+
+function paymentMethodSummaries(availableMethods: string[], methods: PaymentExposureCheck["paymentMethods"]): PaymentExposureMethodSummary[] {
+  const merged = mergePaymentExposureObservation(
+    { availableMethods: [], matchedMethods: [], paymentMethods: [] },
+    {
+      availableMethods,
+      matchedMethods: [],
+      paymentMethods: [
+        ...methods,
+        ...availableMethods.map((method) => ({
+          id: "", type: method, provider: "", name: method, code: "", displayName: method, source: "", sources: [],
+        })),
+      ],
+    },
+  );
+  return merged.paymentMethods.map((method) => ({
+    method: method.type || method.code || method.name || method.displayName || method.id,
+    sources: paymentMethodSources(method),
+    promoMode: method.promoMode,
+  })).filter((item) => item.method);
+}
+
 function jsonMethodArray(value: unknown): PaymentExposureCheck["paymentMethods"] {
   try {
     const parsed = JSON.parse(String(value || "[]"));
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((item) => item && typeof item === "object").map((item: any) => ({
-      id: String(item.id || ""), type: String(item.type || ""), provider: String(item.provider || ""),
-      name: String(item.name || ""), code: String(item.code || ""), displayName: String(item.displayName || ""),
-      source: String(item.source || ""),
+    return parsed.filter((item) => item && typeof item === "object").map((item: any) => normalizePaymentMethod({
+      id: item.id, type: item.type, provider: item.provider, name: item.name, code: item.code,
+      displayName: item.displayName ?? item.display_name, source: item.source, sources: item.sources,
+      promoMode: item.promoMode ?? item.promo_mode,
     })).slice(0, 128);
   } catch {
     return [];
@@ -539,6 +762,7 @@ function paymentExposureRow(row: any): PaymentExposureCheck {
     detail: String(row.detail || ""),
     promoEligible: promoValue < 0 ? null : promoValue === 1,
     promoCampaign: String(row.promo_campaign || ""),
+    promoMode: normalizePaymentExposurePromoMode(row.promo_mode),
     observedAt: String(row.observed_at || ""),
     updatedAt: String(row.updated_at || ""),
   };
@@ -556,14 +780,24 @@ export interface PaymentEligibilityObservationInput {
   billingCurrency: string;
   eligible: boolean | null;
   reason: string;
+  availableMethods?: string[];
+  matchedMethods?: string[];
+  paymentMethods?: PaymentExposureCheck["paymentMethods"];
   observedAt?: string;
+  source?: "eligibility_api" | "local_extractor";
+  promoMode?: PaymentExposurePromoMode;
+  promoEligible?: boolean | null;
+  promoCampaign?: string;
+  trialStatus?: string;
+  checkoutType?: string;
+  replaceMethods?: boolean;
 }
 
 export function savePaymentEligibilityObservation(accountId: string, input: PaymentEligibilityObservationInput): PaymentExposureCheck {
   const account = db.prepare("SELECT 1 FROM gpt_accounts WHERE id=? AND deleted_at=''").get(accountId);
   if (!account) throw new Error("支付资格检测账号不存在");
   const target = canonicalExposureTarget(String(input.target || ""));
-  if (!["ideal", "gcash", "gopay", "upi", "kakao", "naver"].includes(target)) throw new Error("不支持的支付资格检查目标");
+  if (!["ideal", "gcash", "gopay", "upi", "kakao", "naver", "momo"].includes(target)) throw new Error("不支持的支付资格检查目标");
   const ipCountry = String(input.ipCountry || "").trim().toUpperCase();
   const billingCountry = String(input.billingCountry || "").trim().toUpperCase();
   const billingCurrency = String(input.billingCurrency || "").trim().toUpperCase();
@@ -575,29 +809,71 @@ export function savePaymentEligibilityObservation(accountId: string, input: Paym
   const now = new Date().toISOString();
   const eligible = input.eligible;
   const complete = typeof eligible === "boolean";
-  const availableMethods = eligible === true ? [target] : [];
-  const paymentMethods = eligible === true
-    ? [{ id: "", type: target, provider: "", name: target, code: "", displayName: target, source: "eligibility_api" }]
-    : [];
-  const existing = db.prepare(`SELECT id FROM payment_exposure_checks
+  const source = input.source === "local_extractor" ? "local_extractor" : "eligibility_api";
+  const requestedPromoMode = normalizePaymentExposurePromoMode(input.promoMode);
+  const promoEligibleValue = input.promoEligible === true ? 1 : input.promoEligible === false ? 0 : -1;
+  const promoCampaign = String(input.promoCampaign || "").slice(0, 128);
+  const trialStatus = ["observed", "eligible", "ineligible", "unknown"].includes(String(input.trialStatus || "").toLowerCase())
+    ? String(input.trialStatus || "").toLowerCase() : "unknown";
+  const checkoutType = String(input.checkoutType || source).slice(0, 32);
+  const availableMethods = Array.isArray(input.availableMethods) && input.availableMethods.length
+    ? [...new Set(input.availableMethods.map(String).map((item) => item.trim().toLowerCase()).filter(Boolean))].slice(0, 64)
+    : eligible === true ? [target] : [];
+  const matchedMethods = Array.isArray(input.matchedMethods)
+    ? [...new Set(input.matchedMethods.map(String).map((item) => item.trim().toLowerCase()).filter(Boolean))].slice(0, 64)
+    : eligible === true ? [target] : [];
+  const existing = db.prepare(`SELECT id, available_methods_json, matched_methods_json, payment_methods_json,
+      promo_mode, promo_eligible, promo_campaign FROM payment_exposure_checks
     WHERE account_id=? AND target=? AND ip_country=? AND billing_country=? AND billing_currency=?`)
     .get(accountId, target, ipCountry, billingCountry, billingCurrency) as any;
+  const existingPromoMode = normalizePaymentExposurePromoMode(existing?.promo_mode);
+  const promoMode = mergePaymentExposurePromoMode(existingPromoMode, requestedPromoMode);
+  const preservePromoEvidence = existingPromoMode === "one_month" && requestedPromoMode !== "one_month";
+  const paymentMethods = Array.isArray(input.paymentMethods) && input.paymentMethods.length
+    ? input.paymentMethods.map((method) => ({ ...method,
+      // Keep per-mode snapshots: a 1 month observation overlays the no-promo
+      // view but does not erase it.
+      promoMode: method.promoMode && method.promoMode !== "unknown" ? method.promoMode
+        : input.replaceMethods ? requestedPromoMode : promoMode,
+    }))
+    : eligible === true
+    ? [{ id: "", type: target, provider: "", name: target, code: "", displayName: target, source, promoMode }]
+    : [];
+  const previousMethods = jsonMethodArray(existing?.payment_methods_json);
+  const baselineMethods = input.replaceMethods
+    ? previousMethods.filter((method) => normalizePaymentExposurePromoMode(method.promoMode) !== requestedPromoMode)
+    : previousMethods;
+  const merged = mergePaymentExposureObservation(
+    input.replaceMethods ? {
+      availableMethods: jsonStringArray(existing?.available_methods_json),
+      matchedMethods: jsonStringArray(existing?.matched_methods_json),
+      paymentMethods: baselineMethods,
+    } : {
+      availableMethods: jsonStringArray(existing?.available_methods_json),
+      matchedMethods: jsonStringArray(existing?.matched_methods_json),
+      paymentMethods: jsonMethodArray(existing?.payment_methods_json),
+    },
+    { availableMethods, matchedMethods, paymentMethods },
+  );
   const id = String(existing?.id || crypto.randomUUID());
   db.prepare(`INSERT INTO payment_exposure_checks(
     id, account_id, target, ip_country, billing_country, billing_currency, expected_method,
     available_methods_json, matched_methods_json, payment_methods_json, trial_status, exposed, status, checkout_type, detail,
-    promo_eligible, promo_campaign, observed_at, source, created_at, updated_at)
-    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, 'eligibility_api', ?, -1, '', ?, 'eligibility_api', ?, ?)
+    promo_eligible, promo_campaign, promo_mode, observed_at, source, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(account_id, target, ip_country, billing_country, billing_currency) DO UPDATE SET
       expected_method=excluded.expected_method, available_methods_json=excluded.available_methods_json,
       matched_methods_json=excluded.matched_methods_json, payment_methods_json=excluded.payment_methods_json,
-      trial_status='unknown', exposed=excluded.exposed, status=excluded.status, checkout_type='eligibility_api',
-      detail=excluded.detail, promo_eligible=-1, promo_campaign='', observed_at=excluded.observed_at,
-      source='eligibility_api', updated_at=excluded.updated_at`).run(
+      trial_status=excluded.trial_status, exposed=excluded.exposed, status=excluded.status, checkout_type=excluded.checkout_type,
+      detail=excluded.detail, promo_eligible=excluded.promo_eligible, promo_campaign=excluded.promo_campaign,
+      promo_mode=excluded.promo_mode, observed_at=excluded.observed_at,
+      source=excluded.source, updated_at=excluded.updated_at`).run(
     id, accountId, target, ipCountry, billingCountry, billingCurrency, target,
-    JSON.stringify(availableMethods), JSON.stringify(availableMethods), JSON.stringify(paymentMethods),
-    eligible === true ? 1 : 0, complete ? "complete" : "unknown", String(input.reason || "").slice(0, 500),
-    observedAt, now, now,
+    JSON.stringify(merged.availableMethods), JSON.stringify(merged.matchedMethods), JSON.stringify(merged.paymentMethods),
+    trialStatus, eligible === true ? 1 : 0, complete ? "complete" : "unknown", checkoutType, String(input.reason || "").slice(0, 500),
+    preservePromoEvidence ? Number(existing?.promo_eligible ?? -1) : promoEligibleValue,
+    preservePromoEvidence ? String(existing?.promo_campaign || "") : promoCampaign,
+    promoMode, observedAt, source, now, now,
   );
   const row = db.prepare("SELECT * FROM payment_exposure_checks WHERE id=?").get(id) as any;
   return paymentExposureRow(row);
@@ -713,9 +989,9 @@ export function overview(): Record<string, unknown> {
     actionableMissingAt,
     v1SourceRecords: Number(source?.value || 0), readOnly: config.readOnly,
     nativeReadOnly: config.readOnly,
-    commandWriter: config.accountAuthority === "v1" ? "v1-via-v2" : "v2",
-    accountAuthority: config.accountAuthority,
-    independent: config.accountAuthority !== "v1",
+    commandWriter: "v2",
+    accountAuthority: "v2",
+    independent: true,
     latestSync: sync || null, latestSub2Sync: sub2Sync || null,
   };
 }
@@ -740,13 +1016,14 @@ function grantRow(row: any): GrantRecord {
     visibleFrom: row.visible_from,
     visibleTo: row.visible_to,
     hidePromotion: boolean(row.hide_promotion),
-    label: row.lifecycle_status === "deactivated" ? "账号已停用" : "Mailbox",
+    label: "Mailbox",
   };
 }
 
 export function grantByPublicToken(token: string): GrantRecord | null {
   const row = db.prepare(`SELECT g.*, a.hide_promotion, a.lifecycle_status FROM access_grants g
-    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.public_token_hash=? AND g.active=1 AND g.scope!='admin_only'`).get(digestToken(token)) as any;
+    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.public_token_hash=? AND g.active=1 AND g.scope!='admin_only'
+      AND g.revoked_at='' AND g.revoke_reason='' AND a.deleted_at=''`).get(digestToken(token)) as any;
   if (!row) return null;
   markGrantUsed(String(row.id));
   return grantRow(row);
@@ -754,13 +1031,15 @@ export function grantByPublicToken(token: string): GrantRecord | null {
 
 export function grantById(id: string): GrantRecord | null {
   const row = db.prepare(`SELECT g.*, a.hide_promotion, a.lifecycle_status FROM access_grants g
-    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.id=? AND g.active=1 AND g.scope!='admin_only'`).get(id) as any;
+    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.id=? AND g.active=1 AND g.scope!='admin_only'
+      AND g.revoked_at='' AND g.revoke_reason='' AND a.deleted_at=''`).get(id) as any;
   return row ? grantRow(row) : null;
 }
 
 export function authenticateCustomer(email: string, password: string): GrantRecord | null {
   const rows = db.prepare(`SELECT g.*, a.hide_promotion, a.lifecycle_status FROM access_grants g
-    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.login_identifier_hash=? AND g.active=1 AND g.scope!='admin_only'`).all(emailHash(normalizeEmail(email))) as any[];
+    JOIN gpt_accounts a ON a.id=g.account_id WHERE g.login_identifier_hash=? AND g.active=1 AND g.scope!='admin_only'
+      AND g.revoked_at='' AND g.revoke_reason='' AND a.deleted_at=''`).all(emailHash(normalizeEmail(email))) as any[];
   const matched = rows.filter((row) => verifyPassword(password, String(row.password_hash || "")));
   if (matched.length !== 1) return null;
   markGrantUsed(String(matched[0].id));
@@ -770,13 +1049,44 @@ export function authenticateCustomer(email: string, password: string): GrantReco
 function visibleMailWhere(grant: GrantRecord): { clause: string; params: unknown[] } {
   const dateClauses: string[] = [];
   const params: unknown[] = [];
-  if (grant.visibleFrom) { dateClauses.push("datetime(m.received_at) >= datetime(?)"); params.push(grant.visibleFrom); }
-  if (grant.visibleTo) { dateClauses.push("datetime(m.received_at) < datetime(?)"); params.push(grant.visibleTo); }
+  if (grant.visibleFrom) { dateClauses.push("julianday(m.received_at) >= julianday(?)"); params.push(grant.visibleFrom); }
+  if (grant.visibleTo) { dateClauses.push("julianday(m.received_at) < julianday(?)"); params.push(grant.visibleTo); }
+  const binding = db.prepare("SELECT receive_disabled_at FROM email_bindings WHERE id=?").get(grant.bindingId) as any;
+  const receiveDisabledAt = String(binding?.receive_disabled_at || "");
+  if (receiveDisabledAt) {
+    dateClauses.push("julianday(m.received_at) < julianday(?)");
+    params.push(receiveDisabledAt);
+  }
   const dateClause = dateClauses.length ? ` AND ${dateClauses.join(" AND ")}` : "";
+  // V1 could index one iCloud delivery under both the base mailbox and a
+  // concrete +alias mapping. Preserve the exact legacy mapping selected by
+  // this customer grant. A native/non-legacy claim from another account still
+  // wins and keeps the message hidden until reviewed.
+  const trustedLegacyClaim = `(oc.claim_type='legacy_mapping_index'
+    AND EXISTS (
+      SELECT 1 FROM email_bindings legacy_binding
+      WHERE legacy_binding.id=oc.binding_id AND legacy_binding.legacy_mapping_id<>''
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM lifecycle_events rejected_claim
+      WHERE rejected_claim.account_id=oc.account_id AND rejected_claim.binding_id=oc.binding_id
+        AND rejected_claim.event_type='mail_claim_rejected'
+        AND json_extract(rejected_claim.payload_json,'$.messageId')=m.id
+    ))`;
+  const grantBatch = mailboxBindingBatchSql("grant_binding");
+  const claimBatch = mailboxBindingBatchSql("claim_binding");
+  const conflictingBatch = mailboxBindingBatchSql("conflicting_binding");
   return {
-    clause: `oc.binding_id=? AND NOT EXISTS (
+    clause: `EXISTS (
+      SELECT 1 FROM email_bindings grant_binding JOIN email_bindings claim_binding ON claim_binding.id=oc.binding_id
+      WHERE grant_binding.id=? AND ${grantBatch}=${claimBatch}
+    ) AND (oc.visible_to_customer=1 OR ${trustedLegacyClaim})
+    AND NOT EXISTS (
       SELECT 1 FROM mail_ownership_claims conflicting
+      JOIN email_bindings conflicting_binding ON conflicting_binding.id=conflicting.binding_id
+      JOIN email_bindings claim_binding ON claim_binding.id=oc.binding_id
       WHERE conflicting.message_id=m.id AND conflicting.account_id<>oc.account_id
+        AND conflicting.visible_to_customer=1 AND ${conflictingBatch}<>${claimBatch}
     )${dateClause}`,
     params: [grant.bindingId, ...params],
   };
@@ -785,7 +1095,7 @@ function visibleMailWhere(grant: GrantRecord): { clause: string; params: unknown
 export function listCustomerMails(grant: GrantRecord, offset: number, limit: number): { results: any[]; count: number } {
   const visible = visibleMailWhere(grant);
   const promotionClause = grant.hidePromotion ? " AND m.category!='promotion'" : "";
-  const from = `FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE ${visible.clause} AND oc.visible_to_customer=1${promotionClause}`;
+  const from = `FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE ${visible.clause}${promotionClause}`;
   const count = Number((db.prepare(`SELECT COUNT(DISTINCT m.id) AS count ${from}`).get(...visible.params) as any).count || 0);
   const rows = db.prepare(`SELECT DISTINCT m.id, m.sender, m.subject, m.received_at, m.folder, m.category ${from}
     ORDER BY datetime(m.received_at) DESC LIMIT ? OFFSET ?`).all(...visible.params, limit, offset) as any[];
@@ -802,7 +1112,7 @@ export function customerMailDetail(grant: GrantRecord, messageId: string): any |
     FROM mail_messages m
     JOIN mail_ownership_claims oc ON oc.message_id=m.id
     JOIN email_bindings ob ON ob.id=oc.binding_id
-    WHERE m.id=? AND ${visible.clause} AND oc.visible_to_customer=1${promotionClause}`).get(messageId, ...visible.params) as any;
+    WHERE m.id=? AND ${visible.clause}${promotionClause}`).get(messageId, ...visible.params) as any;
   if (!row) return null;
   const metadata = (() => { try { return JSON.parse(String(row.metadata_json || "{}")); } catch { return {}; } })();
   const upstreamMailboxEmail = decryptSecret(String(row.owner_binding_email_enc || ""));
@@ -819,19 +1129,21 @@ export function revealCredentials(accountId: string): Record<string, string> | n
   const row = db.prepare(`SELECT cv.* FROM account_current_credentials cc
     JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(accountId) as any
     || db.prepare("SELECT * FROM credentials WHERE account_id=?").get(accountId) as any;
-  if (!row) return null;
+  const password = db.prepare("SELECT password_enc,totp_secret_enc FROM account_passwords WHERE account_id=?").get(accountId) as any;
+  if (!row && !password) return null;
   return {
-    accessToken: decryptSecret(row.access_token_enc),
-    refreshToken: decryptSecret(row.refresh_token_enc),
-    idToken: decryptSecret(row.id_token_enc),
-    sessionToken: decryptSecret(row.session_token_enc),
-    openaiPassword: decryptSecret(row.openai_password_enc),
+    accessToken: decryptSecret(String(row?.access_token_enc || "")),
+    refreshToken: decryptSecret(String(row?.refresh_token_enc || "")),
+    idToken: decryptSecret(String(row?.id_token_enc || "")),
+    sessionToken: decryptSecret(String(row?.session_token_enc || "")),
+    openaiPassword: decryptSecret(String(password?.password_enc || row?.openai_password_enc || "")),
+    totpSecret: decryptSecret(String(password?.totp_secret_enc || "")),
   };
 }
 
 export function saveAccountCredentials(accountId: string, input: Record<string, unknown>): Record<string, unknown> {
   const current = revealCredentials(accountId) || {
-    accessToken: "", refreshToken: "", idToken: "", sessionToken: "", openaiPassword: "",
+    accessToken: "", refreshToken: "", idToken: "", sessionToken: "", openaiPassword: "", totpSecret: "",
   };
   const value = (key: keyof typeof current): string => Object.prototype.hasOwnProperty.call(input, key)
     ? String(input[key] || "").trim()
@@ -841,6 +1153,7 @@ export function saveAccountCredentials(accountId: string, input: Record<string, 
   const idToken = value("idToken");
   const sessionToken = value("sessionToken");
   const openaiPassword = value("openaiPassword");
+  const totpSecret = value("totpSecret");
   if (!accessToken && !refreshToken && !idToken && !sessionToken) {
     throw new Error("请至少填写 AT、RT、ID Token 或 Session Token 中的一项");
   }
@@ -862,6 +1175,13 @@ export function saveAccountCredentials(accountId: string, input: Record<string, 
     evidence: { adminManual: true },
   });
   if (observed.conflict) throw new Error("新凭证与当前 GPT 身份冲突，已保留待审查但没有替换当前凭证");
+  if (Object.prototype.hasOwnProperty.call(input, "totpSecret")) {
+    const existing = db.prepare("SELECT password_enc FROM account_passwords WHERE account_id=?").get(accountId) as any;
+    db.prepare(`INSERT INTO account_passwords(account_id,password_enc,totp_secret_enc,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(account_id) DO UPDATE SET totp_secret_enc=excluded.totp_secret_enc,updated_at=excluded.updated_at`).run(
+      accountId, String(existing?.password_enc || ""), encryptSecret(totpSecret), new Date().toISOString(),
+    );
+  }
   return {
     ok: true,
     credentialVersionId: observed.credentialVersionId,
@@ -915,6 +1235,7 @@ export function getPaymentExposureCredentials(accountId: string): PaymentExposur
 
 export interface PaymentExposureJobRecord {
   jobId: string;
+  remoteJobId: string;
   accountId: string;
   routeKey: string;
   target: string;
@@ -924,6 +1245,7 @@ export interface PaymentExposureJobRecord {
   jobKind: string;
   accessTokenFingerprint: string;
   scheduledAt: string;
+  promoMode: PaymentExposurePromoMode;
   status: string;
   lastError: string;
   startedAt: string;
@@ -934,27 +1256,28 @@ export interface PaymentExposureJobRecord {
 
 function paymentExposureJobRow(row: any): PaymentExposureJobRecord {
   return {
-    jobId: String(row.job_id || ""), accountId: String(row.account_id || ""), routeKey: String(row.route_key || ""),
+    jobId: String(row.job_id || ""), remoteJobId: String(row.remote_job_id || row.job_id || ""), accountId: String(row.account_id || ""), routeKey: String(row.route_key || ""),
     target: String(row.target || ""), ipCountry: String(row.ip_country || ""), billingCountry: String(row.billing_country || ""),
     billingCurrency: String(row.billing_currency || ""), jobKind: String(row.job_kind || "manual"),
     accessTokenFingerprint: String(row.access_token_fingerprint || ""), scheduledAt: String(row.scheduled_at || ""),
+    promoMode: normalizePaymentExposurePromoMode(row.promo_mode),
     status: String(row.status || "unknown"), lastError: String(row.last_error || ""),
     startedAt: String(row.started_at || ""), finishedAt: String(row.finished_at || ""), createdAt: String(row.created_at || ""),
     updatedAt: String(row.updated_at || ""),
   };
 }
 
-export type PaymentExposureJobInput = Omit<PaymentExposureJobRecord, "updatedAt" | "jobKind" | "accessTokenFingerprint" | "scheduledAt">
-  & Partial<Pick<PaymentExposureJobRecord, "jobKind" | "accessTokenFingerprint" | "scheduledAt">>;
+export type PaymentExposureJobInput = Omit<PaymentExposureJobRecord, "updatedAt" | "remoteJobId" | "jobKind" | "accessTokenFingerprint" | "scheduledAt" | "promoMode">
+  & Partial<Pick<PaymentExposureJobRecord, "remoteJobId" | "jobKind" | "accessTokenFingerprint" | "scheduledAt" | "promoMode">>;
 
 export function createPaymentExposureJob(input: PaymentExposureJobInput): PaymentExposureJobRecord {
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO payment_exposure_jobs(
-    job_id, account_id, route_key, target, ip_country, billing_country, billing_currency,
-    job_kind, access_token_fingerprint, scheduled_at, status, last_error, started_at, finished_at, created_at, updated_at
-  ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
-    input.jobId, input.accountId, input.routeKey, input.target, input.ipCountry, input.billingCountry, input.billingCurrency,
-    input.jobKind || "manual", input.accessTokenFingerprint || "", input.scheduledAt || "",
+    job_id, remote_job_id, account_id, route_key, target, ip_country, billing_country, billing_currency,
+    job_kind, access_token_fingerprint, scheduled_at, promo_mode, status, last_error, started_at, finished_at, created_at, updated_at
+  ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ).run(
+    input.jobId, input.remoteJobId || "", input.accountId, input.routeKey, input.target, input.ipCountry, input.billingCountry, input.billingCurrency,
+    input.jobKind || "manual", input.accessTokenFingerprint || "", input.scheduledAt || "", input.promoMode || "none",
     input.status, input.lastError, input.startedAt, input.finishedAt, input.createdAt, now,
   );
   return getPaymentExposureJob(input.accountId, input.jobId)!;
@@ -972,12 +1295,12 @@ export function finalizePaymentExposureJobReservation(
   const existing = db.prepare("SELECT * FROM payment_exposure_jobs WHERE job_id=?").get(reservationId) as any;
   if (!existing) return null;
   const now = new Date().toISOString();
-  db.prepare(`UPDATE payment_exposure_jobs SET job_id=?, status=?, last_error=?, started_at=?, finished_at=?, updated_at=? WHERE job_id=?`).run(
+  db.prepare(`UPDATE payment_exposure_jobs SET remote_job_id=?, status=?, last_error=?, started_at=?, finished_at=?, updated_at=? WHERE job_id=?`).run(
     remoteJobId, String(patch.status || "queued"), patch.lastError === undefined ? existing.last_error : String(patch.lastError || "").slice(0, 500),
     patch.startedAt === undefined ? existing.started_at : String(patch.startedAt || "").slice(0, 64),
     patch.finishedAt === undefined ? existing.finished_at : String(patch.finishedAt || "").slice(0, 64), now, reservationId,
   );
-  return paymentExposureJobRow(db.prepare("SELECT * FROM payment_exposure_jobs WHERE job_id=?").get(remoteJobId));
+  return paymentExposureJobRow(db.prepare("SELECT * FROM payment_exposure_jobs WHERE job_id=?").get(reservationId));
 }
 
 export interface AutomaticTrialCandidate {
@@ -1118,18 +1441,6 @@ export function recycleAccount(accountId: string, newEmailInput: string, planInp
   return { previous: getAccountDetail(accountId)!, replacement: getAccountDetail(replacementId)! };
 }
 
-export type RecycleMode = "deactivated" | "untagged_free" | "invalid_at" | "alias_rotate";
-
-function recycleGeneration(accountId: string): number {
-  const row = db.prepare(`WITH RECURSIVE lineage(id, depth) AS (
-      SELECT ?, 0 UNION ALL
-      SELECT r.from_account_id, lineage.depth + 1 FROM account_relations r
-      JOIN lineage ON r.to_account_id=lineage.id
-      WHERE r.relation_type='mailbox_recycle' AND lineage.depth<20
-    ) SELECT COALESCE(MAX(depth),0) depth FROM lineage`).get(accountId) as any;
-  return Number(row?.depth || 0);
-}
-
 function nextRecycleAlias(email: string): string {
   const parts = splitEmail(email);
   const local = parts.localPart.split("+")[0];
@@ -1145,49 +1456,30 @@ function nextRecycleAlias(email: string): string {
 }
 
 export function recycleAccountByMode(accountId: string, modeInput: string): { mode: RecycleMode; previous: AccountDetail; replacement: AccountDetail } {
-  const mode = (["deactivated", "untagged_free", "invalid_at", "alias_rotate"].includes(modeInput) ? modeInput : "deactivated") as RecycleMode;
-  const row = db.prepare(`SELECT a.*, b.email_enc, b.provider,
-      EXISTS(SELECT 1 FROM account_origins o WHERE o.account_id=a.id AND o.is_auto=1) is_auto,
-      cv.validity_status credential_validity,
-      EXISTS(SELECT 1 FROM credential_versions x WHERE x.account_id=a.id) has_credential
-    FROM gpt_accounts a JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1
-    LEFT JOIN account_current_credentials cc ON cc.account_id=a.id
-    LEFT JOIN credential_versions cv ON cv.id=cc.credential_version_id
-    WHERE a.id=? AND a.deleted_at=''`).get(accountId) as any;
-  if (!row) throw new Error("账号不存在或没有当前邮箱绑定");
-  if (String(row.provider) !== "icloud") throw new Error("回收只适用于 iCloud 共享收件账号；域名邮箱和 Outlook 固定保留");
-  if (boolean(row.sold)) throw new Error("已售账号必须先结束当前客户授权才能回收");
-  const generation = recycleGeneration(accountId);
-  if (mode !== "alias_rotate" && generation >= 2) throw new Error("该账号链已达到最多 2 次回收限制");
-  if (mode === "deactivated") {
-    if (!boolean(row.deactivation_locked) || !row.deactivated_at) throw new Error("账号尚未永久停用");
-    const age = Date.now() - Date.parse(String(row.deactivated_at));
-    if (!Number.isFinite(age) || age < 7 * 24 * 60 * 60 * 1_000) throw new Error("账号停用未满 7 天");
-  }
-  const special = Boolean(row.mark_color || row.payment_link || row.billing_channel || row.billing_channel_override);
-  if (["untagged_free", "invalid_at"].includes(mode)) {
-    if (String(row.plan) !== "free") throw new Error("只有明确 Free 的账号可使用此回收模式");
-    if (special) throw new Error("账号有颜色、支付链接或渠道标记，已保护不回收");
-    if (boolean(row.deactivation_locked)) throw new Error("已停用账号应使用停用账号回收");
-  }
-  if (mode === "invalid_at" && String(row.credential_validity) !== "invalid") throw new Error("当前 AT 尚未明确判定为失效");
-  if (mode === "alias_rotate") {
-    if (!boolean(row.is_auto) || boolean(row.has_credential)) throw new Error("注册别名轮换只适用于 Auto/API 且尚无凭证的账号");
-  }
-  const email = decryptSecret(String(row.email_enc || ""));
-  const alias = nextRecycleAlias(email);
-  if (!alias) throw new Error("未能生成未使用的 iCloud +oai 别名");
-  const result = recycleAccount(accountId, alias, "free");
-  const now = new Date().toISOString();
-  db.transaction(() => {
+  if (!["deactivated", "untagged_free", "invalid_at", "alias_rotate"].includes(modeInput)) throw new Error("回收模式无效");
+  const mode = modeInput as RecycleMode;
+  return db.transaction(() => {
+    // Re-read eligibility after obtaining the write lock. A stale admin panel
+    // must not recycle an account that was sold, tagged, rebound or reclaimed.
+    const eligibility = assertRecycleEligibility(accountId, mode);
+    const generation = eligibility.generation;
+    const row = db.prepare("SELECT email_enc FROM email_bindings WHERE account_id=? AND is_current=1").get(accountId) as any;
+    const email = decryptSecret(String(row.email_enc || ""));
+    const alias = nextRecycleAlias(email);
+    if (!alias) throw new Error("未能生成未使用的 iCloud +oai 别名");
+    const result = recycleAccount(accountId, alias, "free");
+    const now = new Date().toISOString();
     db.prepare("UPDATE gpt_accounts SET note=?,source_status='v2',updated_at=? WHERE id=?")
       .run("automyai OpenAI signup pool pending", now, result.replacement.id);
     db.prepare(`INSERT OR IGNORE INTO account_origins(account_id,source_type,source_id,is_auto,first_seen_at,metadata_json)
       VALUES(?,'recycle',?,1,?,?)`).run(result.replacement.id, `${accountId}:${mode}`, now, JSON.stringify({ mode, generation: mode === "alias_rotate" ? generation : generation + 1 }));
+    db.prepare(`INSERT INTO account_business_evidence(account_id,recycle_generation,updated_at) VALUES(?,?,?)`)
+      .run(result.replacement.id, mode === "alias_rotate" ? generation : generation + 1, now);
     db.prepare(`UPDATE account_relations SET evidence_json=? WHERE relation_type='mailbox_recycle'
-      AND from_account_id=? AND to_account_id=?`).run(JSON.stringify({ mode, previousEmail: emailHash(email), nextEmail: emailHash(alias), customerAccessInherited: false, credentialsInherited: false }), accountId, result.replacement.id);
-  })();
-  return { mode, previous: getAccountDetail(accountId)!, replacement: getAccountDetail(result.replacement.id)! };
+      AND from_account_id=? AND to_account_id=?`).run(JSON.stringify({ mode, previousEmail: emailHash(email), nextEmail: emailHash(alias), customerAccessInherited: false, credentialsInherited: false,
+        eligibility: recycleEligibilityAudit(eligibility, mode) }), accountId, result.replacement.id);
+    return { mode, previous: getAccountDetail(accountId)!, replacement: getAccountDetail(result.replacement.id)! };
+  }).immediate();
 }
 
 export interface CustomerGrantResult {
@@ -1210,14 +1502,29 @@ export interface CurrentCustomerExport {
   reason: string;
 }
 
-export function formatCurrentCustomerExportText(currentEmail: string, loginIdentifier: string, publicUrl: string): string {
+export interface CurrentCustomerExportCredentials {
+  openaiPassword?: string;
+  totpSecret?: string;
+}
+
+const TWO_FACTOR_URL = "https://2fa.vip";
+
+export function formatCurrentCustomerExportText(currentEmail: string, loginIdentifier: string, publicUrl: string,
+  credentials: CurrentCustomerExportCredentials = {}): string {
   const email = String(currentEmail || "");
   const login = String(loginIdentifier || "");
   const url = String(publicUrl || "");
-  const lines = [`ai账号：${email}`];
-  if (login && login.toLowerCase() !== email.toLowerCase()) lines.push(`登录标识：${login}`);
-  lines.push(`邮箱验证码：${url}`);
-  return lines.join("\n");
+  const password = String(credentials.openaiPassword || "");
+  const totp = String(credentials.totpSecret || "");
+  if (password) {
+    const fields = [`账号：${login || email}`, `密码：${password}`];
+    if (totp) fields.push(`2FA：${totp}`, `2FA地址：${TWO_FACTOR_URL}`);
+    return fields.join(" | ");
+  }
+  const fields = [`ai账号：${email}`];
+  if (login && login.toLowerCase() !== email.toLowerCase()) fields.push(`登录标识：${login}`);
+  fields.push(`邮箱验证码：${url}`);
+  return fields.join(" | ");
 }
 
 export function getCurrentCustomerExport(accountId: string): CurrentCustomerExport | null {
@@ -1230,6 +1537,7 @@ export function getCurrentCustomerExport(accountId: string): CurrentCustomerExpo
     ORDER BY datetime(g.created_at) DESC LIMIT 1`).get(accountId) as any;
   if (!row) return null;
   const currentEmail = decryptSecret(String(row.email_enc || ""));
+  const credentials = revealCredentials(accountId) || {};
   const base = {
     accountId,
     bindingId: String(row.binding_id || ""),
@@ -1238,17 +1546,6 @@ export function getCurrentCustomerExport(accountId: string): CurrentCustomerExpo
     publicUrl: "",
     text: "",
   };
-  const legacyMappingId = String(row.legacy_mapping_id || "");
-  if (config.accountAuthority === "v1" && legacyMappingId && !legacyMappingId.startsWith("v2:")) {
-    const publicUrl = `https://legacy-mail.example.com/?m=${encodeURIComponent(legacyMappingId)}`;
-    return {
-      ...base,
-      available: true,
-      publicUrl,
-      text: `ai账号：${currentEmail} | 邮箱验证码：${publicUrl}`,
-      reason: "",
-    };
-  }
   if (!row.grant_id) return { ...base, available: false, reason: "当前邮箱尚未生成客户接码授权" };
   let publicToken = decryptSecret(String(row.public_token_enc || ""));
   if (!publicToken && boolean(row.legacy_public_token)) publicToken = String(row.legacy_mapping_id || "");
@@ -1261,9 +1558,22 @@ export function getCurrentCustomerExport(accountId: string): CurrentCustomerExpo
     ...base,
     available: true,
     publicUrl,
-    text: formatCurrentCustomerExportText(currentEmail, base.loginIdentifier, publicUrl),
+    text: formatCurrentCustomerExportText(currentEmail, base.loginIdentifier, publicUrl, credentials),
     reason: "",
   };
+}
+
+// Admin copy is a provisioning action, not a sale decision. If this mailbox
+// has no usable entrance yet, create one without changing `sold` or creating a
+// sale. The token remains bound to this exact account + mailbox stage.
+export function provisionCurrentCustomerExport(accountId: string): CurrentCustomerExport | null {
+  const current = getCurrentCustomerExport(accountId);
+  if (!current || current.available || config.readOnly) return current;
+  issueCustomerGrant(accountId, current.bindingId, {
+    loginIdentifier: current.currentEmail,
+    trackSale: false,
+  });
+  return getCurrentCustomerExport(accountId);
 }
 
 export function createCustomerGrant(accountId: string, bindingId: string, input: Record<string, unknown> = {}): CustomerGrantResult {
@@ -1354,15 +1664,23 @@ export function applyBulkAction(accountIds: string[], action: string, value?: un
 
 export interface ImportAccountInput {
   email?: string;
+  lifecycleStatus?: string;
   accessToken?: string;
   refreshToken?: string;
   idToken?: string;
   sessionToken?: string;
   openaiPassword?: string;
+  totpSecret?: string;
   openaiSubject?: string;
   plan?: string;
   note?: string;
+  mfaEnabled?: boolean;
+  authMethods?: string[];
   arrivedAt?: string;
+  rebindPreviousEmail?: string;
+  address?: string;
+  outlookManagerEmail?: string;
+  outlookManagerGroupId?: string;
 }
 
 export interface PaymentExposureIngestInput {
@@ -1395,6 +1713,8 @@ export interface PaymentExposureIngestInput {
   promo_eligible?: unknown;
   promoCampaign?: unknown;
   promo_campaign?: unknown;
+  promoMode?: unknown;
+  promo_mode?: unknown;
   observedAt?: unknown;
   observed_at?: unknown;
   source?: unknown;
@@ -1412,11 +1732,9 @@ function inputStringArray(input: PaymentExposureIngestInput, camel: keyof Paymen
 function inputMethodArray(input: PaymentExposureIngestInput): PaymentExposureCheck["paymentMethods"] {
   const value = input.paymentMethods ?? input.payment_methods;
   if (!Array.isArray(value)) return [];
-  return value.filter((item) => item && typeof item === "object").map((item: any) => ({
-    id: String(item.id || "").trim().slice(0, 128), type: String(item.type || "").trim().toLowerCase().slice(0, 64),
-    provider: String(item.provider || "").trim().toLowerCase().slice(0, 64), name: String(item.name || "").trim().slice(0, 128),
-    code: String(item.code || "").trim().slice(0, 128), displayName: String(item.displayName || item.display_name || "").trim().slice(0, 128),
-    source: String(item.source || "").trim().toLowerCase().slice(0, 64),
+  return value.filter((item) => item && typeof item === "object").map((item: any) => normalizePaymentMethod({
+    id: item.id, type: item.type, provider: item.provider, name: item.name, code: item.code,
+    displayName: item.displayName ?? item.display_name, source: item.source, sources: item.sources,
   })).filter((item) => item.id || item.type || item.name || item.code).slice(0, 128);
 }
 
@@ -1428,6 +1746,14 @@ function canonicalExposureTarget(value: string): string {
     case "ideal_nl": return "ideal";
     case "ph_gcash":
     case "gcash_link": return "gcash";
+    case "in_upi": return "upi";
+    case "id_gopay": return "gopay";
+    case "kakao_pay":
+    case "kr_kakao": return "kakao";
+    case "naver_pay":
+    case "kr_naver": return "naver";
+    case "momo_wallet":
+    case "vn_momo": return "momo";
     default: return value.toLowerCase();
   }
 }
@@ -1460,14 +1786,14 @@ function normalizePaymentExposureInput(input: PaymentExposureIngestInput): {
   accountId: string; target: string; ipCountry: string; billingCountry: string; billingCurrency: string;
   expectedMethod: string; availableMethods: string[]; matchedMethods: string[]; exposed: number; status: string;
   paymentMethods: PaymentExposureCheck["paymentMethods"]; trialStatus: string;
-  checkoutType: string; detail: string; promoEligible: number; promoCampaign: string; observedAt: string; source: string;
+  checkoutType: string; detail: string; promoEligible: number; promoCampaign: string; promoMode: PaymentExposurePromoMode; observedAt: string; source: string;
 } {
   const target = canonicalExposureTarget(inputText(input, "target"));
   const ipCountry = inputText(input, "ipCountry", "ip_country").toUpperCase();
   const billingCountry = inputText(input, "billingCountry", "billing_country").toUpperCase();
   const billingCurrency = inputText(input, "billingCurrency", "billing_currency").toUpperCase();
   const expectedMethod = canonicalExposureTarget(inputText(input, "expectedMethod", "expected_method") || target);
-  if (!["ideal", "paypal", "gcash", "gopay", "upi", "kakao", "naver"].includes(target)) throw new Error("不支持的支付方式检查目标");
+  if (!["ideal", "paypal", "gcash", "gopay", "upi", "kakao", "naver", "momo"].includes(target)) throw new Error("不支持的支付方式检查目标");
   if (!/^[A-Z]{2}$/.test(ipCountry) || !/^[A-Z]{2}$/.test(billingCountry)) throw new Error("IP或账单国家格式无效");
   if (!/^[A-Z0-9]{3,12}$/.test(billingCurrency)) throw new Error("账单币种格式无效");
   const statusValue = inputText(input, "status").toLowerCase();
@@ -1478,14 +1804,19 @@ function normalizePaymentExposureInput(input: PaymentExposureIngestInput): {
   const observedAt = Number.isFinite(Date.parse(observedRaw)) ? new Date(observedRaw).toISOString() : new Date().toISOString();
   const availableMethods = inputStringArray(input, "availableMethods", "available_methods").map((item) => item.slice(0, 64));
   const matchedMethods = inputStringArray(input, "matchedMethods", "matched_methods").map((item) => item.slice(0, 64));
-  const paymentMethods = inputMethodArray(input);
+  const promoCampaign = inputText(input, "promoCampaign", "promo_campaign").slice(0, 128);
+  const requestedPromoMode = normalizePaymentExposurePromoMode(inputText(input, "promoMode", "promo_mode")
+    || (promoCampaign === "plus-1-month-free" ? "one_month" : "unknown"));
+  const promoMode = requestedPromoMode === "one_month" && promoEligible === 0 ? "none" : requestedPromoMode;
+  const paymentMethods = inputMethodArray(input).map((method) => ({ ...method,
+    promoMode: method.promoMode && method.promoMode !== "unknown" ? method.promoMode : promoMode }));
   const trialValue = inputText(input, "trialStatus", "trial_status").toLowerCase();
   const trialStatus = ["observed", "eligible", "ineligible", "unknown"].includes(trialValue) ? trialValue : "unknown";
   return {
     accountId: matchPaymentExposureAccount(input), target, ipCountry, billingCountry, billingCurrency, expectedMethod,
     availableMethods, matchedMethods, paymentMethods, trialStatus, exposed: inputBoolean(input.exposed) ? 1 : 0, status,
     checkoutType: inputText(input, "checkoutType", "checkout_type").slice(0, 32),
-    detail: inputText(input, "detail").slice(0, 500), promoEligible, promoCampaign: inputText(input, "promoCampaign", "promo_campaign").slice(0, 128),
+    detail: inputText(input, "detail").slice(0, 500), promoEligible, promoCampaign, promoMode,
     observedAt, source: inputText(input, "source").slice(0, 64) || "automyai",
   };
 }
@@ -1499,24 +1830,41 @@ export function ingestPaymentExposureChecks(inputs: PaymentExposureIngestInput[]
       const normalized = normalizePaymentExposureInput(input);
       const now = new Date().toISOString();
       const key = [normalized.accountId, normalized.target, normalized.ipCountry, normalized.billingCountry, normalized.billingCurrency];
-      const existed = Boolean(db.prepare(`SELECT 1 FROM payment_exposure_checks
-        WHERE account_id=? AND target=? AND ip_country=? AND billing_country=? AND billing_currency=?`).get(...key));
+      const existing = db.prepare(`SELECT available_methods_json, matched_methods_json, payment_methods_json,
+          promo_mode, promo_eligible, promo_campaign FROM payment_exposure_checks
+        WHERE account_id=? AND target=? AND ip_country=? AND billing_country=? AND billing_currency=?`).get(...key) as any;
+      const existed = Boolean(existing);
+      const promoMode = mergePaymentExposurePromoMode(
+        normalizePaymentExposurePromoMode(existing?.promo_mode), normalized.promoMode,
+      );
+      const preservePromoEvidence = normalizePaymentExposurePromoMode(existing?.promo_mode) === "one_month"
+        && normalized.promoMode !== "one_month";
+      const merged = mergePaymentExposureObservation(
+        {
+          availableMethods: jsonStringArray(existing?.available_methods_json),
+          matchedMethods: jsonStringArray(existing?.matched_methods_json),
+          paymentMethods: jsonMethodArray(existing?.payment_methods_json),
+        },
+        normalized,
+      );
       const result = db.prepare(`INSERT INTO payment_exposure_checks(
         id, account_id, target, ip_country, billing_country, billing_currency, expected_method,
         available_methods_json, matched_methods_json, payment_methods_json, trial_status, exposed, status, checkout_type, detail,
-        promo_eligible, promo_campaign, observed_at, source, created_at, updated_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        promo_eligible, promo_campaign, promo_mode, observed_at, source, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(account_id, target, ip_country, billing_country, billing_currency) DO UPDATE SET
           expected_method=excluded.expected_method, available_methods_json=excluded.available_methods_json,
           matched_methods_json=excluded.matched_methods_json, payment_methods_json=excluded.payment_methods_json,
           trial_status=excluded.trial_status, exposed=excluded.exposed, status=excluded.status,
           checkout_type=excluded.checkout_type, detail=excluded.detail, promo_eligible=excluded.promo_eligible,
-          promo_campaign=excluded.promo_campaign, observed_at=excluded.observed_at, source=excluded.source,
+          promo_campaign=excluded.promo_campaign, promo_mode=excluded.promo_mode, observed_at=excluded.observed_at, source=excluded.source,
           updated_at=excluded.updated_at`).run(
         crypto.randomUUID(), normalized.accountId, normalized.target, normalized.ipCountry, normalized.billingCountry,
-        normalized.billingCurrency, normalized.expectedMethod, JSON.stringify(normalized.availableMethods), JSON.stringify(normalized.matchedMethods),
-        JSON.stringify(normalized.paymentMethods), normalized.trialStatus, normalized.exposed, normalized.status, normalized.checkoutType, normalized.detail, normalized.promoEligible,
-        normalized.promoCampaign, normalized.observedAt, normalized.source, now, now,
+        normalized.billingCurrency, normalized.expectedMethod, JSON.stringify(merged.availableMethods), JSON.stringify(merged.matchedMethods),
+        JSON.stringify(merged.paymentMethods), normalized.trialStatus, normalized.exposed, normalized.status, normalized.checkoutType, normalized.detail,
+        preservePromoEvidence ? Number(existing?.promo_eligible ?? -1) : normalized.promoEligible,
+        preservePromoEvidence ? String(existing?.promo_campaign || "") : normalized.promoCampaign,
+        promoMode, normalized.observedAt, normalized.source, now, now,
       );
       if (result.changes > 0) {
         accepted += 1;
@@ -1534,18 +1882,50 @@ function upsertImportedCredentials(accountId: string, input: ImportAccountInput,
   const refreshToken = String(input.refreshToken || "");
   const idToken = String(input.idToken || "");
   const sessionToken = String(input.sessionToken || "");
+  if (input.openaiPassword !== undefined || input.totpSecret !== undefined) {
+    const existing = db.prepare("SELECT password_enc,totp_secret_enc FROM account_passwords WHERE account_id=?").get(accountId) as any;
+    const passwordEnc = input.openaiPassword === undefined ? String(existing?.password_enc || "") : encryptSecret(String(input.openaiPassword || ""));
+    const totpSecretEnc = input.totpSecret === undefined ? String(existing?.totp_secret_enc || "") : encryptSecret(String(input.totpSecret || ""));
+    db.prepare(`INSERT INTO account_passwords(account_id,password_enc,totp_secret_enc,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(account_id) DO UPDATE SET password_enc=excluded.password_enc,totp_secret_enc=excluded.totp_secret_enc,updated_at=excluded.updated_at`)
+      .run(accountId, passwordEnc, totpSecretEnc, now);
+  }
   if (!accessToken && !refreshToken && !idToken && !sessionToken) return;
   const binding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId) as any;
-  observeCredentialVersion({
+  const observed = observeCredentialVersion({
     accountId, bindingId: String(binding?.id || "") || null, accessToken,
     refreshToken, idToken, sessionToken,
     openaiPassword: String(input.openaiPassword || ""), subjectHash, source: "v2-import",
     observedAt: now, validityStatus: accessToken ? "alive" : "unknown",
     evidence: { import: true },
   });
+  if (observed.conflict) throw new Error("凭证身份冲突，导入已回滚");
 }
 
 export { credentialHistory };
+
+export function configureImportedMailboxConnection(accountId: string, input: ImportAccountInput): void {
+  if (input.address === undefined && input.outlookManagerEmail === undefined) return;
+  const binding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(accountId) as any;
+  if (!binding) throw new Error("账号没有当前邮箱绑定");
+  const now = new Date().toISOString();
+  const manager = normalizeEmail(input.outlookManagerEmail || "");
+  const address = String(input.address || "");
+  if (!manager && !address) {
+    db.prepare("DELETE FROM mailbox_connections WHERE binding_id=?").run(binding.id);
+    return;
+  }
+  if (manager && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(manager)) throw new Error("Outlook 管理邮箱格式无效");
+  if (address.length > 16_384) throw new Error("邮箱连接地址过长");
+  db.prepare(`INSERT INTO mailbox_connections(id,binding_id,provider,secret_ref,status,manager_email_enc,credentials_enc,
+      external_group_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET provider=excluded.provider,secret_ref=excluded.secret_ref,status=excluded.status,
+      manager_email_enc=excluded.manager_email_enc,credentials_enc=excluded.credentials_enc,
+      external_group_id=excluded.external_group_id,updated_at=excluded.updated_at`).run(
+    stableId("v2-mailbox-connection", binding.id), binding.id, manager ? "outlook-manager" : "external", `v2:${binding.id}:mailbox`, "active",
+    encryptSecret(manager), encryptSecret(JSON.stringify({ address })), String(input.outlookManagerGroupId || ""), now, now,
+  );
+}
 
 export function importAccounts(inputs: ImportAccountInput[]): { imported: number; created: number; rebound: number; errors: Array<{ index: number; error: string }> } {
   const items = inputs.slice(0, 200);
@@ -1557,35 +1937,71 @@ export function importAccounts(inputs: ImportAccountInput[]): { imported: number
       const email = normalizeEmail(input.email);
       const parts = splitEmail(email);
       if (!parts.localPart || !parts.domain) throw new Error("邮箱格式无效");
+      const requestedLifecycleStatus = String(input.lifecycleStatus || "").trim().toLowerCase();
+      if (requestedLifecycleStatus && !["active", "third_party_registered", "third_party_pending_recovery"].includes(requestedLifecycleStatus)) {
+        throw new Error("导入状态只允许 active、third_party_registered 或 third_party_pending_recovery");
+      }
+      if (requestedLifecycleStatus === "third_party_pending_recovery"
+        && [input.accessToken, input.refreshToken, input.idToken, input.sessionToken].some(Boolean)) {
+        throw new Error("第三方待恢复账号不能同时导入身份令牌");
+      }
       const subject = String(input.openaiSubject || parseJwtSubject(input.accessToken || input.idToken));
       const subjectHash = subject ? sha256(subject) : "";
-      const match = resolveAccountMatch(subjectHash, email);
+      let match = resolveAccountMatch(subjectHash, email);
+      const previousEmail = normalizeEmail(input.rebindPreviousEmail || "");
+      if (previousEmail && previousEmail !== email) {
+        const source = db.prepare(`SELECT b.account_id FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
+          WHERE b.email_hash=? AND b.is_current=1 AND a.deleted_at=''`).get(emailHash(previousEmail)) as any;
+        if (!source) throw new Error("明确改绑来源不存在或已经结束");
+        if (match.accountId && match.accountId !== source.account_id) throw new Error("明确改绑来源与目标邮箱身份冲突");
+        const existingSubjects = db.prepare("SELECT subject_hash FROM openai_identity_observations WHERE account_id=? AND status='confirmed'").all(source.account_id) as any[];
+        if (subjectHash && existingSubjects.some((row) => row.subject_hash !== subjectHash)) throw new Error("明确改绑来源与凭证身份冲突");
+        match = { kind: "account", accountId: source.account_id, method: "explicit_import_rebind", reason: "", candidateAccountIds: [source.account_id] };
+      }
       if (match.kind === "conflict") {
-        if (match.accountId && ["identity_email_conflict", "contradictory_identity", "trusted_local_identity_conflict"].includes(match.method)) {
+        const sameCurrentMailboxOnly = match.method === "contradictory_identity"
+          && Boolean(match.accountId) && match.candidateAccountIds.length === 1;
+        if (match.accountId
+          && ["identity_email_conflict", "contradictory_identity", "trusted_local_identity_conflict"].includes(match.method)
+          && !sameCurrentMailboxOnly) {
           quarantineAccount(match.accountId, match.reason, "v2-import", { subjectHash, email, candidateAccountIds: match.candidateAccountIds });
         }
-        createPendingAssociationReview(match.accountId || null, email, match.reason, { subjectHash, candidateAccountIds: match.candidateAccountIds, source: "v2-import" });
-        throw new Error(`${match.reason}，已进入待审查`);
+        const reason = sameCurrentMailboxOnly
+          ? "同一当前邮箱出现新的 OpenAI 身份，已暂存待核对；未修改账号状态或客户链接"
+          : match.reason;
+        createPendingAssociationReview(match.accountId || null, email, reason, {
+          subjectHash, candidateAccountIds: match.candidateAccountIds, source: "v2-import", matchMethod: match.method,
+        });
+        throw new Error(`${reason}，已进入待审查`);
       }
       let accountId = match.accountId;
       const now = new Date().toISOString();
+      let createdItem = false;
+      let reboundItem = false;
+      db.transaction(() => {
       if (accountId) {
+        const existingAccount = db.prepare("SELECT lifecycle_status, sold, deactivation_locked, deleted_at FROM gpt_accounts WHERE id=?").get(accountId) as any;
+        if (requestedLifecycleStatus === "third_party_pending_recovery"
+          && (existingAccount.lifecycle_status !== "third_party_pending_recovery" || existingAccount.sold || existingAccount.deactivation_locked || existingAccount.deleted_at)) {
+          throw new Error("邮箱已存在且不属于第三方待恢复队列，拒绝覆盖");
+        }
         const current = db.prepare("SELECT local_part, email_hash FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId) as any;
         if (!current) throw new Error("匹配账号没有当前邮箱绑定");
         if (String(current.email_hash) !== emailHash(email)) {
           if (match.method !== "recycled_mailbox_identity") {
-            if (String(current.local_part) !== parts.localPart) throw new Error("同身份邮箱本地部分不同，禁止自动改绑");
+            if (String(current.local_part) !== parts.localPart && !previousEmail) throw new Error("同身份邮箱本地部分不同，禁止自动改绑");
             try {
               rebindAccountTransition(accountId, email, {
                 source: "v2-import",
                 associationMethod: match.method === "trusted_exact_local_part" ? "trusted_exact_local_part" : "import_identity_rebind",
                 evidence: { subjectHash, matchMethod: match.method },
+                explicitPreviousEmail: previousEmail,
               });
             } catch (error) {
               createPendingAssociationReview(accountId, email, error instanceof Error ? error.message : String(error), { subjectHash, matchMethod: match.method, source: "v2-import" });
               throw error;
             }
-            rebound += 1;
+            reboundItem = true;
           }
         }
       }
@@ -1595,11 +2011,15 @@ export function importAccounts(inputs: ImportAccountInput[]): { imported: number
         const provider = mailboxProvider(email);
         const familyId = stableId("mailbox-family", provider, emailHash(email));
         const arrivedAt = Number.isFinite(Date.parse(String(input.arrivedAt || ""))) ? new Date(String(input.arrivedAt)).toISOString() : now;
+        const lifecycleStatus = requestedLifecycleStatus || "active";
         db.transaction(() => {
-          db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, plan, note, domain_mailbox, identity_status, source_status, arrived_at, created_at, updated_at)
-            VALUES(?, 'active', ?, ?, ?, ?, 'v2', ?, ?, ?)`).run(
-            accountId, String(input.plan || "unknown").toLowerCase(), String(input.note || "").slice(0, 4_000), provider === "domain" ? 1 : 0,
-            subjectHash ? "confirmed" : "unknown", arrivedAt, arrivedAt, now,
+          db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, plan, note, domain_mailbox, identity_status, source_status,
+              openai_mfa_enabled, openai_auth_methods_json, arrived_at, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, 'v2', ?, ?, ?, ?, ?)`).run(
+            accountId, lifecycleStatus, String(input.plan || "unknown").toLowerCase(), String(input.note || "").slice(0, 4_000), provider === "domain" ? 1 : 0,
+            subjectHash ? "confirmed" : "unknown", input.mfaEnabled ? 1 : 0,
+            JSON.stringify(Array.isArray(input.authMethods) ? input.authMethods.map(String).filter(Boolean).slice(0, 20) : []),
+            arrivedAt, arrivedAt, now,
           );
           db.prepare(`INSERT OR IGNORE INTO mailbox_families(id, provider, canonical_address_enc, canonical_address_hash, created_at, updated_at)
             VALUES(?, ?, ?, ?, ?, ?)`).run(familyId, provider, encryptSecret(email), emailHash(email), now, now);
@@ -1612,10 +2032,11 @@ export function importAccounts(inputs: ImportAccountInput[]): { imported: number
           insertAdminOnlyGrant(accountId, bindingId, email, now);
           db.prepare(`INSERT INTO lifecycle_events(id, account_id, binding_id, event_type, occurred_at, source, payload_json, created_at)
             VALUES(?, ?, ?, 'account_imported', ?, 'v2-import', ?, ?)`).run(
-            crypto.randomUUID(), accountId, bindingId, arrivedAt, JSON.stringify({ credentialsStoredSeparately: true, customerAccessInherited: false }), now,
+            crypto.randomUUID(), accountId, bindingId, arrivedAt,
+            JSON.stringify({ credentialsStoredSeparately: true, customerAccessInherited: false, lifecycleStatus }), now,
           );
         })();
-        created += 1;
+        createdItem = true;
       } else if (input.note !== undefined || input.plan !== undefined) {
         const currentAccount = db.prepare("SELECT note, plan FROM gpt_accounts WHERE id=?").get(accountId) as any;
         db.prepare("UPDATE gpt_accounts SET note=?, plan=?, updated_at=? WHERE id=?").run(
@@ -1624,11 +2045,41 @@ export function importAccounts(inputs: ImportAccountInput[]): { imported: number
           now, accountId,
         );
       }
+      if (!createdItem && (input.mfaEnabled !== undefined || input.authMethods !== undefined)) {
+        const currentAuth = db.prepare("SELECT openai_mfa_enabled,openai_auth_methods_json FROM gpt_accounts WHERE id=?").get(accountId) as any;
+        db.prepare("UPDATE gpt_accounts SET openai_mfa_enabled=?,openai_auth_methods_json=?,updated_at=? WHERE id=?").run(
+          input.mfaEnabled === undefined ? Number(currentAuth.openai_mfa_enabled || 0) : input.mfaEnabled ? 1 : 0,
+          input.authMethods === undefined ? String(currentAuth.openai_auth_methods_json || "[]")
+            : JSON.stringify(input.authMethods.map(String).filter(Boolean).slice(0, 20)),
+          now, accountId,
+        );
+      }
       if (subjectHash) {
         const identity = recordIdentityObservation(accountId, subjectHash, "v2-import", { email });
         if (identity.conflict) throw new Error("OpenAI身份与其他GPT账号冲突，当前账号已隔离");
       }
       upsertImportedCredentials(accountId, input, subjectHash, now);
+      configureImportedMailboxConnection(accountId, input);
+      if (!createdItem && requestedLifecycleStatus === "third_party_registered") {
+        const importedAt = Number.isFinite(Date.parse(String(input.arrivedAt || ""))) ? new Date(String(input.arrivedAt)).toISOString() : now;
+        const registered = db.prepare(`UPDATE gpt_accounts SET lifecycle_status='third_party_registered',
+            arrived_at=CASE WHEN lifecycle_status='third_party_pending_recovery' THEN ? ELSE arrived_at END, updated_at=?
+          WHERE id=? AND lifecycle_status IN ('third_party_pending_recovery','third_party_registered')
+            AND sold=0 AND deactivation_locked=0 AND deleted_at=''`).run(importedAt, now, accountId);
+        if (!registered.changes) throw new Error("邮箱已存在且不属于可转换的第三方注册账号，拒绝覆盖");
+      }
+      if (!createdItem && [input.accessToken, input.idToken, input.sessionToken].some(Boolean)) {
+        const activated = db.prepare(`UPDATE gpt_accounts SET lifecycle_status='third_party_registered', updated_at=?
+          WHERE id=? AND lifecycle_status='third_party_pending_recovery' AND sold=0 AND deactivation_locked=0 AND deleted_at=''`).run(now, accountId);
+        if (activated.changes > 0) {
+          db.prepare(`INSERT INTO lifecycle_events(id, account_id, binding_id, event_type, occurred_at, source, payload_json, created_at)
+            VALUES(?, ?, (SELECT id FROM email_bindings WHERE account_id=? AND is_current=1 LIMIT 1),
+              'third_party_recovery_completed', ?, 'v2-import', '{}', ?)`).run(crypto.randomUUID(), accountId, accountId, now, now);
+        }
+      }
+      })();
+      created += createdItem ? 1 : 0;
+      rebound += reboundItem ? 1 : 0;
       imported += 1;
     } catch (error) {
       errors.push({ index, error: error instanceof Error ? error.message : String(error) });
