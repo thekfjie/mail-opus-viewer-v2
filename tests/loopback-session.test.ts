@@ -18,7 +18,7 @@ test("legacy signed sessions and real HTTP CookieJar survive local V2 routing", 
     import("../src/server/repository.js"), import("../src/server/crypto.js"),
   ]);
   const app = await buildApp();
-  t.after(async () => { await app.close(); db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { await app.close(); (await db.close()); fs.rmSync(directory, { recursive: true, force: true }); });
   const adminToken = signSession("admin", "administrator");
   assert.equal((await app.inject({ url: "/api/admin/session", headers: { cookie: `mail_opus_admin=${adminToken}` } })).statusCode, 200);
   assert.equal((await app.inject({ url: "/api/admin/session", headers: { cookie: "mail_opus_admin=forged-token" } })).statusCode, 401);
@@ -37,9 +37,9 @@ test("legacy signed sessions and real HTTP CookieJar survive local V2 routing", 
     assert.equal(response.statusCode, 200);
     assert.equal(Boolean(response.cookies[0].secure), scenario.secure, JSON.stringify(scenario));
   }
-  assert.equal(repository.importAccounts([{ email: "cookiejar@icloud.com" }]).errors.length, 0);
-  const owner = db.prepare("SELECT account_id,id FROM email_bindings WHERE is_current=1").get() as any;
-  repository.createCustomerGrant(owner.account_id, owner.id, { password: "offline-customer-password" });
+  assert.equal((await repository.importAccounts([{ email: "cookiejar@icloud.com" }])).errors.length, 0);
+  const owner = (await db.prepare("SELECT account_id,id FROM email_bindings WHERE is_current=1").get()) as any;
+  (await repository.createCustomerGrant(owner.account_id, owner.id, { password: "offline-customer-password" }));
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   const script = [
     "import json, sys",

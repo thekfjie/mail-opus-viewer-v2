@@ -19,34 +19,34 @@ test("第三方待恢复账号独立入队，并在补入 AT 后转为第三方�
     import("../src/server/db.js"),
     import("../src/server/repository.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
   const email = "third-party-pending+oai@icloud.com";
-  assert.deepEqual(repository.importAccounts([{
+  assert.deepEqual((await repository.importAccounts([{
     email,
     lifecycleStatus: "third_party_pending_recovery",
     plan: "free",
     note: "第三方注册，待 AT 恢复",
-  }]), { imported: 1, created: 1, rebound: 0, errors: [] });
+  }])), { imported: 1, created: 1, rebound: 0, errors: [] });
 
-  const queued = repository.listAccounts({ status: "third_party_pending_recovery", limit: 10 });
+  const queued = (await repository.listAccounts({ status: "third_party_pending_recovery", limit: 10 }));
   assert.equal(queued.total, 1);
   assert.equal(queued.results[0]?.primaryEmail, email);
   assert.equal(queued.results[0]?.lifecycleStatus, "third_party_pending_recovery");
-  assert.throws(() => repository.provisionCurrentCustomerExport(String(queued.results[0]?.id)), /非可授权账号/);
+  await assert.rejects(async () => (await repository.provisionCurrentCustomerExport(String(queued.results[0]?.id))), /非可授权账号/);
 
-  assert.deepEqual(repository.importAccounts([{
+  assert.deepEqual((await repository.importAccounts([{
     email,
     lifecycleStatus: "third_party_pending_recovery",
-  }]), { imported: 1, created: 0, rebound: 0, errors: [] });
+  }])), { imported: 1, created: 0, rebound: 0, errors: [] });
 
-  assert.deepEqual(repository.importAccounts([{
+  assert.deepEqual((await repository.importAccounts([{
     email,
     accessToken: "restored-at",
-  }]), { imported: 1, created: 0, rebound: 0, errors: [] });
-  assert.equal(repository.listAccounts({ status: "third_party_pending_recovery", limit: 10 }).total, 0);
-  assert.equal(repository.listAccounts({ status: "active", search: email, limit: 10 }).total, 0);
-  const registered = repository.listAccounts({ status: "third_party_registered", search: email, limit: 10 }).results[0];
+  }])), { imported: 1, created: 0, rebound: 0, errors: [] });
+  assert.equal((await repository.listAccounts({ status: "third_party_pending_recovery", limit: 10 })).total, 0);
+  assert.equal((await repository.listAccounts({ status: "active", search: email, limit: 10 })).total, 0);
+  const registered = (await repository.listAccounts({ status: "third_party_registered", search: email, limit: 10 })).results[0];
   assert.equal(registered?.lifecycleStatus, "third_party_registered");
-  assert.equal(repository.provisionCurrentCustomerExport(String(registered?.id))?.available, true);
+  assert.equal((await repository.provisionCurrentCustomerExport(String(registered?.id)))?.available, true);
 });

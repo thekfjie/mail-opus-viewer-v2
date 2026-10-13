@@ -12,14 +12,14 @@ function integer(value: unknown, fallback: number, min: number, max: number): nu
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, Math.trunc(parsed))) : fallback;
 }
 
-export function listAdminAccountMails(accountId: string, offsetInput: unknown, limitInput: unknown): Record<string, unknown> {
+export async function listAdminAccountMails(accountId: string, offsetInput: unknown, limitInput: unknown): Promise<Record<string, unknown>> {
   const offset = integer(offsetInput, 0, 0, 5_000);
   const limit = integer(limitInput, 10, 1, 30);
-  const count = Number((db.prepare(`SELECT COUNT(DISTINCT m.id) count FROM mail_messages m
-    JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE oc.account_id=?`).get(accountId) as any)?.count || 0);
-  const rows = db.prepare(`SELECT DISTINCT m.id, m.sender, m.subject, m.received_at, m.folder, m.category
+  const count = Number(((await db.prepare(`SELECT COUNT(DISTINCT m.id) count FROM mail_messages m
+    JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE oc.account_id=?`).get(accountId)) as any)?.count || 0);
+  const rows = (await db.prepare(`SELECT DISTINCT m.id, m.sender, m.subject, m.received_at, m.folder, m.category
     FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id
-    WHERE oc.account_id=? ORDER BY datetime(m.received_at) DESC, m.id DESC LIMIT ? OFFSET ?`).all(accountId, limit, offset) as any[];
+    WHERE oc.account_id=? ORDER BY datetime(m.received_at) DESC, m.id DESC LIMIT ? OFFSET ?`).all(accountId, limit, offset)) as any[];
   return {
     count,
     results: rows.map((row) => ({
@@ -31,14 +31,14 @@ export function listAdminAccountMails(accountId: string, offsetInput: unknown, l
 
 async function outlookMailboxForProvider(provider: string): Promise<string> {
   const hash = provider.replace(/^outlook:/, "");
-  const connection = db.prepare(`SELECT manager_email_enc FROM mailbox_connections
-    WHERE provider='outlook-manager' AND external_account_id=? AND status='active' LIMIT 1`).get(hash) as any;
+  const connection = (await db.prepare(`SELECT manager_email_enc FROM mailbox_connections
+    WHERE provider='outlook-manager' AND external_account_id=? AND status='active' LIMIT 1`).get(hash)) as any;
   return connection?.manager_email_enc ? normalizeEmail(decryptSecret(connection.manager_email_enc)) : "";
 }
 
 export async function adminAccountMailDetail(accountId: string, messageId: string): Promise<Record<string, unknown> | null> {
-  const row = db.prepare(`SELECT m.* FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id
-    WHERE oc.account_id=? AND m.id=? LIMIT 1`).get(accountId, messageId) as any;
+  const row = (await db.prepare(`SELECT m.* FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id
+    WHERE oc.account_id=? AND m.id=? LIMIT 1`).get(accountId, messageId)) as any;
   if (!row) return null;
   let text = "";
   let html = "";
@@ -94,12 +94,12 @@ export interface VerificationCodeOptions { bindingId?: string; ignoreAccessWindo
 
 type AccountMailDetailReader = typeof adminAccountMailDetail;
 
-function verificationCandidates(accountId: string, options: VerificationCodeOptions): { binding: any; rows: any[] } {
+async function verificationCandidates(accountId: string, options: VerificationCodeOptions): Promise<{ binding: any; rows: any[] }> {
   const binding = options.bindingId
-    ? db.prepare("SELECT * FROM email_bindings WHERE id=? AND account_id=?").get(options.bindingId, accountId) as any
-    : db.prepare("SELECT * FROM email_bindings WHERE account_id=? ORDER BY is_current DESC, valid_from DESC LIMIT 1").get(accountId) as any;
+    ? (await db.prepare("SELECT * FROM email_bindings WHERE id=? AND account_id=?").get(options.bindingId, accountId)) as any
+    : (await db.prepare("SELECT * FROM email_bindings WHERE account_id=? ORDER BY is_current DESC, valid_from DESC LIMIT 1").get(accountId)) as any;
   if (!binding) return { binding: null, rows: [] };
-  const rows = db.prepare(`SELECT DISTINCT m.id,m.sender AS "from",m.subject,m.received_at AS created_at,m.folder,m.category,m.indexed_at
+  const rows = (await db.prepare(`SELECT DISTINCT m.id,m.sender AS "from",m.subject,m.received_at AS created_at,m.folder,m.category,m.indexed_at
     FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
     WHERE c.account_id=? AND c.binding_id=? AND m.received_at<>''
       AND NOT EXISTS(SELECT 1 FROM mail_ownership_claims other WHERE other.message_id=m.id AND other.account_id<>?)
@@ -107,7 +107,7 @@ function verificationCandidates(accountId: string, options: VerificationCodeOpti
         AND (?='' OR m.received_at<=?)))
     ORDER BY m.received_at DESC,m.id DESC LIMIT 20`).all(accountId, binding.id, accountId, Number(options.ignoreAccessWindow === true),
     binding.valid_from, binding.valid_from, binding.valid_to, binding.valid_to,
-    binding.receive_disabled_at, binding.receive_disabled_at) as any[];
+    binding.receive_disabled_at, binding.receive_disabled_at)) as any[];
   return { binding, rows };
 }
 
@@ -122,8 +122,8 @@ async function readAccountVerificationCode(accountId: string, rows: any[], detai
   return { ok: true, item: null };
 }
 
-export function accountVerificationCode(accountId: string, options: VerificationCodeOptions = {}, detailReader: AccountMailDetailReader = adminAccountMailDetail): Promise<Record<string, unknown>> {
-  const { binding, rows } = verificationCandidates(accountId, options);
+export async function accountVerificationCode(accountId: string, options: VerificationCodeOptions = {}, detailReader: AccountMailDetailReader = adminAccountMailDetail): Promise<Record<string, unknown>> {
+  const { binding, rows } = (await verificationCandidates(accountId, options));
   const key = JSON.stringify([accountId, binding?.id || "", binding?.valid_from || "", binding?.valid_to || "",
     binding?.receive_disabled_at || "", options.ignoreAccessWindow === true, rows.map((row) => [row.id, row.indexed_at])]);
   const cached = verificationResults.get(key);
@@ -142,13 +142,13 @@ export function accountVerificationCode(accountId: string, options: Verification
 export async function pendingMailboxVerificationCode(emailInput: unknown, reader: Pick<D1MailReader, "byId"> = sharedMailReader): Promise<Record<string, unknown>> {
   const email = normalizeEmail(emailInput);
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new MailReadError("invalid_mailbox_email", 400);
-  const pending = db.prepare("SELECT id,created_at FROM pending_mailboxes WHERE email_hash=?").get(emailHash(email)) as any;
+  const pending = (await db.prepare("SELECT id,created_at FROM pending_mailboxes WHERE email_hash=?").get(emailHash(email))) as any;
   if (!pending) throw new MailReadError("pending_mailbox_not_found", 404);
-  const rows = db.prepare(`SELECT m.* FROM mail_messages m JOIN pending_mail_claims c ON c.message_id=m.id
-    WHERE c.pending_id=? AND m.received_at>=datetime(?,'-5 minutes')
+  const rows = (await db.prepare(`SELECT m.* FROM mail_messages m JOIN pending_mail_claims c ON c.message_id=m.id
+    WHERE c.pending_id=? AND datetime(m.received_at)>=datetime(?,'-5 minutes')
       AND (m.received_at>=? OR c.created_at>=?)
     ORDER BY m.received_at DESC,m.id DESC LIMIT 20`)
-    .all(pending.id, pending.created_at, pending.created_at, pending.created_at) as any[];
+    .all(pending.id, pending.created_at, pending.created_at, pending.created_at)) as any[];
   const key = `pending:${pending.id}:${pending.created_at}:${rows[0]?.id || ""}:${rows[0]?.indexed_at || ""}`;
   const cached = verificationResults.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.result;
@@ -214,8 +214,8 @@ async function refreshOutlookPool(): Promise<OutlookPoolCache> {
   return outlookPoolCache;
 }
 
-function poolResponse(cache: OutlookPoolCache): Record<string, unknown> {
-  const viewerHashes = new Set((db.prepare("SELECT email_hash FROM email_bindings").all() as any[]).map((row) => String(row.email_hash)));
+async function poolResponse(cache: OutlookPoolCache): Promise<Record<string, unknown>> {
+  const viewerHashes = new Set(((await db.prepare("SELECT email_hash FROM email_bindings").all()) as any[]).map((row) => String(row.email_hash)));
   const results = cache.accounts.filter((item) => item?.opened && !viewerHashes.has(emailHash(normalizeEmail(item.email)))).map((item) => ({
     id: `outlook-${item.id || emailHash(normalizeEmail(item.email))}`,
     email: String(item.email || ""), groupId: item.group_id || null, groupName: String(item.group_name || ""),
@@ -234,7 +234,7 @@ function poolResponse(cache: OutlookPoolCache): Record<string, unknown> {
 
 export async function outlookFreePool(force = false): Promise<Record<string, unknown>> {
   const cache = force || !outlookPoolCache ? await refreshOutlookPool() : outlookPoolCache;
-  return { ...poolResponse(cache), refreshed: force };
+  return { ...(await poolResponse(cache)), refreshed: force };
 }
 
 export async function outlookFreeMails(email: string, offsetInput: unknown, limitInput: unknown): Promise<Record<string, unknown>> {

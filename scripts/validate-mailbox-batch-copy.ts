@@ -1,3 +1,4 @@
+import { asyncMap } from '../src/server/async-collections.js';
 import assert from "node:assert/strict";
 import path from "node:path";
 
@@ -47,44 +48,44 @@ function regex(value: string): string {
   return `^${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
 }
 
-function addAccount(index: number, email: string, familyId: string): { accountId: string; bindingId: string } {
+async function addAccount(index: number, email: string, familyId: string): Promise<{ accountId: string; bindingId: string }> {
   const accountId = `${runId}-account-${index}`;
   const bindingId = `${runId}-binding-${index}`;
   const parts = association.splitEmail(email);
-  db.prepare(`INSERT INTO gpt_accounts(id,lifecycle_status,source_status,arrived_at,created_at,updated_at)
-    VALUES(?,'active','v2',?,?,?)`).run(accountId, startedAt, startedAt, startedAt);
-  db.prepare(`INSERT INTO email_bindings(id,account_id,mailbox_family_id,email_enc,email_hash,local_part,domain,provider,
+  (await db.prepare(`INSERT INTO gpt_accounts(id,lifecycle_status,source_status,arrived_at,created_at,updated_at)
+    VALUES(?,'active','v2',?,?,?)`).run(accountId, startedAt, startedAt, startedAt));
+  (await db.prepare(`INSERT INTO email_bindings(id,account_id,mailbox_family_id,email_enc,email_hash,local_part,domain,provider,
     valid_from,is_current,association_method,legacy_mapping_id,created_at,updated_at)
     VALUES(?,?,?,?,?,?,?,'icloud',?,1,'batch_validation',?,?,?)`).run(
     bindingId, accountId, familyId, encryptSecret(email), association.emailHash(email), parts.localPart, parts.domain,
     startedAt, `${runId}-legacy-${index}`, startedAt, startedAt,
-  );
-  db.prepare(`INSERT INTO mail_routing_rules(id,binding_id,sender_pattern,recipient_pattern,valid_from,source,created_at,updated_at)
+  ));
+  (await db.prepare(`INSERT INTO mail_routing_rules(id,binding_id,sender_pattern,recipient_pattern,valid_from,source,created_at,updated_at)
     VALUES(?,?,?,?,?,'batch-validation',?,?)`).run(
     `${runId}-rule-${index}`, bindingId, regex(sender), regex(email), startedAt, startedAt, startedAt,
-  );
+  ));
   return { accountId, bindingId };
 }
 
 const familyId = `${runId}-family`;
-db.prepare(`INSERT INTO mailbox_families(id,provider,canonical_address_enc,canonical_address_hash,created_at,updated_at)
+(await db.prepare(`INSERT INTO mailbox_families(id,provider,canonical_address_enc,canonical_address_hash,created_at,updated_at)
   VALUES(?,'icloud',?,?,?,?)`).run(
   familyId, encryptSecret(baseAddress), association.emailHash(baseAddress), startedAt, startedAt,
-);
-const children = aliases.map((email, index) => addAccount(index + 1, email, familyId));
+));
+const children = (await asyncMap(aliases, async (email, index) => (await addAccount(index + 1, email, familyId))));
 const otherFamilyId = `${runId}-other-family`;
-db.prepare(`INSERT INTO mailbox_families(id,provider,canonical_address_enc,canonical_address_hash,created_at,updated_at)
+(await db.prepare(`INSERT INTO mailbox_families(id,provider,canonical_address_enc,canonical_address_hash,created_at,updated_at)
   VALUES(?,'icloud',?,?,?,?)`).run(
   otherFamilyId, encryptSecret(otherBase), association.emailHash(otherBase), startedAt, startedAt,
-);
-const other = addAccount(9, otherAlias, otherFamilyId);
+));
+const other = (await addAccount(9, otherAlias, otherFamilyId));
 
-const grants = children.map((child, index) => transitions.issueCustomerGrant(child.accountId, child.bindingId, {
+const grants = (await asyncMap(children, async (child, index) => (await transitions.issueCustomerGrant(child.accountId, child.bindingId, {
   trackSale: false, password: `validation-password-${index + 1}`,
-}));
-const otherGrant = transitions.issueCustomerGrant(other.accountId, other.bindingId, {
+}))));
+const otherGrant = (await transitions.issueCustomerGrant(other.accountId, other.bindingId, {
   trackSale: false, password: "validation-password-other",
-});
+}));
 
 function raw(recipient: string, subject: string): string {
   return `From: Validation <${sender}>\r\nTo: ${recipient}\r\nSubject: ${subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nvalidation body`;
@@ -107,12 +108,11 @@ const separate = await deliver("separate", otherAlias);
 const duplicate = await deliver("base", baseAddress);
 
 const messageId = (label: string) => association.stableId("mail-message", "shared-mail-api", providerIds.get(label));
-const providerId = (id: string) => String((db.prepare("SELECT provider_message_id FROM mail_messages WHERE id=?").get(id) as any)?.provider_message_id || "");
-const visibleLabels = (grantId: string) => {
-  const grant = repository.grantById(grantId);
+const providerId = async (id: string) => String(((await db.prepare("SELECT provider_message_id FROM mail_messages WHERE id=?").get(id)) as any)?.provider_message_id || "");
+const visibleLabels = async (grantId: string) => {
+  const grant = (await repository.grantById(grantId));
   assert.ok(grant);
-  return new Set(repository.listCustomerMails(grant, 0, 100).results
-    .map((item: any) => providerId(String(item.id))).filter((id: string) => labelByProviderId.has(id))
+  return new Set((await asyncMap((await repository.listCustomerMails(grant, 0, 100)).results, async (item: any) => await providerId(String(item.id)))).filter((id: string) => labelByProviderId.has(id))
     .map((id: string) => labelByProviderId.get(id)!));
 };
 
@@ -120,26 +120,26 @@ for (const { result } of firstResults) assert.deepEqual({ inserted: result.inser
 assert.deepEqual({ inserted: unclear.inserted, claims: unclear.claims }, { inserted: true, claims: 0 });
 assert.deepEqual({ inserted: separate.inserted, claims: separate.claims }, { inserted: true, claims: 1 });
 assert.deepEqual({ inserted: duplicate.inserted, claims: duplicate.claims }, { inserted: false, claims: 0 });
-assert.equal((db.prepare("SELECT COUNT(*) n FROM mail_messages WHERE provider_message_id=?").get(providerIds.get("base")) as any).n, 1);
-assert.equal((db.prepare("SELECT COUNT(*) n FROM mail_ownership_claims WHERE message_id=?").get(messageId("base")) as any).n, 3);
-assert.equal((db.prepare("SELECT COUNT(*) n FROM mail_ownership_claims WHERE message_id=?").get(messageId("unclear")) as any).n, 0);
+assert.equal(((await db.prepare("SELECT COUNT(*) n FROM mail_messages WHERE provider_message_id=?").get(providerIds.get("base"))) as any).n, 1);
+assert.equal(((await db.prepare("SELECT COUNT(*) n FROM mail_ownership_claims WHERE message_id=?").get(messageId("base"))) as any).n, 3);
+assert.equal(((await db.prepare("SELECT COUNT(*) n FROM mail_ownership_claims WHERE message_id=?").get(messageId("unclear"))) as any).n, 0);
 
 const sharedBefore = new Set(["base", "alias-one", "alias-two", "alias-three"]);
-for (const grant of grants) assert.deepEqual(visibleLabels(grant.grantId), sharedBefore);
-assert.deepEqual(visibleLabels(otherGrant.grantId), new Set(["separate"]));
+for (const grant of grants) assert.deepEqual((await visibleLabels(grant.grantId)), sharedBefore);
+assert.deepEqual((await visibleLabels(otherGrant.grantId)), new Set(["separate"]));
 
-const recycled = transitions.recycleAccountTransition(children[0].accountId, replacementAlias, "free", "batch-validation");
-assert.equal(repository.grantById(grants[0].grantId), null);
-const replacementBinding = db.prepare("SELECT id,valid_from FROM email_bindings WHERE account_id=? AND is_current=1").get(recycled.replacementId) as any;
-const replacementGrant = transitions.issueCustomerGrant(recycled.replacementId, String(replacementBinding.id), {
+const recycled = (await transitions.recycleAccountTransition(children[0].accountId, replacementAlias, "free", "batch-validation"));
+assert.equal((await repository.grantById(grants[0].grantId)), null);
+const replacementBinding = (await db.prepare("SELECT id,valid_from FROM email_bindings WHERE account_id=? AND is_current=1").get(recycled.replacementId)) as any;
+const replacementGrant = (await transitions.issueCustomerGrant(recycled.replacementId, String(replacementBinding.id), {
   trackSale: false, password: "validation-password-replacement",
-});
+}));
 const postRecycleAt = new Date(Date.parse(String(replacementBinding.valid_from)) + 1000).toISOString();
 const postRecycle = await deliver("post-recycle-base", baseAddress, postRecycleAt);
 assert.deepEqual({ inserted: postRecycle.inserted, claims: postRecycle.claims }, { inserted: true, claims: 3 });
-for (const grant of grants.slice(1)) assert.ok(visibleLabels(grant.grantId).has("post-recycle-base"));
-assert.deepEqual(visibleLabels(replacementGrant.grantId), new Set(["post-recycle-base"]));
-assert.ok(!visibleLabels(otherGrant.grantId).has("post-recycle-base"));
+for (const grant of grants.slice(1)) assert.ok((await visibleLabels(grant.grantId)).has("post-recycle-base"));
+assert.deepEqual((await visibleLabels(replacementGrant.grantId)), new Set(["post-recycle-base"]));
+assert.ok(!(await visibleLabels(otherGrant.grantId)).has("post-recycle-base"));
 
 const normalized = aliases.map(batch.mailboxBatchKey);
 assert.equal(new Set([...normalized, batch.mailboxBatchKey(baseAddress), batch.mailboxBatchKey(replacementAlias)]).size, 1);
@@ -162,4 +162,4 @@ const result = {
   foreignKeyViolations: db.pragma("foreign_key_check").length,
 };
 process.stdout.write(`${JSON.stringify(result)}\n`);
-db.close();
+(await db.close());

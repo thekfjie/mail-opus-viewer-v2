@@ -83,36 +83,36 @@ test("回收各代保持独立，未完成换绑目标不建账号映射", async
     import("../src/server/legacy-import.js"),
     import("../src/server/account-transitions.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  syncFromV1();
-  const sourceBinding = db.prepare("SELECT account_id, id FROM email_bindings WHERE legacy_mapping_id='generation-two'").get() as any;
-  const targetBinding = db.prepare("SELECT account_id FROM email_bindings WHERE legacy_mapping_id='generation-two-domain'").get() as any;
-  const laterBinding = db.prepare("SELECT account_id FROM email_bindings WHERE legacy_mapping_id='generation-three'").get() as any;
+  (await syncFromV1());
+  const sourceBinding = (await db.prepare("SELECT account_id, id FROM email_bindings WHERE legacy_mapping_id='generation-two'").get()) as any;
+  const targetBinding = (await db.prepare("SELECT account_id FROM email_bindings WHERE legacy_mapping_id='generation-two-domain'").get()) as any;
+  const laterBinding = (await db.prepare("SELECT account_id FROM email_bindings WHERE legacy_mapping_id='generation-three'").get()) as any;
   assert.equal(targetBinding, undefined);
   assert.notEqual(sourceBinding.account_id, laterBinding.account_id);
 
-  const reboundAccount = db.prepare("SELECT lifecycle_status, identity_status, quarantine_reason FROM gpt_accounts WHERE id=?").get(sourceBinding.account_id) as any;
+  const reboundAccount = (await db.prepare("SELECT lifecycle_status, identity_status, quarantine_reason FROM gpt_accounts WHERE id=?").get(sourceBinding.account_id)) as any;
   assert.deepEqual(reboundAccount, { lifecycle_status: "retired", identity_status: "unknown", quarantine_reason: "" });
-  const relations = db.prepare("SELECT relation_type, from_account_id, to_account_id FROM account_relations ORDER BY relation_type").all() as any[];
+  const relations = (await db.prepare("SELECT relation_type, from_account_id, to_account_id FROM account_relations ORDER BY relation_type").all()) as any[];
   assert.ok(!relations.some((row) => row.relation_type === "email_rebind"));
   assert.ok(relations.some((row) => row.relation_type === "mailbox_recycle" && row.from_account_id === sourceBinding.account_id && row.to_account_id === laterBinding.account_id));
 
-  const claim = db.prepare(`SELECT oc.account_id, b.legacy_mapping_id, oc.claim_type
+  const claim = (await db.prepare(`SELECT oc.account_id, b.legacy_mapping_id, oc.claim_type
     FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id
-    JOIN email_bindings b ON b.id=oc.binding_id WHERE m.provider_message_id='3720'`).get() as any;
+    JOIN email_bindings b ON b.id=oc.binding_id WHERE m.provider_message_id='3720'`).get()) as any;
   assert.deepEqual(claim, {
     account_id: laterBinding.account_id,
     legacy_mapping_id: "generation-three",
     claim_type: "legacy_mapping_index",
   });
 
-  db.prepare(`INSERT INTO openai_identity_observations(
+  (await db.prepare(`INSERT INTO openai_identity_observations(
     id, account_id, subject_hash, source, status, first_seen_at, last_seen_at, evidence_json
   ) VALUES('third-identity', ?, 'third-subject-hash', 'test', 'confirmed', ?, ?, '{}')`).run(
     laterBinding.account_id, "2026-08-28T18:31:14.448Z", "2026-08-28T18:31:14.448Z",
-  );
-  const observedOldMailbox = resolveAccountMatch("third-subject-hash", sourceEmail);
+  ));
+  const observedOldMailbox = (await resolveAccountMatch("third-subject-hash", sourceEmail));
   assert.equal(observedOldMailbox.kind, "account");
   assert.equal(observedOldMailbox.accountId, laterBinding.account_id);
   assert.equal(observedOldMailbox.method, "recycled_mailbox_identity");

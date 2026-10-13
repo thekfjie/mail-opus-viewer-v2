@@ -105,10 +105,10 @@ export function fetchExternalMessageById(external: ExternalMailbox, messageId: s
 }
 
 export async function fetchExternalMessage(accountId: string, messageId: string, bindingId = ""): Promise<SharedMessageDetail | null> {
-  const row = db.prepare(`SELECT m.*,c.credentials_enc FROM mail_messages m
+  const row = (await db.prepare(`SELECT m.*,c.credentials_enc FROM mail_messages m
     JOIN mail_ownership_claims oc ON oc.message_id=m.id JOIN mailbox_connections c ON c.binding_id=oc.binding_id
     WHERE m.id=? AND oc.account_id=? AND (?='' OR oc.binding_id=?) ORDER BY c.updated_at DESC LIMIT 1`)
-    .get(messageId, accountId, bindingId, bindingId) as any;
+    .get(messageId, accountId, bindingId, bindingId)) as any;
   if (!row) return null;
   let address = "";
   try { address = String(JSON.parse(decryptSecret(String(row.credentials_enc || ""))).address || ""); } catch { /* Legacy records may lack connection material. */ }

@@ -22,7 +22,7 @@ export async function migrateSnapshot(args = process.argv.slice(2)): Promise<unk
   process.env.V1_USAGE_AUDIT_FILE = path.join(snapshot, "usage-audit-cache.json");
   process.env.V1_BACKUPS_DIR = path.join(snapshot, "backups");
   const { syncFromV1 } = await import("./legacy-import.js");
-  return syncFromV1();
+  return (await syncFromV1());
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

@@ -3,10 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import test from "node:test";
 
-test("migration CLI requires an explicit valid snapshot and writes only the new target", () => {
+test("migration CLI requires an explicit valid snapshot and writes only the new target", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "v2-migration-cli-"));
   const snapshot = path.join(directory, "source");
   fs.mkdirSync(snapshot);
@@ -27,8 +27,8 @@ test("migration CLI requires an explicit valid snapshot and writes only the new 
     assert.equal(imported.status, 0, imported.stderr || imported.stdout);
     assert.equal(fs.readFileSync(source, "utf8"), records);
     const db = new Database(target, { readonly: true });
-    assert.equal((db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get() as any).n, 1);
-    db.close();
+    assert.equal(((await db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get()) as any).n, 1);
+    (await db.close());
     const before = fs.readFileSync(target);
     assert.notEqual(invoke(target).status, 0);
     assert.deepEqual(fs.readFileSync(target), before);

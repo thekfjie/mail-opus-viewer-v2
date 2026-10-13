@@ -124,6 +124,10 @@ const paymentExposureRoutes = {
 
 export const config = {
   projectRoot,
+  mysqlUrl: String(process.env.MYSQL_URL || ""),
+  mysqlPoolSize: Math.max(1, Math.min(50, Number(process.env.MYSQL_POOL_SIZE || 10))),
+  redisUrl: String(process.env.REDIS_URL || ""),
+  redisPrefix: String(process.env.REDIS_PREFIX || "opusmail:"),
   port: Number(process.env.PORT || 8790),
   databasePath: process.env.DATABASE_PATH || path.join(projectRoot, ".state", "mail-opus-v2.sqlite"),
   sqliteBusyTimeoutMs: Math.max(5_000, Math.min(120_000, Number(process.env.V2_SQLITE_BUSY_TIMEOUT_MS || 30_000))),

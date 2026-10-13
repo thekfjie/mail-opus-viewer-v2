@@ -328,11 +328,11 @@ interface AccessTokenObservationBackup {
   firstSeenAt: string;
 }
 
-function captureAccessTokenObservations(): { byAccount: Map<string, AccessTokenObservationBackup>; byFingerprint: Map<string, string> } {
+async function captureAccessTokenObservations(): Promise<{ byAccount: Map<string, AccessTokenObservationBackup>; byFingerprint: Map<string, string> }> {
   const byAccount = new Map<string, AccessTokenObservationBackup>();
   const byFingerprint = new Map<string, string>();
-  const rows = db.prepare(`SELECT account_id, access_token_enc, access_token_fingerprint, access_token_first_seen_at
-    FROM credentials`).all() as any[];
+  const rows = (await db.prepare(`SELECT account_id, access_token_enc, access_token_fingerprint, access_token_first_seen_at
+    FROM credentials`).all()) as any[];
   for (const row of rows) {
     let token = "";
     try { token = decryptSecret(String(row.access_token_enc || "")); } catch { token = ""; }
@@ -346,13 +346,13 @@ function captureAccessTokenObservations(): { byAccount: Map<string, AccessTokenO
   return { byAccount, byFingerprint };
 }
 
-function capturePaymentExposureChecks(): PaymentExposureBackup[] {
-  const rows = db.prepare(`SELECT p.*, COALESCE(c.openai_subject_hash, '') AS subject_hash,
+async function capturePaymentExposureChecks(): Promise<PaymentExposureBackup[]> {
+  const rows = (await db.prepare(`SELECT p.*, COALESCE(c.openai_subject_hash, '') AS subject_hash,
       COALESCE(GROUP_CONCAT(DISTINCT b.email_hash), '') AS email_hashes
     FROM payment_exposure_checks p
     LEFT JOIN credentials c ON c.account_id=p.account_id
     LEFT JOIN email_bindings b ON b.account_id=p.account_id
-    GROUP BY p.id`).all() as any[];
+    GROUP BY p.id`).all()) as any[];
   return rows.map((row) => ({
     id: String(row.id || ""), accountId: String(row.account_id || ""), subjectHash: String(row.subject_hash || ""),
     emailHashes: String(row.email_hashes || "").split(",").filter(Boolean), target: String(row.target || ""),
@@ -368,8 +368,8 @@ function capturePaymentExposureChecks(): PaymentExposureBackup[] {
   })).filter((row) => row.id && row.accountId);
 }
 
-function capturePaymentExposureJobs(): PaymentExposureJobBackup[] {
-  const rows = db.prepare("SELECT * FROM payment_exposure_jobs").all() as any[];
+async function capturePaymentExposureJobs(): Promise<PaymentExposureJobBackup[]> {
+  const rows = (await db.prepare("SELECT * FROM payment_exposure_jobs").all()) as any[];
   return rows.map((row) => ({
     jobId: String(row.job_id || ""), accountId: String(row.account_id || ""), routeKey: String(row.route_key || ""),
     target: String(row.target || ""), ipCountry: String(row.ip_country || ""), billingCountry: String(row.billing_country || ""),
@@ -381,18 +381,18 @@ function capturePaymentExposureJobs(): PaymentExposureJobBackup[] {
   })).filter((row) => row.jobId && row.accountId);
 }
 
-function promoEligibilityTableExists(): boolean {
-  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='promo_eligibility_checks'").get());
+async function promoEligibilityTableExists(): Promise<boolean> {
+  return Boolean((await db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='promo_eligibility_checks'").get()));
 }
 
-function capturePromoEligibilityChecks(): PromoEligibilityBackup[] {
-  if (!promoEligibilityTableExists()) return [];
-  const rows = db.prepare(`SELECT p.*, COALESCE(c.openai_subject_hash, '') AS subject_hash,
+async function capturePromoEligibilityChecks(): Promise<PromoEligibilityBackup[]> {
+  if (!(await promoEligibilityTableExists())) return [];
+  const rows = (await db.prepare(`SELECT p.*, COALESCE(c.openai_subject_hash, '') AS subject_hash,
       COALESCE(GROUP_CONCAT(DISTINCT b.email_hash), '') AS email_hashes
     FROM promo_eligibility_checks p
     LEFT JOIN credentials c ON c.account_id=p.account_id
     LEFT JOIN email_bindings b ON b.account_id=p.account_id
-    GROUP BY p.id`).all() as any[];
+    GROUP BY p.id`).all()) as any[];
   return rows.map((row) => ({
     id: String(row.id || ""), accountId: String(row.account_id || ""), subjectHash: String(row.subject_hash || ""),
     emailHashes: String(row.email_hashes || "").split(",").filter(Boolean),
@@ -405,7 +405,7 @@ function capturePromoEligibilityChecks(): PromoEligibilityBackup[] {
   })).filter((row) => row.id && row.accountId);
 }
 
-function reuseExistingProjectionAccounts(graph: ReturnType<typeof buildAssociationGraph>): void {
+async function reuseExistingProjectionAccounts(graph: ReturnType<typeof buildAssociationGraph>): Promise<void> {
   const replacements = new Map<string, string>();
   const claimed = new Set<string>();
   const bySource = db.prepare(`SELECT b.account_id
@@ -417,18 +417,18 @@ function reuseExistingProjectionAccounts(graph: ReturnType<typeof buildAssociati
     WHERE subject_hash=? AND status!='conflict'`);
 
   for (const [projectedId, members] of graph.groups) {
-    if (db.prepare("SELECT 1 FROM gpt_accounts WHERE id=?").get(projectedId)) {
+    if ((await db.prepare("SELECT 1 FROM gpt_accounts WHERE id=?").get(projectedId))) {
       claimed.add(projectedId);
       continue;
     }
     const candidates = new Set<string>();
     for (const member of members) {
-      for (const row of bySource.all(member.id) as any[]) candidates.add(String(row.account_id));
+      for (const row of (await bySource.all(member.id)) as any[]) candidates.add(String(row.account_id));
       const email = normalizeEmail(member.email || member.login);
-      if (email) for (const row of byEmail.all(emailHash(email)) as any[]) candidates.add(String(row.account_id));
+      if (email) for (const row of (await byEmail.all(emailHash(email))) as any[]) candidates.add(String(row.account_id));
       const material = tokenMaterial(member);
       const subject = String(material.identity || parseJwtSubject(material.accessToken || material.idToken));
-      if (subject) for (const row of bySubject.all(sha256(subject)) as any[]) candidates.add(String(row.account_id));
+      if (subject) for (const row of (await bySubject.all(sha256(subject))) as any[]) candidates.add(String(row.account_id));
     }
     const available = [...candidates].filter((accountId) => !claimed.has(accountId));
     if (available.length === 1) {
@@ -460,10 +460,10 @@ export interface SyncResult {
   sourceHash: string;
 }
 
-export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): SyncResult {
+export async function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Promise<SyncResult> {
   const startedAt = new Date().toISOString();
   const runId = crypto.randomUUID();
-  db.prepare("INSERT INTO shadow_sync_runs(id, started_at, status) VALUES(?, ?, 'running')").run(runId, startedAt);
+  (await db.prepare("INSERT INTO shadow_sync_runs(id, started_at, status) VALUES(?, ?, 'running')").run(runId, startedAt));
 
   try {
     const v1Authoritative = options.legacyAuthoritative === true;
@@ -536,11 +536,11 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
     ]).filter((entry): entry is [string, string] => Boolean(entry[1])));
     const sourceHash = sha256(currentPayload);
     const graph = buildAssociationGraph(records, config.routingEmails);
-    reuseExistingProjectionAccounts(graph);
-    const paymentExposureBackups = capturePaymentExposureChecks();
-    const paymentExposureJobBackups = capturePaymentExposureJobs();
-    const promoEligibilityBackups = capturePromoEligibilityChecks();
-    const accessTokenObservations = captureAccessTokenObservations();
+    (await reuseExistingProjectionAccounts(graph));
+    const paymentExposureBackups = (await capturePaymentExposureChecks());
+    const paymentExposureJobBackups = (await capturePaymentExposureJobs());
+    const promoEligibilityBackups = (await capturePromoEligibilityChecks());
+    const accessTokenObservations = (await captureAccessTokenObservations());
     const paymentExposureSubjects = new Map<string, Set<string>>();
     const paymentExposureEmails = new Map<string, Set<string>>();
     const addCandidate = (map: Map<string, Set<string>>, key: string, accountId: string): void => {
@@ -601,11 +601,11 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
       if (next) next.method = pair.method;
     }
 
-    const transaction = db.transaction(() => {
+    const transaction = db.transaction(async () => {
       if (v1Authoritative) {
         // V1 is authoritative during coexistence. Projection diagnostics must
         // not become a second, continuously regenerated business queue.
-        db.prepare("UPDATE pending_reviews SET status='resolved', updated_at=? WHERE status='pending'").run(now);
+        (await db.prepare("UPDATE pending_reviews SET status='resolved', updated_at=? WHERE status='pending'").run(now));
       }
       const insertRaw = db.prepare(`INSERT INTO raw_import_records(
         source_key, source_type, source_path, source_record_id, source_hash, source_updated_at, payload_json, imported_at
@@ -618,7 +618,7 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const payload = JSON.stringify({ id, emailHash: emailHash(normalizeEmail(row.record.email || row.record.login)),
           updatedAt: iso(row.record.updatedAt), sourceType: row.sourceType });
         const sourceKey = sha256(`${row.sourcePath}\0${id}`);
-        insertRaw.run(sourceKey, row.sourceType, row.sourcePath, id, sha256(sourcePayload), iso(row.record.updatedAt), payload, now);
+        (await insertRaw.run(sourceKey, row.sourceType, row.sourcePath, id, sha256(sourcePayload), iso(row.record.updatedAt), payload, now));
       }
 
       const insertRouting = db.prepare("INSERT OR REPLACE INTO routing_endpoints(email_hash, email_enc, reason, created_at) VALUES(?, ?, ?, ?)");
@@ -628,7 +628,7 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         if (email) configuredRoutingEmails.add(email);
       }
       for (const email of configuredRoutingEmails) {
-        insertRouting.run(emailHash(email), encryptSecret(email), "configured or legacy routing endpoint", now);
+        (await insertRouting.run(emailHash(email), encryptSecret(email), "configured or legacy routing endpoint", now));
       }
 
       const insertAccount = db.prepare(`INSERT INTO gpt_accounts(
@@ -755,7 +755,7 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const lifecycleStatus = deactivationLocked ? "deactivated"
           : (!v1Authoritative && soldRebindAnomaly) ? "quarantined"
             : (allRetired || allRecovered ? "retired" : "active");
-        const trialOnlyCorrected = hasActiveTrialOnlyCorrection(db, accountId);
+        const trialOnlyCorrected = (await hasActiveTrialOnlyCorrection(db, accountId));
         const plan = !trialOnlyCorrected
           && members.some((item: JsonObject) => item.hasPlus || item.manualPlus || item.hasPlusOverride || String(item.plan || "").toLowerCase() === "plus")
           ? "plus" : "free";
@@ -781,9 +781,9 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const arrivedAt = latestIso(members.map((item: JsonObject) => recordOrderTimestamp(item)), now);
         const createdAt = earliestIso(members.map((item: JsonObject) => item.createdAt || item.updatedAt)) || arrivedAt;
         const updatedAt = latestIso(members.map((item: JsonObject) => item.updatedAt || item.createdAt), now);
-        db.prepare("UPDATE email_bindings SET is_current=0, updated_at=? WHERE account_id=? AND is_current=1")
-          .run(updatedAt, accountId);
-        insertAccount.run(
+        (await db.prepare("UPDATE email_bindings SET is_current=0, updated_at=? WHERE account_id=? AND is_current=1")
+          .run(updatedAt, accountId));
+        (await insertAccount.run(
           accountId, lifecycleStatus, deactivationLocked ? 1 : 0, deactivatedAt,
           everSold ? 1 : 0, plan, trialOnlyCorrected ? "" : legacyBillingChannel(latest.billingChannelOverride || latest.billingChannel || ""),
           trialOnlyCorrected ? "" : legacyBillingChannel(latest.billingChannelOverride || ""), String(latest.note || ""), String(latest.paymentLink || ""), credential.identity ? "confirmed" : "unknown",
@@ -791,19 +791,19 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           members.some((item: JsonObject) => item.domainMailbox) ? 1 : 0, suspectedUnused ? 1 : 0,
           markColor, groupBoundary ? 1 : 0, sourceStatus,
           arrivedAt, createdAt, updatedAt,
-        );
-        upsertOrigin.run(accountId, members.some((item: JsonObject) => Boolean(item.autoFlag)) ? 1 : 0, createdAt,
-          JSON.stringify({ currentLegacyId: latest.id, providers: [...new Set(members.map((item) => providerFor(item)))] }));
-        upsertPreference.run(accountId, String(latest.label || ""), latest.showBilling ? 1 : 0,
+        ));
+        (await upsertOrigin.run(accountId, members.some((item: JsonObject) => Boolean(item.autoFlag)) ? 1 : 0, createdAt,
+          JSON.stringify({ currentLegacyId: latest.id, providers: [...new Set(members.map((item) => providerFor(item)))] })));
+        (await upsertPreference.run(accountId, String(latest.label || ""), latest.showBilling ? 1 : 0,
           latest.showDeactivation ? 1 : 0, latest.hidePromotion ? 1 : 0,
-          String(latest.statusMessage || ""), updatedAt);
+          String(latest.statusMessage || ""), updatedAt));
         const flags = mailFlagEntries[latest.id] || {};
         const audit = usageAuditEntries[latest.id] || {};
         const flagMatches = flags.configKey === legacyEvidenceConfigKey(latest) && Number(flags.updatedAt) > 0;
         const auditMatches = audit.configKey === legacyEvidenceConfigKey(latest, true);
         const atIso = (value: unknown) => Number(value) > 0 ? new Date(Number(value)).toISOString() : "";
         const generation = Number(latest.recycleGeneration);
-        db.prepare(`INSERT INTO account_business_evidence(account_id,hidden_tags_json,mail_verified_no_plus,mail_verified_at,
+        (await db.prepare(`INSERT INTO account_business_evidence(account_id,hidden_tags_json,mail_verified_no_plus,mail_verified_at,
             recycle_generation,billing_started_at,last_activity_at,newest_mail_at,audit_binding_id,audited_at,updated_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET hidden_tags_json=excluded.hidden_tags_json,
             mail_verified_no_plus=excluded.mail_verified_no_plus,mail_verified_at=excluded.mail_verified_at,
@@ -818,16 +818,16 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           flagMatches ? atIso(flags.updatedAt) : "", Number.isInteger(generation) && generation >= 0 ? generation : null,
           trialOnlyCorrected ? "" : atIso(audit.billingAt), auditMatches ? atIso(audit.lastActivityAt) : "", auditMatches ? atIso(audit.newestMailAt) : "",
           stableId("email-binding", latest.id), auditMatches ? atIso(audit.checkedAt) : "", now,
-        );
+        ));
         if (!v1Authoritative && soldRebindAnomaly) {
-          db.prepare(`UPDATE gpt_accounts SET quarantined_at=?, quarantine_reason='已售GPT身份在未停用状态下出现后续改绑', updated_at=? WHERE id=?`)
-            .run(updatedAt, updatedAt, accountId);
+          (await db.prepare(`UPDATE gpt_accounts SET quarantined_at=?, quarantine_reason='已售GPT身份在未停用状态下出现后续改绑', updated_at=? WHERE id=?`)
+            .run(updatedAt, updatedAt, accountId));
           const latestEmail = normalizeEmail(latest.email || latest.login);
-          insertReview.run(
+          (await insertReview.run(
             stableId("legacy-sold-rebind-anomaly", accountId), "legacy_sold_rebind_anomaly", accountId,
             encryptSecret(latestEmail), emailHash(latestEmail), "已售GPT身份在未停用状态下出现新绑定，已隔离并禁止二次出售",
             JSON.stringify({ firstSoldLegacyId: firstSold?.id, latestLegacyId: latest.id }), now, now,
-          );
+          ));
         }
 
         const saleId = everSold ? stableId("legacy-sale", accountId) : "";
@@ -837,7 +837,7 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           const provider = providerFor(record);
           const canonical = providerCanonical(record);
           const familyId = stableId("mailbox-family", provider, emailHash(canonical));
-          insertFamily.run(familyId, provider, encryptSecret(canonical), emailHash(canonical), now, now);
+          (await insertFamily.run(familyId, provider, encryptSecret(canonical), emailHash(canonical), now, now));
           const bindingId = stableId("email-binding", record.id);
           bindingIdByLegacyId.set(record.id, bindingId);
           const window = bindingWindow.get(record.id) || { from: "", to: "", method: "legacy_mapping" };
@@ -846,7 +846,7 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           // create two current bindings for one identity after each rebuild.
           const isCurrent = !window.to && String(record.lifecycleStatus || "") !== "retired"
             && record.__sourceStatus !== "recovered";
-          insertBinding.run(
+          (await insertBinding.run(
             bindingId, accountId, familyId, encryptSecret(email), emailHash(email), parts.localPart, parts.domain, provider,
             window.from, window.to, isCurrent ? 1 : 0, window.method, record.id,
             JSON.stringify({ sourceStatus: record.__sourceStatus, sourcePath: record.__sourcePath,
@@ -854,26 +854,26 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
                 toEmail: String(record.toEmail || email).trim().slice(0, 320),
                 internalStatusMessage: String(record.internalStatusMessage || record.statusMessage || "").trim().slice(0, 500) } }),
             iso(record.createdAt, now), iso(record.updatedAt, now),
-          );
-          const persistedBindingWindow = db.prepare("SELECT valid_from,valid_to FROM email_bindings WHERE id=?").get(bindingId) as any;
+          ));
+          const persistedBindingWindow = (await db.prepare("SELECT valid_from,valid_to FROM email_bindings WHERE id=?").get(bindingId)) as any;
           const receiveDisabledAt = iso(record.receiveDisabledAt || (record.receiveDisabled ? record.updatedAt || now : ""));
-          db.prepare("UPDATE email_bindings SET receive_disabled_at=? WHERE id=?").run(receiveDisabledAt, bindingId);
-          upsertSourceLink.run(String(record.id), "email_binding", bindingId, String(record.updatedAt || ""), now);
+          (await db.prepare("UPDATE email_bindings SET receive_disabled_at=? WHERE id=?").run(receiveDisabledAt, bindingId));
+          (await upsertSourceLink.run(String(record.id), "email_binding", bindingId, String(record.updatedAt || ""), now));
           const connectionProvider = record.outlookManagerEmail ? "outlook-manager"
             : record.address ? String(record.mailSource || "external") : provider;
           if (record.outlookManagerEmail || record.address) {
-            upsertConnection.run(
+            (await upsertConnection.run(
               stableId("mailbox-connection", record.id), bindingId, familyId, connectionProvider,
               record.outlookManagerEmail ? emailHash(normalizeEmail(record.outlookManagerEmail)) : "",
               String(record.outlookManagerGroupId || ""), `v2:${bindingId}:mailbox`,
               receiveDisabledAt ? "disabled" : "active",
               JSON.stringify({ hasExternalAddress: Boolean(record.address), mailSource: String(record.mailSource || "") }),
               iso(record.createdAt, now), updatedAt,
-            );
-            db.prepare("UPDATE mailbox_connections SET manager_email_enc=?,credentials_enc=? WHERE id=?").run(
+            ));
+            (await db.prepare("UPDATE mailbox_connections SET manager_email_enc=?,credentials_enc=? WHERE id=?").run(
               encryptSecret(normalizeEmail(record.outlookManagerEmail || "")),
               encryptSecret(JSON.stringify({ address: String(record.address || "") })), stableId("mailbox-connection", record.id),
-            );
+            ));
           }
           const fromPatterns = Array.isArray(record.fromPatterns) ? record.fromPatterns.map(String) : [];
           const toPatterns = Array.isArray(record.toPatterns) ? record.toPatterns.map(String) : [];
@@ -883,22 +883,22 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           }
           const senderPatterns = fromPatterns.length ? fromPatterns : record.sourceEmail ? [mailboxRecipientPattern(String(record.sourceEmail))]
             : [provider === "domain" ? LEGACY_DIRECT_SENDER_PATTERN : LEGACY_RELAY_SENDER_PATTERN];
-          db.prepare("DELETE FROM mail_routing_rules WHERE binding_id=? AND source='legacy_v1'").run(bindingId);
+          (await db.prepare("DELETE FROM mail_routing_rules WHERE binding_id=? AND source='legacy_v1'").run(bindingId));
           for (const [fromIndex, senderPattern] of senderPatterns.entries()) for (const [toIndex, recipientPattern] of [...new Set(recipientPatterns)].entries()) {
-            upsertRoutingRule.run(stableId("mail-routing-rule", record.id, String(fromIndex), String(toIndex)), bindingId,
+            (await upsertRoutingRule.run(stableId("mail-routing-rule", record.id, String(fromIndex), String(toIndex)), bindingId,
               senderPattern, recipientPattern,
-              persistedBindingWindow.valid_from, persistedBindingWindow.valid_to, 100 - fromIndex - toIndex, iso(record.createdAt, now), updatedAt);
+              persistedBindingWindow.valid_from, persistedBindingWindow.valid_to, 100 - fromIndex - toIndex, iso(record.createdAt, now), updatedAt));
           }
 
           if (firstSold && record.id === firstSold.id) {
             const saleStartedAt = window.from || iso(record.createdAt, createdAt);
             const saleClosed = allRetired || soldRebindAnomaly || Boolean(window.to);
             const saleEndedAt = saleClosed ? (window.to || updatedAt) : "";
-            insertSale.run(
+            (await insertSale.run(
               saleId, accountId, bindingId, saleClosed ? "closed" : "active", saleStartedAt, saleEndedAt,
               soldRebindAnomaly ? "sold_identity_rebound" : allRetired ? "account_retired" : window.to ? "binding_ended" : "",
               saleStartedAt, saleStartedAt, saleStartedAt, updatedAt,
-            );
+            ));
           }
 
           const soldRecord = Boolean(record.sold);
@@ -920,23 +920,23 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           const visibleTo = scope === "historical" ? iso(window.to) : "";
           const usedAt = soldRecord && scope !== "admin_only" ? (window.from || iso(record.createdAt, createdAt)) : "";
           const grantId = stableId("access-grant", record.id);
-          insertGrant.run(
+          (await insertGrant.run(
             grantId, accountId, bindingId, soldRecord ? saleId : null, digestToken(record.id), encryptSecret(record.id), emailHash(email), encryptSecret(email),
             String(record.passwordHash || record.password || ""), encryptSecret(String(record.passwordPlain || "")), scope,
             window.from, visibleTo, scope === "admin_only" ? 0 : 1, usedAt, usedAt, iso(record.createdAt, now), iso(record.updatedAt, now),
-          );
+          ));
           if (manuallyReclaimed) {
             // Record the explicit action independently from the GPT lifecycle.
             // A later stale active snapshot must not recreate customer access.
-            db.prepare(`UPDATE access_grants SET active=0,
+            (await db.prepare(`UPDATE access_grants SET active=0,
               revoked_at=CASE WHEN revoked_at='' THEN ? ELSE revoked_at END,
               revoke_reason=CASE WHEN revoke_reason='' THEN 'legacy_admin_reclaimed' ELSE revoke_reason END
-              WHERE id=?`).run(iso(record.retiredAt || window.to, updatedAt), grantId);
+              WHERE id=?`).run(iso(record.retiredAt || window.to, updatedAt), grantId));
           }
-          insertEvent.run(
+          (await insertEvent.run(
             stableId("event-binding", record.id), accountId, bindingId, window.method.includes("rebind") ? "email_binding_changed" : "email_binding_imported",
             window.from || createdAt, "v1-shadow-import", JSON.stringify({ legacyMappingId: record.id, associationMethod: window.method }), now,
-          );
+          ));
         }
 
         const subject = String(credential.identity || parseJwtSubject(credential.accessToken || credential.idToken));
@@ -948,30 +948,30 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           : accessTokenObservations.byFingerprint.get(fingerprint) || credential.updatedAt || now;
         const credentialBindingId = bindingIdByLegacyId.get(String(latest.id)) || null;
         if (credential.accessToken || credential.refreshToken || credential.idToken || credential.sessionToken) {
-          observeCredentialVersion({
+          (await observeCredentialVersion({
             accountId, bindingId: credentialBindingId, accessToken: credential.accessToken,
             refreshToken: credential.refreshToken, idToken: credential.idToken, sessionToken: credential.sessionToken,
             openaiPassword: credential.openaiPassword, subjectHash, source: String(credential.source || "v1-shadow-import"),
             observedAt, validityStatus: credential.accessToken ? "alive" : "unknown",
             evidence: { legacyMappingId: latest.id, incrementalProjection: true }, observationKey: String(latest.id),
             allowAccountMutation: !v1Authoritative,
-          });
+          }));
         } else if (credentialBindingId) {
-          invalidateCurrentCredentialWithoutCurrentBindingObservation(accountId, credentialBindingId, updatedAt);
+          (await invalidateCurrentCredentialWithoutCurrentBindingObservation(accountId, credentialBindingId, updatedAt));
         }
-        if (subjectHash) insertIdentity.run(
+        if (subjectHash) (await insertIdentity.run(
           stableId("legacy-identity", accountId, subjectHash), accountId, subjectHash, String(credential.source || "legacy-v1"),
           createdAt, updatedAt, JSON.stringify({ importedFrom: "v1-shadow", credentialEmail: credential.email || "" }),
-        );
+        ));
         if (deactivationLocked) {
-          insertEvent.run(
+          (await insertEvent.run(
             stableId("event-deactivation", accountId, deactivatedAt || "locked"), accountId, null, "account_deactivated",
             deactivatedAt, "v1-shadow-import", JSON.stringify({ immutable: true, timePending: !deactivatedAt }), now,
-          );
+          ));
         }
-        const persistedLock = db.prepare("SELECT deactivation_locked,deactivated_at FROM gpt_accounts WHERE id=?").get(accountId) as any;
+        const persistedLock = (await db.prepare("SELECT deactivation_locked,deactivated_at FROM gpt_accounts WHERE id=?").get(accountId)) as any;
         if (persistedLock?.deactivation_locked) {
-          freezeAccountTransition(accountId, "legacy_migration_preserved_lock", "v2-offline-migration", String(persistedLock.deactivated_at || ""));
+          (await freezeAccountTransition(accountId, "legacy_migration_preserved_lock", "v2-offline-migration", String(persistedLock.deactivated_at || "")));
         }
       }
 
@@ -984,10 +984,10 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         updated_at=excluded.updated_at`);
       for (const job of paymentExposureJobBackups) {
         if (!graph.groups.has(job.accountId)) continue;
-        restorePaymentExposureJob.run(
+        (await restorePaymentExposureJob.run(
           job.jobId, job.accountId, job.routeKey, job.target, job.ipCountry, job.billingCountry, job.billingCurrency,
           job.jobKind, job.accessTokenFingerprint, job.scheduledAt, job.status, job.lastError, job.startedAt, job.finishedAt, job.createdAt || now, job.updatedAt || now,
-        );
+        ));
       }
 
       const findPaymentExposureByLogicalKey = db.prepare(`SELECT id FROM payment_exposure_checks
@@ -1006,10 +1006,10 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
       for (const backup of paymentExposureBackups) {
         const accountId = resolveProjectionAccount(backup);
         if (!accountId) continue;
-        const logical = findPaymentExposureByLogicalKey.get(
+        const logical = (await findPaymentExposureByLogicalKey.get(
           accountId, backup.target, backup.ipCountry, backup.billingCountry, backup.billingCurrency,
-        ) as any;
-        const byId = findPaymentExposureById.get(backup.id) as any;
+        )) as any;
+        const byId = (await findPaymentExposureById.get(backup.id)) as any;
         const existingId = String(logical?.id || byId?.id || "");
         const values = [
           accountId, backup.target, backup.ipCountry, backup.billingCountry, backup.billingCurrency, backup.expectedMethod,
@@ -1017,12 +1017,12 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
           backup.checkoutType, backup.detail, backup.promoEligible, backup.promoCampaign, backup.observedAt, backup.source,
           backup.createdAt || now, backup.updatedAt || now,
         ];
-        if (existingId) updatePaymentExposure.run(...values, existingId);
-        else insertPaymentExposure.run(backup.id, ...values);
+        if (existingId) (await updatePaymentExposure.run(...values, existingId));
+        else (await insertPaymentExposure.run(backup.id, ...values));
         paymentExposureRestoredCount += 1;
       }
 
-      if (promoEligibilityTableExists()) {
+      if ((await promoEligibilityTableExists())) {
         const insertPromoEligibility = db.prepare(`INSERT INTO promo_eligibility_checks(
           id, account_id, access_token_fingerprint, check_kind, status, eligible, campaign, evidence,
           method, endpoint, upstream_status, duration_ms, error, scheduled_at, checked_at, created_at
@@ -1033,11 +1033,11 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         for (const backup of promoEligibilityBackups) {
           const accountId = resolveProjectionAccount(backup);
           if (!accountId) continue;
-          insertPromoEligibility.run(
+          (await insertPromoEligibility.run(
             backup.id, accountId, backup.accessTokenFingerprint, backup.checkKind, backup.status, backup.eligible,
             backup.campaign, backup.evidence, backup.method, backup.endpoint, backup.upstreamStatus, backup.durationMs,
             backup.error, backup.scheduledAt, backup.checkedAt, backup.createdAt || now,
-          );
+          ));
           promoEligibilityRestoredCount += 1;
         }
       }
@@ -1046,29 +1046,29 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const candidate = records.find((record) => conflict.recordIds.includes(record.id));
         const candidateEmail = normalizeEmail(candidate?.email || candidate?.login);
         const candidateAccounts = [...new Set(conflict.recordIds.map((id) => graph.accountIdByLegacyId.get(id)).filter(Boolean))] as string[];
-        insertReview.run(
+        (await insertReview.run(
           stableId("legacy-association-conflict", ...conflict.recordIds.sort()), "legacy_association_conflict", candidateAccounts[0] || null,
           encryptSecret(candidateEmail), candidateEmail ? emailHash(candidateEmail) : stableId("legacy-conflict-email", ...conflict.recordIds),
           conflict.reason, JSON.stringify({ recordIds: conflict.recordIds, candidateAccountIds: candidateAccounts, localPart: conflict.localPart }), now, now,
-        );
+        ));
       }
 
-      const duplicateEmails = v1Authoritative ? [] : db.prepare(`SELECT email_hash, GROUP_CONCAT(DISTINCT account_id) AS account_ids
-        FROM email_bindings GROUP BY email_hash HAVING COUNT(DISTINCT account_id)>1`).all() as Array<{ email_hash: string; account_ids: string }>;
+      const duplicateEmails = v1Authoritative ? [] : (await db.prepare(`SELECT email_hash, GROUP_CONCAT(DISTINCT account_id) AS account_ids
+        FROM email_bindings GROUP BY email_hash HAVING COUNT(DISTINCT account_id)>1`).all()) as Array<{ email_hash: string; account_ids: string }>;
       for (const duplicate of duplicateEmails) {
         const accountIds = String(duplicate.account_ids || "").split(",").filter(Boolean);
-        const sample = db.prepare("SELECT email_enc FROM email_bindings WHERE email_hash=? LIMIT 1").get(duplicate.email_hash) as any;
+        const sample = (await db.prepare("SELECT email_enc FROM email_bindings WHERE email_hash=? LIMIT 1").get(duplicate.email_hash)) as any;
         for (const duplicateAccountId of accountIds) {
-          const account = db.prepare("SELECT source_status, deactivation_locked FROM gpt_accounts WHERE id=?").get(duplicateAccountId) as any;
+          const account = (await db.prepare("SELECT source_status, deactivation_locked FROM gpt_accounts WHERE id=?").get(duplicateAccountId)) as any;
           if (String(account?.source_status) === "recovered" && !Number(account?.deactivation_locked)) {
-            db.prepare(`UPDATE gpt_accounts SET lifecycle_status='retired', retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,
-              quarantined_at='', quarantine_reason='', updated_at=? WHERE id=?`).run(now, now, duplicateAccountId);
+            (await db.prepare(`UPDATE gpt_accounts SET lifecycle_status='retired', retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END,
+              quarantined_at='', quarantine_reason='', updated_at=? WHERE id=?`).run(now, now, duplicateAccountId));
           }
-          insertReview.run(
+          (await insertReview.run(
             stableId("legacy-duplicate-email", duplicate.email_hash, duplicateAccountId), "legacy_duplicate_email", duplicateAccountId,
             String(sample?.email_enc || ""), duplicate.email_hash, "同一邮箱存在多条历史身份链；保持分离，等待结合回收关系和OpenAI身份时间线核对",
             JSON.stringify({ candidateAccountIds: accountIds, automaticQuarantine: false }), now, now,
-          );
+          ));
         }
       }
 
@@ -1084,10 +1084,10 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const previousBindingId = bindingIdByLegacyId.get(pair.previousId);
         const nextBindingId = bindingIdByLegacyId.get(pair.nextId);
         if (!previousBindingId || !nextBindingId) continue;
-        insertBindingTransition.run(
+        (await insertBindingTransition.run(
           stableId("relation-rebind", pair.previousId, pair.nextId), accountId, previousBindingId, nextBindingId,
           iso(pair.changedAt, now), pair.method, JSON.stringify({ ruleVersion: 2, source: "v1-incremental" }), now,
-        );
+        ));
       }
       const seenRecycle = new Set<string>();
       for (const record of records) {
@@ -1102,10 +1102,10 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
         const key = `${fromAccountId}:${toAccountId}`;
         if (seenRecycle.has(key)) continue;
         seenRecycle.add(key);
-        insertRelation.run(
+        (await insertRelation.run(
           stableId("relation-recycle", fromAccountId, toAccountId), "mailbox_recycle", fromAccountId, toAccountId,
           iso(record.retiredAt || record.updatedAt, now), "legacy_recycle_chain", JSON.stringify({ leftId, rightId }), "confirmed", now,
-        );
+        ));
       }
 
       const insertMessage = db.prepare(`INSERT INTO mail_messages(
@@ -1159,55 +1159,57 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
             .sort((left, right) => Math.abs(left.changedMs - receivedMs) - Math.abs(right.changedMs - receivedMs))[0] : null;
           const claimAccountId = taskWindow?.accountId || accountId;
           const claimBindingId = taskWindow?.bindingId || bindingId;
-          insertMessage.run(
+          (await insertMessage.run(
             messageId, provider, providerMessageId, String(mail.from || mail.source || ""), encryptSecret(String(mail.to || "")),
             String(mail.subject || "(无主题)"), receivedAt, String(mail.folder || "inbox"),
             classification.category, classification.isSecurity ? 1 : 0,
             JSON.stringify({ legacyAddress: Boolean(mail.address), source: "v1-mail-index", ...(classification.category === "rebind" ? { rebindNotification: true } : {}) }), now,
-          );
-          insertClaim.run(
+          ));
+          (await insertClaim.run(
             messageId, claimAccountId, claimBindingId,
             taskWindow ? "explicit_rebind_task_window" : "legacy_mapping_index",
             taskWindow ? 1.25 : 1,
             taskWindow ? "邮件时间与明确换绑任务窗口一致，归属于被换绑的GPT身份" : "V1 indexed this message for the mapping",
             1, now,
-          );
+          ));
           if (classification.category === "rebind") {
-            insertEvent.run(
+            (await insertEvent.run(
               stableId("event-email-rebind-notice", messageId), claimAccountId, claimBindingId, "email_rebind_notice_detected",
               receivedAt || now, "v1-mail-index", JSON.stringify({ messageId, legacyId, subject: String(mail.subject || ""), taskMatched: Boolean(taskWindow) }), now,
-            );
+            ));
           }
         }
       }
 
-      db.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0
+      (await db.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0
         WHERE message_id IN (
-          SELECT message_id FROM mail_ownership_claims GROUP BY message_id
-          HAVING count(DISTINCT account_id)>1
-            AND SUM(CASE WHEN claim_type<>'legacy_mapping_index' THEN 1 ELSE 0 END)>0
-        )`).run();
+          SELECT message_id FROM (
+            SELECT message_id FROM mail_ownership_claims GROUP BY message_id
+            HAVING count(DISTINCT account_id)>1
+              AND SUM(CASE WHEN claim_type<>'legacy_mapping_index' THEN 1 ELSE 0 END)>0
+          ) AS ambiguous_claims
+        )`).run());
 
-      db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('v1_source_hash', ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(sourceHash, now);
-      db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('v1_source_count', ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(String(currentRecords.length), now);
+      (await db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('v1_source_hash', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(sourceHash, now));
+      (await db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('v1_source_count', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(String(currentRecords.length), now));
     });
 
-    transaction();
-    const counts = db.prepare(`SELECT
+    (await transaction());
+    const counts = (await db.prepare(`SELECT
       (SELECT COUNT(*) FROM gpt_accounts) AS accounts,
       (SELECT COUNT(*) FROM email_bindings) AS bindings,
       (SELECT COUNT(*) FROM account_relations) AS relations,
       (SELECT COUNT(*) FROM gpt_accounts WHERE source_status='recovered') AS recovered,
       (SELECT COUNT(*) FROM routing_endpoints) AS routing,
-      (SELECT COUNT(*) FROM mail_messages) AS messages`).get() as any;
+      (SELECT COUNT(*) FROM mail_messages) AS messages`).get()) as any;
     const finishedAt = new Date().toISOString();
-    db.prepare(`UPDATE shadow_sync_runs SET finished_at=?, source_hash=?, source_count=?, account_count=?, binding_count=?,
+    (await db.prepare(`UPDATE shadow_sync_runs SET finished_at=?, source_hash=?, source_count=?, account_count=?, binding_count=?,
       relation_count=?, recovered_count=?, status='ok', detail_json=? WHERE id=?`).run(
       finishedAt, sourceHash, currentRecords.length, counts.accounts, counts.bindings, counts.relations, counts.recovered,
       JSON.stringify({ routingCount: counts.routing, messageCount: counts.messages }), runId,
-    );
+    ));
     return {
       runId,
       sourceCount: currentRecords.length,
@@ -1222,8 +1224,8 @@ export function syncFromV1(options: { legacyAuthoritative?: boolean } = {}): Syn
       sourceHash,
     };
   } catch (error) {
-    db.prepare("UPDATE shadow_sync_runs SET finished_at=?, status='error', detail_json=? WHERE id=?")
-      .run(new Date().toISOString(), JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), runId);
+    (await db.prepare("UPDATE shadow_sync_runs SET finished_at=?, status='error', detail_json=? WHERE id=?")
+      .run(new Date().toISOString(), JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), runId));
     throw error;
   }
 }

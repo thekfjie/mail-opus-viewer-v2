@@ -87,13 +87,13 @@ test("多账号单 route 只创建一个远程批次并按 tokenHash 分别映�
     import("../src/server/repository.js"),
     import("../src/server/payment-exposure.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  repository.importAccounts([
+  (await repository.importAccounts([
     { email: "batch-a@icloud.com", accessToken: tokens[0], openaiSubject: "batch-subject-a", plan: "free" },
     { email: "batch-b@icloud.com", accessToken: tokens[1], openaiSubject: "batch-subject-b", plan: "free" },
-  ]);
-  const accounts = repository.listAccounts({ limit: 10 }).results;
+  ]));
+  const accounts = (await repository.listAccounts({ limit: 10 })).results;
   const byEmail = new Map(accounts.map((account) => [account.primaryEmail, account]));
   const accountA = byEmail.get("batch-a@icloud.com")!;
   const accountB = byEmail.get("batch-b@icloud.com")!;
@@ -109,7 +109,7 @@ test("多账号单 route 只创建一个远程批次并按 tokenHash 分别映�
   assert.equal(started.started, 2);
   assert.equal(new Set(started.jobAccounts.map((item) => item.jobId)).size, 2);
 
-  const rows = db.prepare("SELECT job_id,remote_job_id,promo_mode FROM payment_exposure_jobs ORDER BY account_id").all() as any[];
+  const rows = (await db.prepare("SELECT job_id,remote_job_id,promo_mode FROM payment_exposure_jobs ORDER BY account_id").all()) as any[];
   assert.equal(rows.length, 2);
   assert.equal(new Set(rows.map((row) => row.remote_job_id)).size, 1);
   assert.equal(rows[0].remote_job_id, "shared-remote-batch");
@@ -120,8 +120,8 @@ test("多账号单 route 只创建一个远程批次并按 tokenHash 分别映�
   const completed = await paymentExposure.getPaymentExposureBatchStatus(started.jobAccounts);
   assert.equal(reads, 1);
   assert.deepEqual(completed.map((job) => job.status), ["completed", "completed"]);
-  const savedA = repository.listPaymentExposureChecks(accountA.id)[0];
-  const savedB = repository.listPaymentExposureChecks(accountB.id)[0];
+  const savedA = (await repository.listPaymentExposureChecks(accountA.id))[0];
+  const savedB = (await repository.listPaymentExposureChecks(accountB.id))[0];
   assert.equal(savedA.detail, "account-a");
   assert.deepEqual(savedA.availableMethods, ["card"]);
   assert.equal(savedB.detail, "account-b");
@@ -132,36 +132,36 @@ test("多账号单 route 只创建一个远程批次并按 tokenHash 分别映�
   assert.equal(savedA.checkoutType, "local_extractor");
   assert.equal(savedB.paymentMethods[0]?.promoMode, "one_month");
 
-  repository.savePaymentEligibilityObservation(accountA.id, {
+  (await repository.savePaymentEligibilityObservation(accountA.id, {
     target: "momo", ipCountry: "VN", billingCountry: "VN", billingCurrency: "VND",
     eligible: true, reason: "second-source", source: "local_extractor",
     availableMethods: ["apple_pay"], matchedMethods: ["apple_pay"],
     paymentMethods: [{ id: "", type: "card", provider: "", name: "", code: "", displayName: "", source: "oaics" }],
     promoMode: "one_month",
-  });
-  const mergedA = repository.listPaymentExposureChecks(accountA.id)[0];
+  }));
+  const mergedA = (await repository.listPaymentExposureChecks(accountA.id))[0];
   assert.deepEqual(mergedA.availableMethods, ["card", "apple_pay"]);
   assert.deepEqual(mergedA.matchedMethods, ["card", "apple_pay"]);
   assert.deepEqual(mergedA.paymentMethods.find((method) => method.type === "card" && method.promoMode === "one_month")?.sources, ["oaics"]);
   assert.equal(mergedA.paymentMethods.filter((method) => method.type === "card").length, 2);
 
-  repository.savePaymentEligibilityObservation(accountA.id, {
+  (await repository.savePaymentEligibilityObservation(accountA.id, {
     target: "momo", ipCountry: "VN", billingCountry: "VN", billingCurrency: "VND",
     eligible: true, reason: "without-promo", source: "local_extractor", promoMode: "none",
     availableMethods: ["card"], matchedMethods: ["card"],
     paymentMethods: [{ id: "", type: "card", provider: "", name: "", code: "", displayName: "", source: "checkout" }],
-  });
-  const comparedA = repository.listPaymentExposureChecks(accountA.id)[0];
+  }));
+  const comparedA = (await repository.listPaymentExposureChecks(accountA.id))[0];
   assert.deepEqual(comparedA.paymentMethods.filter((method) => method.type === "card").map((method) => method.promoMode).sort(), ["none", "one_month"]);
   assert.equal(comparedA.promoMode, "one_month", "1 month 证据优先级高于后续无优惠探查");
 
-  const stale = repository.createPaymentExposureJob({
+  const stale = (await repository.createPaymentExposureJob({
     jobId: "dispatch:stale-fixture", remoteJobId: "dispatch:stale-fixture", accountId: accountA.id,
     routeKey: "vn_momo", target: "momo", ipCountry: "VN", billingCountry: "VN", billingCurrency: "VND",
     status: "dispatching", lastError: "", startedAt: "2026-09-01T00:00:00.000Z", finishedAt: "", createdAt: "2026-09-01T00:00:00.000Z",
-  });
-  db.prepare("UPDATE payment_exposure_jobs SET updated_at=? WHERE job_id=?").run("2026-09-01T00:00:00.000Z", stale.jobId);
+  }));
+  (await db.prepare("UPDATE payment_exposure_jobs SET updated_at=? WHERE job_id=?").run("2026-09-01T00:00:00.000Z", stale.jobId));
   const staleResult = await paymentExposure.refreshPendingPaymentExposureJobs();
   assert.deepEqual(staleResult, { checked: 1, completed: 0, failed: 1, active: 0 });
-  assert.equal(repository.getPaymentExposureJob(accountA.id, stale.jobId)?.status, "failed");
+  assert.equal((await repository.getPaymentExposureJob(accountA.id, stale.jobId))?.status, "failed");
 });

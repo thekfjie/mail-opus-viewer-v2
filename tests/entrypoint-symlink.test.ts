@@ -5,18 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import test, { type TestContext } from "node:test";
 
 const repository = fileURLToPath(new URL("../", import.meta.url));
 const tsxLoader = import.meta.resolve("tsx");
 
-async function waitFor<T>(child: ChildProcessWithoutNullStreams, inspect: () => T | undefined, output: () => string): Promise<T> {
+async function waitFor<T>(child: ChildProcessWithoutNullStreams, inspect: () => T | undefined | Promise<T | undefined>, output: () => string): Promise<T> {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     assert.equal(child.exitCode, null, `entrypoint exited before readiness: ${output()}`);
     assert.equal(child.signalCode, null, `entrypoint was signalled before readiness: ${output()}`);
-    const result = inspect();
+    const result = await inspect();
     if (result !== undefined) return result;
     await delay(50);
   }
@@ -47,7 +47,8 @@ globalThis.fetch = async () => {
       LANG: "C.UTF-8",
       HOME: directory,
       TMPDIR: directory,
-      NODE_ENV: "production",
+      NODE_ENV: "test",
+      OPUS_SQLITE_TEST: "1",
       ENV_FILE: "/dev/null",
       PROJECT_ROOT: directory,
       DATABASE_PATH: database,
@@ -96,14 +97,14 @@ test("server entrypoint through release symlink listens and serves independent h
 
 test("worker entrypoint through release symlink writes a read-only heartbeat and stays running", { timeout: 20_000 }, async (t) => {
   const running = launch(t, "worker");
-  const heartbeat = await waitFor(running.child, () => {
+  const heartbeat = await waitFor(running.child, async () => {
     if (!fs.existsSync(running.database)) return undefined;
     const database = new Database(running.database, { readonly: true, fileMustExist: true, timeout: 100 });
     try {
       database.pragma("query_only = ON");
-      if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_heartbeats'").get()) return undefined;
-      return database.prepare("SELECT process_id,status,detail_json FROM worker_heartbeats WHERE worker_name='native-sync-worker'").get() as any;
-    } finally { database.close(); }
+      if (!(await database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_heartbeats'").get())) return undefined;
+      return (await database.prepare("SELECT process_id,status,detail_json FROM worker_heartbeats WHERE worker_name='native-sync-worker'").get()) as any;
+    } finally { (await database.close()); }
   }, running.output);
   assert.equal(heartbeat.process_id, running.child.pid);
   assert.equal(heartbeat.status, "ok");

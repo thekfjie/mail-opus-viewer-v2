@@ -5,9 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 
-function fixture(root: string) {
+async function fixture(root: string) {
   const v1 = path.join(root, "v1");
   const units = path.join(root, "units");
   fs.mkdirSync(path.join(v1, "backups", "old"), { recursive: true });
@@ -36,19 +36,19 @@ function fixture(root: string) {
   const database = path.join(root, "source.sqlite");
   const connection = new Database(database);
   connection.pragma("journal_mode=WAL");
-  connection.exec("CREATE TABLE accounts(id INTEGER PRIMARY KEY); INSERT INTO accounts VALUES(1)");
+  (await connection.exec("CREATE TABLE accounts(id INTEGER PRIMARY KEY); INSERT INTO accounts VALUES(1)"));
   const destination = path.join(root, "backup");
   const args = ["scripts/production-backup.mjs", "--destination", destination, "--database", database,
     "--v1-root", v1, "--systemd-root", units, "--nginx-file", nginx[0], "--nginx-file", nginx[1], "--env-file", environment];
   return { body, secret, v1, connection, database, destination, args };
 }
 
-test("production backup uses a read-only consistent SQLite copy and protected sanitized snapshots", () => {
+test("production backup uses a read-only consistent SQLite copy and protected sanitized snapshots", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "v2-production-backup-"));
-  const input = fixture(root);
+  const input = (await fixture(root));
   try {
     const sourceBefore = fs.readFileSync(path.join(input.v1, "mail-index-cache.json"));
-    input.connection.prepare("INSERT INTO accounts VALUES(2)").run();
+    (await input.connection.prepare("INSERT INTO accounts VALUES(2)").run());
     const command = spawnSync(process.execPath, input.args, { encoding: "utf8" });
     assert.equal(command.status, 0, command.stderr);
     assert.equal(command.stdout.includes(input.secret), false);
@@ -61,8 +61,8 @@ test("production backup uses a read-only consistent SQLite copy and protected sa
     assert.equal(summary.manifestSha256, crypto.createHash("sha256").update(manifestBytes).digest("hex"));
     const manifest = JSON.parse(manifestBytes.toString());
     const snapshot = new Database(path.join(input.destination, "protected/v2/mail-opus-v2.sqlite"), { readonly: true });
-    assert.deepEqual(snapshot.prepare("SELECT id FROM accounts ORDER BY id").all(), [{ id: 1 }, { id: 2 }]);
-    snapshot.close();
+    assert.deepEqual((await snapshot.prepare("SELECT id FROM accounts ORDER BY id").all()), [{ id: 1 }, { id: 2 }]);
+    (await snapshot.close());
     for (const entry of manifest.files) {
       const bytes = fs.readFileSync(path.join(input.destination, entry.path));
       assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), entry.sha256);
@@ -84,12 +84,12 @@ test("production backup uses a read-only consistent SQLite copy and protected sa
     assert.equal(repeated.status, 1);
     assert.equal(JSON.parse(repeated.stderr).code, "DESTINATION_ALREADY_EXISTS");
     assert.equal(fs.existsSync(path.join(input.destination, "INCOMPLETE")), false);
-  } finally { input.connection.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { (await input.connection.close()); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("backup failures mark partial artifacts and never print source JSON or credentials", () => {
+test("backup failures mark partial artifacts and never print source JSON or credentials", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "v2-production-backup-failure-"));
-  const input = fixture(root);
+  const input = (await fixture(root));
   try {
     fs.writeFileSync(path.join(input.v1, "access-config.json"), `${input.secret} ${input.body}`);
     const command = spawnSync(process.execPath, input.args, { encoding: "utf8" });
@@ -99,19 +99,19 @@ test("backup failures mark partial artifacts and never print source JSON or cred
     assert.equal(fs.existsSync(path.join(input.destination, "INCOMPLETE")), true);
     assert.equal(fs.existsSync(path.join(input.destination, "manifest.json")), false);
     assert.equal(fs.statSync(path.join(input.destination, "INCOMPLETE")).mode & 0o777, 0o600);
-  } finally { input.connection.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { (await input.connection.close()); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("backup rejects a source snapshot with foreign key violations", () => {
+test("backup rejects a source snapshot with foreign key violations", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "v2-production-backup-fk-"));
-  const input = fixture(root);
+  const input = (await fixture(root));
   try {
     input.connection.pragma("foreign_keys=OFF");
-    input.connection.exec("CREATE TABLE grants(account_id INTEGER REFERENCES accounts(id)); INSERT INTO grants VALUES(999)");
+    (await input.connection.exec("CREATE TABLE grants(account_id INTEGER REFERENCES accounts(id)); INSERT INTO grants VALUES(999)"));
     const command = spawnSync(process.execPath, input.args, { encoding: "utf8" });
     assert.equal(command.status, 1);
     assert.equal(JSON.parse(command.stderr).code, "SQLITE_FOREIGN_KEYS_FAILED");
     assert.equal(fs.existsSync(path.join(input.destination, "INCOMPLETE")), true);
     assert.equal(fs.existsSync(path.join(input.destination, "manifest.json")), false);
-  } finally { input.connection.close(); fs.rmSync(root, { recursive: true, force: true }); }
+  } finally { (await input.connection.close()); fs.rmSync(root, { recursive: true, force: true }); }
 });

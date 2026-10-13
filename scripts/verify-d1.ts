@@ -12,7 +12,7 @@ fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
 const database = new Database(filename);
 fs.chmodSync(filename, 0o600);
 database.pragma("busy_timeout = 30000");
-applyMailIngestionSchema(database);
+(await applyMailIngestionSchema(database));
 if (process.stdin.isTTY && spawnSync("stty", ["-echo"], { stdio: "inherit" }).status !== 0) {
   database.close();
   throw new Error("Cannot disable credential input echo");

@@ -19,10 +19,16 @@
     "backup": "node dist/server/server/backup.js",
     "migrate:v1": "tsx src/server/migrate-v1.ts",
     "audit": "tsx scripts/audit-production.ts",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "OPUS_SQLITE_TEST=1 ENV_FILE=/dev/null node --import tsx --test --test-concurrency=4 tests/*.test.ts",
     "test:offline": "node scripts/test-offline.mjs",
     "validate:mailbox-batch-copy": "tsx scripts/validate-mailbox-batch-copy.ts",
-    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc --noEmit"
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc --noEmit",
+    "test:integration": "node --import tsx --test tests/integration/*.test.ts && node --import tsx scripts/test-mysql-contracts.ts",
+    "db:migrate": "node --import tsx src/server/storage/migrate.ts",
+    "db:import-sqlite": "node --import tsx src/server/storage/import-sqlite.ts",
+    "backup:sqlite-legacy": "node --import tsx src/server/storage/backup-legacy-sqlite.ts",
+    "benchmark": "node scripts/benchmark.mjs",
+    "benchmark:fixture": "node --import tsx scripts/benchmark-fixture.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
@@ -31,8 +37,10 @@
     "fastify": "^5.5.0",
     "lucide-react": "^0.468.0",
     "mailparser": "^3.9.20",
+    "mysql2": "^3.24.5",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "redis": "^6.3.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

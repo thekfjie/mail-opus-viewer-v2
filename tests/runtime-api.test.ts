@@ -1,3 +1,4 @@
+import { databaseSnapshot } from "./helpers/database-snapshot.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -20,7 +21,7 @@ test("independent HTTP customer and automation contracts use local state and exa
     import("../src/server/compatibility-state.js"),
   ]);
   const app = await buildApp();
-  t.after(async () => { await app.close(); db.close(); fs.rmSync(directory, { recursive: true }); });
+  t.after(async () => { await app.close(); (await db.close()); fs.rmSync(directory, { recursive: true }); });
   assert.equal(app.server.listening, false);
   const health = await app.inject("/health");
   assert.equal(health.json().independent, true);
@@ -36,7 +37,7 @@ test("independent HTTP customer and automation contracts use local state and exa
     payload: { email: "pending@icloud.com", note: compatibility.SIGNUP_NOTE } });
   assert.equal(pending.statusCode, 201);
   assert.equal(pending.json().temporary, true);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get() as any).n, 0);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get()) as any).n, 0);
   const pendingList = await app.inject({ url: "/api/admin/mappings?view=openai-retry", headers: { cookie: adminCookie } });
   assert.equal(pendingList.json().results[0].email, "pending@icloud.com");
   const cleanup = await app.inject({ method: "POST", url: "/api/v1/accounts/cleanup", headers: importHeaders,
@@ -51,8 +52,8 @@ test("independent HTTP customer and automation contracts use local state and exa
   assert.equal(oauth.json().accessToken, "fake-access-token");
   assert.equal(oauth.headers["cache-control"], "no-store");
   assert.equal((await app.inject({ url: "/api/admin/mappings/" + accountId + "/oauth", headers: { cookie: adminCookie, origin: "https://evil.test" } })).statusCode, 403);
-  const binding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(accountId) as any;
-  const grant = repository.createCustomerGrant(accountId, binding.id, { password: "fake-customer-password" });
+  const binding = (await db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(accountId)) as any;
+  const grant = (await repository.createCustomerGrant(accountId, binding.id, { password: "fake-customer-password" }));
   const preset = await app.inject("/api/preset?m=" + encodeURIComponent(grant.publicToken));
   assert.equal(preset.json().password, "fake-customer-password");
   assert.equal(preset.body.includes("fake-access-token"), false);
@@ -62,11 +63,11 @@ test("independent HTTP customer and automation contracts use local state and exa
   const customerCookie = login.cookies.map((item) => item.name + "=" + item.value).join("; ");
   assert.equal((await app.inject({ url: "/api/admin/mappings", headers: { cookie: customerCookie } })).statusCode, 401);
   const now = new Date(Date.now() + 1000).toISOString();
-  db.prepare(`INSERT INTO mail_messages(id,provider,provider_message_id,sender,recipient_enc,subject,received_at,category,is_security,indexed_at)
+  (await db.prepare(`INSERT INTO mail_messages(id,provider,provider_message_id,sender,recipient_enc,subject,received_at,category,is_security,indexed_at)
     VALUES('message-1','shared-mail-api','77','OpenAI',?,'Login code',?,'security',1,?)`)
-    .run(crypto.encryptSecret("route-internal@example.test"), now, now);
-  db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,reason,visible_to_customer,created_at)
-    VALUES('message-1',?,?,'exact','offline fixture',1,?)`).run(accountId, binding.id, now);
+    .run(crypto.encryptSecret("route-internal@example.test"), now, now));
+  (await db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,reason,visible_to_customer,created_at)
+    VALUES('message-1',?,?,'exact','offline fixture',1,?)`).run(accountId, binding.id, now));
   let bodyReads = 0;
   const canary = "BODY-CANARY-RUNTIME-92415";
   t.mock.method(upstream.sharedMailReader, "byId", async (id: string) => {
@@ -89,14 +90,14 @@ test("independent HTTP customer and automation contracts use local state and exa
   assert.equal(bodyReads, 1);
   await app.inject({ url: "/api/mail-detail?id=message-1", headers: { cookie: customerCookie } });
   assert.equal(bodyReads, 2);
-  db.prepare("UPDATE access_grants SET visible_to=? WHERE id=?").run(now, grant.grantId);
+  (await db.prepare("UPDATE access_grants SET visible_to=? WHERE id=?").run(now, grant.grantId));
   assert.equal((await app.inject({ url: "/api/mail-detail?id=message-1", headers: { cookie: customerCookie } })).statusCode, 404);
   assert.equal(bodyReads, 2);
-  assert.equal(db.serialize().includes(Buffer.from(canary)), false);
+  assert.equal((await databaseSnapshot(db)).includes(canary), false);
   const changed = await app.inject({ method: "POST", url: "/api/change-password", headers: { cookie: customerCookie }, payload: { password: "changed-customer-password" } });
   assert.equal(changed.statusCode, 200, changed.body);
-  assert.equal(repository.authenticateCustomer("customer@icloud.com", "fake-customer-password"), null);
-  assert.ok(repository.authenticateCustomer("customer@icloud.com", "changed-customer-password"));
+  assert.equal((await repository.authenticateCustomer("customer@icloud.com", "fake-customer-password")), null);
+  assert.ok((await repository.authenticateCustomer("customer@icloud.com", "changed-customer-password")));
   const root = await app.inject("/");
   assert.equal(root.body.includes("/customer.js"), true);
   assert.match(String(root.headers["content-security-policy"]), /img-src 'self' data: https:/);
@@ -117,7 +118,7 @@ test("independent HTTP customer and automation contracts use local state and exa
     payload: { id: 99, to: "registration@icloud.com", from: "noreply@openai.com", subject: "Your temporary ChatGPT code",
       created_at: pendingAt, parsedText: "Your code is 987654 " + canary } });
   assert.equal(pendingMessage.statusCode, 200, pendingMessage.body);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get() as any).n, 1);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM gpt_accounts").get()) as any).n, 1);
   let pendingReads = 0;
   t.mock.method(upstream.sharedMailReader, "byId", async (id: string) => {
     pendingReads += 1; assert.equal(id, "99");
@@ -134,16 +135,16 @@ test("independent HTTP customer and automation contracts use local state and exa
   const completeSignup = await app.inject({ method: "POST", url: "/api/v1/accounts", headers: importHeaders,
     payload: { email: "registration@icloud.com", accessToken: "fake-registration-at", openaiSubject: "registration-subject" } });
   assert.equal(completeSignup.statusCode, 201, completeSignup.body);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM pending_mailboxes").get() as any).n, 0);
-  assert.ok(db.prepare(`SELECT 1 FROM mail_ownership_claims c JOIN mail_messages m ON m.id=c.message_id
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM pending_mailboxes").get()) as any).n, 0);
+  assert.ok((await db.prepare(`SELECT 1 FROM mail_ownership_claims c JOIN mail_messages m ON m.id=c.message_id
     WHERE m.provider_message_id=? AND c.account_id=?`)
-    .get(pendingMessage.json().messageId, completeSignup.json().item.id));
+    .get(pendingMessage.json().messageId, completeSignup.json().item.id)));
   const rejectedHook = await app.inject({ method: "POST", url: "/api/v2/internal/mail-events", payload: { raw: canary } });
   assert.equal(rejectedHook.statusCode, 401);
   const hook = await app.inject({ method: "POST", url: "/api/v2/internal/mail-events", headers: { authorization: "Bearer fake-webhook-key" },
     payload: { id: 88, to: "customer@icloud.com", subject: "Notice", created_at: now, parsedText: canary } });
   assert.equal(hook.statusCode, 200, hook.body);
-  assert.equal(db.serialize().includes(Buffer.from(canary)), false);
+  assert.equal((await databaseSnapshot(db)).includes(canary), false);
   const calls: string[] = [];
   const worker = createWorker({
     now: () => Date.now(),

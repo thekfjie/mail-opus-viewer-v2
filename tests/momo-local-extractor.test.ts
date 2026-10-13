@@ -70,15 +70,15 @@ test("MoMo 通过统一的本机无优惠 method 观察并只保存 MoMo 结果"
     import("../src/server/repository.js"),
     import("../src/server/payment-exposure.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  repository.importAccounts([{
+  (await repository.importAccounts([{
     email: "momo-local@icloud.com",
     accessToken: "fake-momo-access-token-for-test",
     openaiSubject: "momo-local-subject",
     plan: "free",
-  }]);
-  const account = repository.listAccounts({ limit: 5 }).results[0];
+  }]));
+  const account = (await repository.listAccounts({ limit: 5 })).results[0];
   const route = paymentExposure.listPaymentExposureRoutes().find((item) => item.key === "vn_momo");
   assert.ok(route?.configured);
 
@@ -106,7 +106,7 @@ test("MoMo 通过统一的本机无优惠 method 观察并只保存 MoMo 结果"
   assert.equal(completed.items[0].paymentExposure[0].checkoutType, "local_extractor");
   assert.equal(JSON.stringify(completed).includes("fake-momo-access-token-for-test"), false);
 
-  const saved = repository.listPaymentExposureChecks(account.id).filter((item) => item.checkoutType === "local_extractor");
+  const saved = (await repository.listPaymentExposureChecks(account.id)).filter((item) => item.checkoutType === "local_extractor");
   assert.equal(saved.length, 1);
   assert.equal(saved[0].target, "momo");
   assert.deepEqual(saved[0].availableMethods, ["card", "momo_wallet"]);

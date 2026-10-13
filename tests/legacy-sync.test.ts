@@ -136,30 +136,30 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
     import("../src/server/legacy-import.js"),
     import("../src/server/sync-outbox.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  const imported = repository.importAccounts([{
+  const imported = (await repository.importAccounts([{
     email: "sync-account@icloud.com",
     plan: "plus",
-  }]);
+  }]));
   assert.equal(imported.created, 1);
-  const accountBefore = repository.listAccounts({ search: "sync-account", limit: 10 }).results[0];
+  const accountBefore = (await repository.listAccounts({ search: "sync-account", limit: 10 })).results[0];
   assert.ok(accountBefore);
-  db.exec(`CREATE TABLE promo_eligibility_checks (
+  (await db.exec(`CREATE TABLE promo_eligibility_checks (
     id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES gpt_accounts(id), access_token_fingerprint TEXT NOT NULL DEFAULT '',
     check_kind TEXT NOT NULL DEFAULT 'manual', status TEXT NOT NULL, eligible INTEGER NOT NULL DEFAULT -1,
     campaign TEXT NOT NULL DEFAULT 'plus-1-month-free', evidence TEXT NOT NULL DEFAULT '', method TEXT NOT NULL DEFAULT 'check_promo',
     endpoint TEXT NOT NULL DEFAULT '/api/tools/chatgpt-promo-check', upstream_status INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', scheduled_at TEXT NOT NULL DEFAULT '',
     checked_at TEXT NOT NULL, created_at TEXT NOT NULL
-  )`);
-  db.prepare(`INSERT INTO promo_eligibility_checks(
+  )`));
+  (await db.prepare(`INSERT INTO promo_eligibility_checks(
     id, account_id, access_token_fingerprint, check_kind, status, eligible, campaign, evidence,
     upstream_status, duration_ms, checked_at, created_at
   ) VALUES(?, ?, ?, 'manual', 'eligible', 1, 'plus-1-month-free', 'fixture eligible_promo_campaigns', 200, 321, ?, ?)`)
-    .run("promo-sync-check", accountBefore.id, "fixture-fingerprint", new Date().toISOString(), new Date().toISOString());
+    .run("promo-sync-check", accountBefore.id, "fixture-fingerprint", new Date().toISOString(), new Date().toISOString()));
   const subjectHash = "legacy-sync-subject-hash";
-  const exposure = repository.ingestPaymentExposureChecks([{
+  const exposure = (await repository.ingestPaymentExposureChecks([{
     email: "sync-account@icloud.com",
     openaiSubjectHash: subjectHash,
     target: "ideal",
@@ -173,13 +173,13 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
     trialStatus: "observed",
     exposed: true,
     status: "complete",
-  }]);
+  }]));
   assert.deepEqual(exposure, { accepted: 1, updated: 0, errors: [] });
-  const sync = syncFromV1({ legacyAuthoritative: true });
+  const sync = (await syncFromV1({ legacyAuthoritative: true }));
   assert.equal(sync.paymentExposureRestoredCount, 1);
   assert.equal(sync.promoEligibilityRestoredCount, 1);
   assert.equal(sync.routingCount, 4);
-  const accountAfter = repository.listAccounts({ search: "sync-account", limit: 10 }).results[0];
+  const accountAfter = (await repository.listAccounts({ search: "sync-account", limit: 10 })).results[0];
   assert.ok(accountAfter);
   assert.equal(accountAfter.plan, "plus");
   assert.equal(accountAfter.accountStateLabel, "Plus 已停用");
@@ -189,34 +189,34 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   assert.equal(accountAfter.billingChannel, "stripe");
   assert.equal(accountAfter.suspectedUnused, true);
   assert.equal(accountAfter.hidePromotion, true);
-  const indexedDeactivation = repository.listAccounts({ search: "indexed-deactivation", limit: 10 }).results[0];
+  const indexedDeactivation = (await repository.listAccounts({ search: "indexed-deactivation", limit: 10 })).results[0];
   assert.ok(indexedDeactivation);
   assert.equal(indexedDeactivation.accountStateLabel, "Free 已停用");
   assert.equal(indexedDeactivation.deactivationLocked, true);
   assert.equal(indexedDeactivation.deactivatedAt, "2026-09-06T19:07:39.000Z");
-  const unreviewed = repository.listAccounts({ search: "unreviewed-free", limit: 10 }).results[0];
+  const unreviewed = (await repository.listAccounts({ search: "unreviewed-free", limit: 10 })).results[0];
   assert.ok(unreviewed);
   assert.equal(unreviewed.plan, "free");
   assert.equal(unreviewed.deactivationLocked, false);
   assert.equal(unreviewed.hasAccessToken, false);
   assert.equal(unreviewed.hasRefreshToken, false);
   assert.equal(unreviewed.suspectedUnused, false);
-  db.prepare(`UPDATE gpt_accounts SET lifecycle_status='quarantined', identity_status='conflict',
-    quarantined_at=?, quarantine_reason='secondary projection conflict' WHERE id=?`).run(new Date().toISOString(), unreviewed.id);
-  db.prepare(`INSERT INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, created_at, updated_at)
+  (await db.prepare(`UPDATE gpt_accounts SET lifecycle_status='quarantined', identity_status='conflict',
+    quarantined_at=?, quarantine_reason='secondary projection conflict' WHERE id=?`).run(new Date().toISOString(), unreviewed.id));
+  (await db.prepare(`INSERT INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, created_at, updated_at)
     VALUES('secondary-review', 'sub2api_rebind', ?, 'candidate', 'secondary projection conflict', ?, ?)`).run(
     unreviewed.id, new Date().toISOString(), new Date().toISOString(),
-  );
-  syncFromV1({ legacyAuthoritative: true });
-  const v1Restored = db.prepare(`SELECT lifecycle_status, identity_status, quarantined_at, quarantine_reason
-    FROM gpt_accounts WHERE id=?`).get(unreviewed.id) as any;
+  ));
+  (await syncFromV1({ legacyAuthoritative: true }));
+  const v1Restored = (await db.prepare(`SELECT lifecycle_status, identity_status, quarantined_at, quarantine_reason
+    FROM gpt_accounts WHERE id=?`).get(unreviewed.id)) as any;
   assert.deepEqual(v1Restored, { lifecycle_status: "active", identity_status: "unknown", quarantined_at: "", quarantine_reason: "" });
-  assert.equal((db.prepare("SELECT count(*) count FROM pending_reviews WHERE status='pending'").get() as any).count, 0);
-  const directional = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
+  assert.equal(((await db.prepare("SELECT count(*) count FROM pending_reviews WHERE status='pending'").get()) as any).count, 0);
+  const directional = (await repository.listAccounts({ search: "directional", limit: 10 })).results[0];
   assert.ok(directional);
   assert.equal(directional.primaryEmail, "directional@kfjie.me");
   assert.equal(directional.hasAccessToken, true);
-  assert.equal(repository.revealCredentials(directional.id)?.accessToken, "new-at-owned-by-new-email");
+  assert.equal((await repository.revealCredentials(directional.id))?.accessToken, "new-at-owned-by-new-email");
   const withoutCurrentCredential = JSON.parse(fs.readFileSync(configFile, "utf8"));
   const previousCurrent = withoutCurrentCredential.find((item: any) => item.id === "direction-new");
   previousCurrent.rebindNextId = "direction-newer";
@@ -234,47 +234,47 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
     updatedAt: "2026-08-29T00:01:00.000Z",
   });
   fs.writeFileSync(configFile, JSON.stringify(withoutCurrentCredential));
-  syncFromV1({ legacyAuthoritative: true });
-  const directionalMissing = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
+  (await syncFromV1({ legacyAuthoritative: true }));
+  const directionalMissing = (await repository.listAccounts({ search: "directional", limit: 10 })).results[0];
   assert.ok(directionalMissing);
   assert.equal(directionalMissing.primaryEmail, "directional@ai-mail.tech");
   assert.equal(directionalMissing.hasAccessToken, false);
   // Manual read/copy returns the newest retained AT even when it is invalid;
   // automated checks still require an alive current credential.
-  assert.equal(repository.revealCredentials(directionalMissing.id)?.accessToken, "new-at-owned-by-new-email");
-  assert.equal(repository.getPaymentExposureCredentials(directionalMissing.id), null);
-  assert.equal((db.prepare(`SELECT cv.validity_status FROM account_current_credentials cc
-    JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(directionalMissing.id) as any).validity_status, "invalid");
+  assert.equal((await repository.revealCredentials(directionalMissing.id))?.accessToken, "new-at-owned-by-new-email");
+  assert.equal((await repository.getPaymentExposureCredentials(directionalMissing.id)), null);
+  assert.equal(((await db.prepare(`SELECT cv.validity_status FROM account_current_credentials cc
+    JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(directionalMissing.id)) as any).validity_status, "invalid");
   const sharedCredential = JSON.parse(fs.readFileSync(configFile, "utf8"));
   sharedCredential.find((item: any) => item.id === "direction-newer").openaiOAuth = { accessToken: "new-at-owned-by-new-email" };
   fs.writeFileSync(configFile, JSON.stringify(sharedCredential));
-  syncFromV1({ legacyAuthoritative: true });
-  const directionalShared = repository.listAccounts({ search: "directional", limit: 10 }).results[0];
+  (await syncFromV1({ legacyAuthoritative: true }));
+  const directionalShared = (await repository.listAccounts({ search: "directional", limit: 10 })).results[0];
   assert.ok(directionalShared);
   assert.equal(directionalShared.hasAccessToken, true);
-  assert.equal(repository.revealCredentials(directionalShared.id)?.accessToken, "new-at-owned-by-new-email");
-  assert.equal((db.prepare("SELECT count(*) count FROM credential_versions WHERE account_id=?").get(directionalShared.id) as any).count, 1);
-  const restored = repository.listAccounts({ search: "restore-current", limit: 10 }).results[0];
+  assert.equal((await repository.revealCredentials(directionalShared.id))?.accessToken, "new-at-owned-by-new-email");
+  assert.equal(((await db.prepare("SELECT count(*) count FROM credential_versions WHERE account_id=?").get(directionalShared.id)) as any).count, 1);
+  const restored = (await repository.listAccounts({ search: "restore-current", limit: 10 })).results[0];
   assert.ok(restored);
   assert.equal(restored.primaryEmail, "restore-current@icloud.com");
-  assert.equal(repository.listAccounts({ search: "transient", limit: 10 }).total, 0);
-  const detail = repository.getAccountDetail(accountAfter.id);
+  assert.equal((await repository.listAccounts({ search: "transient", limit: 10 })).total, 0);
+  const detail = (await repository.getAccountDetail(accountAfter.id));
   assert.ok(detail);
   assert.equal(detail.paymentExposureChecks[0]?.paymentMethods[0]?.id, "cpmt_1togstc6h1nxgoi3wuvey2cj");
   assert.equal(detail.paymentExposureChecks[0]?.trialStatus, "observed");
-  const promoAfterFirstSync = db.prepare("SELECT account_id, campaign, status FROM promo_eligibility_checks WHERE id='promo-sync-check'").get() as any;
+  const promoAfterFirstSync = (await db.prepare("SELECT account_id, campaign, status FROM promo_eligibility_checks WHERE id='promo-sync-check'").get()) as any;
   assert.equal(promoAfterFirstSync.account_id, accountAfter.id);
   assert.equal(promoAfterFirstSync.campaign, "plus-1-month-free");
   assert.equal(promoAfterFirstSync.status, "eligible");
-  repository.createPaymentExposureJob({
+  (await repository.createPaymentExposureJob({
     jobId: "exposure-sync-job", accountId: accountAfter.id, routeKey: "nl_ideal", target: "ideal", ipCountry: "NL",
     billingCountry: "NL", billingCurrency: "EUR", status: "running", lastError: "", startedAt: new Date().toISOString(),
     finishedAt: "", createdAt: new Date().toISOString(),
-  });
-  const secondSync = syncFromV1({ legacyAuthoritative: true });
+  }));
+  const secondSync = (await syncFromV1({ legacyAuthoritative: true }));
   assert.equal(secondSync.paymentExposureRestoredCount, 1);
   assert.equal(secondSync.promoEligibilityRestoredCount, 1);
-  assert.equal(repository.getPaymentExposureJob(accountAfter.id, "exposure-sync-job")?.status, "running");
+  assert.equal((await repository.getPaymentExposureJob(accountAfter.id, "exposure-sync-job"))?.status, "running");
 
   const event = (id: string) => JSON.stringify({
     eventId: id, aggregateType: "mapping_collection", aggregateId: "access-config", aggregateVersion: 1,
@@ -284,13 +284,13 @@ test("V1 影子同步保留账号标记、账号状态和支付检查结果", as
   const first = `${event("outbox-1")}\n`;
   const second = `${event("outbox-2")}\n`;
   fs.writeFileSync(outboxFile, `${first}${second.slice(0, 20)}`);
-  assert.deepEqual(consumeV1Outbox(), { consumed: 1, cursor: Buffer.byteLength(first), reset: false });
+  assert.deepEqual((await consumeV1Outbox()), { consumed: 1, cursor: Buffer.byteLength(first), reset: false });
   fs.appendFileSync(outboxFile, second.slice(20));
-  assert.deepEqual(consumeV1Outbox(), { consumed: 1, cursor: Buffer.byteLength(first + second), reset: false });
-  assert.equal(consumeV1Outbox().consumed, 0);
+  assert.deepEqual((await consumeV1Outbox()), { consumed: 1, cursor: Buffer.byteLength(first + second), reset: false });
+  assert.equal((await consumeV1Outbox()).consumed, 0);
   fs.writeFileSync(outboxFile, `${event("x")}\n`);
-  const replay = consumeV1Outbox();
+  const replay = (await consumeV1Outbox());
   assert.equal(replay.reset, true);
   assert.equal(replay.consumed, 1);
-  assert.equal((db.prepare("SELECT count(*) count FROM change_outbox WHERE source_system='v1'").get() as any).count, 3);
+  assert.equal(((await db.prepare("SELECT count(*) count FROM change_outbox WHERE source_system='v1'").get()) as any).count, 3);
 });

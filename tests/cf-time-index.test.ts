@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import { applyMailIngestionSchema, D1MailReader, MAIL_READ_LIMITS } from "../src/server/cf-mail.js";
 import { verifyD1Index } from "../scripts/verify-d1-index.js";
 
@@ -11,17 +11,17 @@ const options = { accountId: "fake-account", databaseId: "fake-database", readTo
 const definition = "CREATE INDEX idx_raw_mails_created_at ON raw_mails(created_at)";
 const detail = "SEARCH raw_mails USING INDEX idx_raw_mails_created_at (created_at>? AND created_at<?)";
 const response = (rows: unknown[], rowsRead = 0) => new Response(JSON.stringify({ success: true, result: [{ success: true, results: rows, meta: { rows_read: rowsRead } }] }));
-function database(): Database.Database {
+async function database(): Promise<Database> {
   const db = new Database(":memory:");
-  applyMailIngestionSchema(db);
+  (await applyMailIngestionSchema(db));
   return db;
 }
 
 test("time-index verification uses two budgeted fixed read-only queries and the exact backfill plan", async () => {
-  const db = database();
+  const db = (await database());
   const upstream = new Database(":memory:");
-  upstream.exec(`CREATE TABLE raw_mails(id INTEGER PRIMARY KEY, source TEXT, address TEXT, raw TEXT, raw_blob BLOB, created_at TEXT); ${definition};`);
-  upstream.prepare("INSERT INTO raw_mails(id,created_at,raw) VALUES(1,?,?)").run("2026-09-08 00:00:01", "DO-NOT-PERSIST-MAIL-BODY");
+  (await upstream.exec(`CREATE TABLE raw_mails(id INTEGER PRIMARY KEY, source TEXT, address TEXT, raw TEXT, raw_blob BLOB, created_at TEXT); ${definition};`));
+  (await upstream.prepare("INSERT INTO raw_mails(id,created_at,raw) VALUES(1,?,?)").run("2026-09-08 00:00:01", "DO-NOT-PERSIST-MAIL-BODY"));
   const queries: { sql: string; params: unknown[] }[] = [];
   const reader = new D1MailReader(db, { ...options, transport: async (_url, init) => {
     const query = JSON.parse(String(init?.body));
@@ -29,25 +29,25 @@ test("time-index verification uses two budgeted fixed read-only queries and the 
     if (queries.length === 1) {
       assert.equal(query.sql, "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='raw_mails' AND name=? LIMIT 1");
       assert.deepEqual(query.params, [options.timeIndex]);
-      return response(upstream.prepare(query.sql).all(...query.params), 1);
+      return response((await upstream.prepare(query.sql).all(...query.params)), 1);
     }
     if (queries.length === 2) {
       assert.match(query.sql, /^EXPLAIN QUERY PLAN SELECT/);
       assert.match(query.sql, /INDEXED BY "idx_raw_mails_created_at"/);
       assert.match(query.sql, /LIMIT 100$/);
       assert.doesNotMatch(query.sql, /COUNT|OFFSET|PRAGMA/);
-      return response(upstream.prepare(query.sql).all(...query.params));
+      return response((await upstream.prepare(query.sql).all(...query.params)));
     }
     assert.equal(query.sql, queries[1].sql.replace("EXPLAIN QUERY PLAN ", ""));
-    return response(upstream.prepare(query.sql).all(...query.params), 1);
+    return response((await upstream.prepare(query.sql).all(...query.params)), 1);
   } });
   try {
     assert.deepEqual(await reader.verifyTimeIndex(), { verified: true });
-    assert.deepEqual(db.prepare("SELECT COUNT(*) requests, SUM(rows_read) rowsRead FROM mail_read_requests").get(), { requests: 2, rowsRead: 1 });
-    assert.equal((db.prepare("SELECT backfill_at FROM mail_read_control").get() as any).backfill_at, 0);
+    assert.deepEqual((await db.prepare("SELECT COUNT(*) requests, SUM(rows_read) rowsRead FROM mail_read_requests").get()), { requests: 2, rowsRead: 1 });
+    assert.equal(((await db.prepare("SELECT backfill_at FROM mail_read_control").get()) as any).backfill_at, 0);
     assert.equal((await reader.backfill({ from: "2026-09-08T00:00:00Z", to: "2026-09-08T00:01:00Z" })).rows.length, 1);
     assert.equal(db.serialize().includes(Buffer.from("DO-NOT-PERSIST-MAIL-BODY")), false);
-  } finally { upstream.close(); db.close(); }
+  } finally { (await upstream.close()); (await db.close()); }
 });
 
 test("time-index verification rejects absent, partial, expression and non-leading time indexes before EXPLAIN", async () => {
@@ -58,13 +58,13 @@ test("time-index verification rejects absent, partial, expression and non-leadin
     "CREATE INDEX idx_raw_mails_created_at ON other_table(created_at)",
     "CREATE INDEX another_index ON raw_mails(created_at)", `${definition}; SELECT raw FROM raw_mails;`];
   for (const sql of definitions) {
-    const db = database();
+    const db = (await database());
     let calls = 0;
     const reader = new D1MailReader(db, { ...options, transport: async () => { calls += 1; return response(sql === null ? [] : [{ sql }], 1); } });
     try {
       await assert.rejects(reader.verifyTimeIndex(), (error: any) => error.code === "mail_d1_time_index_unverified");
       assert.equal(calls, 1);
-    } finally { db.close(); }
+    } finally { (await db.close()); }
   }
 });
 
@@ -72,7 +72,7 @@ test("time-index verification accepts quoted ordinary columns but rejects scan, 
   for (const plan of [[{ detail }], [{ detail: "SCAN raw_mails USING INDEX idx_raw_mails_created_at" }],
     [{ detail }, { detail: "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY" }], [], [{ detail: "SEARCH raw_mails USING INTEGER PRIMARY KEY (rowid>?)" }],
     [{ detail: "SEARCH raw_mails USING INDEX wrong_index (created_at>?)" }], [{ detail: "SEARCH raw_mails USING INDEX idx_raw_mails_created_at (id>?)" }]]) {
-    const db = database();
+    const db = (await database());
     let calls = 0;
     const reader = new D1MailReader(db, { ...options, transport: async () => {
       calls += 1;
@@ -82,12 +82,12 @@ test("time-index verification accepts quoted ordinary columns but rejects scan, 
       if (plan.length === 1 && plan[0].detail === detail) assert.deepEqual(await reader.verifyTimeIndex(), { verified: true });
       else await assert.rejects(reader.verifyTimeIndex(), (error: any) => error.code === "mail_d1_time_index_plan_unverified");
       assert.equal(calls, 2);
-    } finally { db.close(); }
+    } finally { (await db.close()); }
   }
 });
 
 test("time-index verification rejects identifier injection with zero requests and shares exhausted budgets", async () => {
-  const db = database();
+  const db = (await database());
   let calls = 0;
   const transport: typeof fetch = async () => { calls += 1; return response([{ sql: definition }]); };
   try {
@@ -95,16 +95,16 @@ test("time-index verification rejects identifier injection with zero requests an
       await assert.rejects(new D1MailReader(db, { ...options, timeIndex, transport }).verifyTimeIndex(),
         (error: any) => error.code === "mail_d1_time_index_unverified");
     }
-    db.prepare("INSERT INTO mail_read_requests(id,started_at,rows_read,outcome) VALUES('exhausted',?,?,'ok')")
-      .run(Date.now(), MAIL_READ_LIMITS.maxRowsReadPerDay);
+    (await db.prepare("INSERT INTO mail_read_requests(id,started_at,rows_read,outcome) VALUES('exhausted',?,?,'ok')")
+      .run(Date.now(), MAIL_READ_LIMITS.maxRowsReadPerDay));
     await assert.rejects(new D1MailReader(db, { ...options, transport }).verifyTimeIndex(),
       (error: any) => error.code === "mail_read_budget_exhausted");
     assert.equal(calls, 0);
-  } finally { db.close(); }
+  } finally { (await db.close()); }
 });
 
 test("time-index verification accounts for retries and never records provider errors or credentials", async () => {
-  const db = database();
+  const db = (await database());
   let calls = 0;
   const reader = new D1MailReader(db, { ...options, transport: async () => {
     calls += 1;
@@ -114,10 +114,10 @@ test("time-index verification accounts for retries and never records provider er
   try {
     assert.deepEqual(await reader.verifyTimeIndex(), { verified: true });
     assert.equal(calls, 3);
-    assert.deepEqual(db.prepare("SELECT COUNT(*) requests, SUM(rows_read) rowsRead FROM mail_read_requests").get(), { requests: 3, rowsRead: 1 });
+    assert.deepEqual((await db.prepare("SELECT COUNT(*) requests, SUM(rows_read) rowsRead FROM mail_read_requests").get()), { requests: 3, rowsRead: 1 });
     assert.equal(db.serialize().includes(Buffer.from(options.readToken)), false);
     assert.equal(db.serialize().includes(Buffer.from("PRIVATE-PROVIDER-ERROR")), false);
-  } finally { db.close(); }
+  } finally { (await db.close()); }
 });
 
 test("index verification script requires protected explicit matching configuration and changes only existing budget tables", async () => {
@@ -126,7 +126,7 @@ test("index verification script requires protected explicit matching configurati
   const envFile = path.join(directory, "candidate.env");
   const environment = `DATABASE_PATH=${filename}\nV2_CF_ACCOUNT_ID=${options.accountId}\nV2_CF_D1_DATABASE_ID=${options.databaseId}\nV2_CF_D1_READ_TOKEN=${options.readToken}\nV2_CF_D1_TIME_INDEX=${options.timeIndex}\n`;
   const db = new Database(filename);
-  applyMailIngestionSchema(db);
+  (await applyMailIngestionSchema(db));
   fs.writeFileSync(envFile, environment, { mode: 0o600 });
   let calls = 0;
   const transport: typeof fetch = async () => { calls += 1; return response(calls % 2 ? [{ sql: definition }] : [{ detail }], calls % 2); };
@@ -143,5 +143,5 @@ test("index verification script requires protected explicit matching configurati
     assert.equal((await verifyD1Index(["--env", envFile], transport)).verified, false);
     assert.equal(calls, 2);
     assert.equal(fs.existsSync(filename + ".missing"), false);
-  } finally { db.close(); fs.rmSync(directory, { recursive: true, force: true }); }
+  } finally { (await db.close()); fs.rmSync(directory, { recursive: true, force: true }); }
 });

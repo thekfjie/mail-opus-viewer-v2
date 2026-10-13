@@ -1,3 +1,4 @@
+import { asyncMap } from './async-collections.js';
 import crypto from "node:crypto";
 import { config } from "./config.js";
 import {
@@ -141,12 +142,12 @@ function extractorItemStatus(item: Record<string, unknown>, fallback: string): s
   }
 }
 
-function extractorItemForRecord(job: Record<string, unknown>, record: PaymentExposureJobRecord): {
+async function extractorItemForRecord(job: Record<string, unknown>, record: PaymentExposureJobRecord): Promise<{
   item: Record<string, unknown> | null;
   error: string;
-} {
+}> {
   const items = extractorJobItems(job);
-  const credentials = getPaymentExposureCredentials(record.accountId);
+  const credentials = (await getPaymentExposureCredentials(record.accountId));
   if (credentials?.accessToken
     && (!record.accessTokenFingerprint || credentials.accessTokenFingerprint === record.accessTokenFingerprint)) {
     const tokenHash = extractorTokenHash(credentials.accessToken);
@@ -263,24 +264,24 @@ async function refreshPaymentExtractorJob(record: PaymentExposureJobRecord, supp
       job = response.job;
     }
   } catch (error) {
-    const check = listPaymentExposureChecks(record.accountId).find((item) => item.target === route.target && item.checkoutType === "local_extractor");
+    const check = (await listPaymentExposureChecks(record.accountId)).find((item) => item.target === route.target && item.checkoutType === "local_extractor");
     return publicStatus(record, check, error instanceof Error ? error.message : String(error));
   }
   if (!job) return publicStatus(record, undefined, "本机支付方式提炼服务未返回任务");
   const remoteStatus = extractorJobStatus(job);
-  const mapped = extractorItemForRecord(job, record);
+  const mapped = (await extractorItemForRecord(job, record));
   const itemStatus = mapped.item ? extractorItemStatus(mapped.item, remoteStatus) : remoteStatus;
-  let updated = updatePaymentExposureJob(record.jobId, {
+  let updated = (await updatePaymentExposureJob(record.jobId, {
     status: itemStatus,
     startedAt: timestamp(mapped.item?.startedAt ?? job.startedAt) || record.startedAt,
     finishedAt: timestamp(mapped.item?.finishedAt ?? (itemStatus === remoteStatus ? job.finishedAt : "")) || record.finishedAt,
-  }) || record;
-  let check = listPaymentExposureChecks(record.accountId).find((item) => item.target === route.target && item.checkoutType === "local_extractor");
+  })) || record;
+  let check = (await listPaymentExposureChecks(record.accountId)).find((item) => item.target === route.target && item.checkoutType === "local_extractor");
   if (["completed", "failed", "cancelled", "interrupted"].includes(itemStatus)) {
     if (!mapped.item) {
-      updated = updatePaymentExposureJob(record.jobId, {
+      updated = (await updatePaymentExposureJob(record.jobId, {
         status: "failed", lastError: mapped.error, finishedAt: timestamp(job.finishedAt) || new Date().toISOString(),
-      }) || updated;
+      })) || updated;
       return publicStatus(updated, check);
     }
     const observation = paymentExtractorObservation(job, route, mapped.item);
@@ -288,7 +289,7 @@ async function refreshPaymentExtractorJob(record: PaymentExposureJobRecord, supp
       const effectivePromoMode = record.promoMode === "one_month"
         ? observation.promoEligible === true ? "one_month" : observation.promoEligible === false ? "none" : "unknown"
         : record.promoMode;
-      check = savePaymentEligibilityObservation(record.accountId, {
+      check = (await savePaymentEligibilityObservation(record.accountId, {
         target: route.target, ipCountry: route.ipCountry, billingCountry: route.billingCountry, billingCurrency: route.billingCurrency,
         eligible: observation.eligible, reason: observation.reason, observedAt: observation.observedAt, source: "local_extractor",
         promoMode: effectivePromoMode,
@@ -301,15 +302,15 @@ async function refreshPaymentExtractorJob(record: PaymentExposureJobRecord, supp
         checkoutType: "local_extractor",
         replaceMethods: true,
         availableMethods: observation.availableMethods, matchedMethods: observation.matchedMethods, paymentMethods: observation.paymentMethods,
-      });
-      updated = updatePaymentExposureJob(record.jobId, {
+      }));
+      updated = (await updatePaymentExposureJob(record.jobId, {
         status: "completed", lastError: "", finishedAt: observation.observedAt,
-      }) || updated;
+      })) || updated;
     } else {
-      updated = updatePaymentExposureJob(record.jobId, {
+      updated = (await updatePaymentExposureJob(record.jobId, {
         status: itemStatus === "cancelled" || itemStatus === "interrupted" ? itemStatus : "failed",
         lastError: observation.reason, finishedAt: observation.observedAt,
-      }) || updated;
+      })) || updated;
     }
   }
   return publicStatus(updated, check);
@@ -323,7 +324,7 @@ async function startPaymentExtractorCheck(
 ): Promise<PaymentExposureJobStatus> {
   const startedAt = new Date().toISOString();
   const reservationId = `payment-exposure-dispatch:${crypto.randomUUID()}`;
-  let record = createPaymentExposureJob({
+  let record = (await createPaymentExposureJob({
     jobId: reservationId, accountId, routeKey: route.key, target: route.target,
     ipCountry: route.ipCountry, billingCountry: route.billingCountry, billingCurrency: route.billingCurrency,
     status: "dispatching", lastError: "", startedAt, finishedAt: "", createdAt: startedAt,
@@ -331,7 +332,7 @@ async function startPaymentExtractorCheck(
     promoMode: paymentExposurePromoMode(options.promoMode),
     accessTokenFingerprint: credentials.accessTokenFingerprint,
     scheduledAt: timestamp(options.scheduledAt) || startedAt,
-  });
+  }));
   try {
     const response = await extractorJSON("POST", "/api/extract/jobs", {
       method: "payment_exposure",
@@ -353,13 +354,13 @@ async function startPaymentExtractorCheck(
     const job = response.job;
     const remoteJobId = text(job?.id, 120);
     if (!job || !remoteJobId) throw new Error("本机支付方式提炼服务未返回任务编号");
-    record = finalizePaymentExposureJobReservation(reservationId, remoteJobId, {
+    record = (await finalizePaymentExposureJobReservation(reservationId, remoteJobId, {
       status: extractorJobStatus(job), startedAt: timestamp(job.startedAt) || startedAt, finishedAt: timestamp(job.finishedAt), lastError: "",
-    }) || record;
+    })) || record;
     return refreshPaymentExtractorJob(record, job);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    updatePaymentExposureJob(reservationId, { status: "failed", lastError: message, finishedAt: new Date().toISOString() });
+    (await updatePaymentExposureJob(reservationId, { status: "failed", lastError: message, finishedAt: new Date().toISOString() }));
     throw new Error(message);
   }
 }
@@ -379,7 +380,7 @@ export async function startPaymentExposureCheck(
   const route = routeForKey(routeKey);
   if (!route) throw new Error("支付资格检查项目不存在");
   if (!config.paymentMethodExtractApiBase) throw new Error("本机支付方式提炼服务尚未配置");
-  const credentials = getPaymentExposureCredentials(accountId);
+  const credentials = (await getPaymentExposureCredentials(accountId));
   if (!credentials?.accessToken) throw new Error("账号没有可用的 Access Token");
   if (options.expectedAccessTokenFingerprint && credentials.accessTokenFingerprint
     && options.expectedAccessTokenFingerprint !== credentials.accessTokenFingerprint) {
@@ -411,7 +412,7 @@ export async function startPaymentExposureBatch(accountIds: string[], routeKeys:
   const result: PaymentExposureBatchResult = { requested: ids.length, requestedJobs: 0, started: 0, skipped: 0, failed: 0, jobs: [], jobAccounts: [], errors: [] };
   const selected: Array<{ accountId: string; credentials: { accessToken: string; accessTokenFingerprint: string } }> = [];
   for (const accountId of ids) {
-    const detail = getAccountDetail(accountId);
+    const detail = (await getAccountDetail(accountId));
     if (!detail) {
       result.failed += 1;
       result.errors.push({ accountId, error: "账号不存在" });
@@ -423,7 +424,7 @@ export async function startPaymentExposureBatch(accountIds: string[], routeKeys:
       result.errors.push({ accountId, error: "账号已开通或已有账单，跳过支付方式探查", skipped: true });
       continue;
     }
-    const credentials = getPaymentExposureCredentials(accountId);
+    const credentials = (await getPaymentExposureCredentials(accountId));
     if (!credentials?.accessToken) {
       result.failed += 1;
       result.errors.push({ accountId, routeKey: route.key, error: "账号没有可用的 Access Token" });
@@ -434,12 +435,12 @@ export async function startPaymentExposureBatch(accountIds: string[], routeKeys:
   if (!selected.length) return result;
 
   const startedAt = new Date().toISOString();
-  const reservations = selected.map(({ accountId, credentials }) => createPaymentExposureJob({
+  const reservations = (await asyncMap(selected, async ({ accountId, credentials }) => (await createPaymentExposureJob({
     jobId: `payment-exposure-dispatch:${crypto.randomUUID()}`, accountId, routeKey: route.key, target: route.target,
     ipCountry: route.ipCountry, billingCountry: route.billingCountry, billingCurrency: route.billingCurrency,
     status: "dispatching", lastError: "", startedAt, finishedAt: "", createdAt: startedAt,
     jobKind: "bulk", accessTokenFingerprint: credentials.accessTokenFingerprint, scheduledAt: startedAt, promoMode,
-  }));
+  }))));
   result.requestedJobs = 1;
   try {
     const response = await extractorJSON("POST", "/api/extract/jobs", {
@@ -457,16 +458,16 @@ export async function startPaymentExposureBatch(accountIds: string[], routeKeys:
     if (!remoteJob || !remoteJobId) throw new Error("本机支付方式提炼服务未返回任务编号");
     const remoteStatus = extractorJobStatus(remoteJob);
     for (const record of reservations) {
-      const current = finalizePaymentExposureJobReservation(record.jobId, remoteJobId, {
+      const current = (await finalizePaymentExposureJobReservation(record.jobId, remoteJobId, {
         status: remoteStatus, startedAt: timestamp(remoteJob.startedAt) || startedAt, finishedAt: timestamp(remoteJob.finishedAt), lastError: "",
-      }) || record;
+      })) || record;
       result.jobs.push(await refreshPaymentExtractorJob(current, remoteJob));
       result.jobAccounts.push({ accountId: current.accountId, jobId: current.jobId });
       result.started += 1;
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    for (const record of reservations) updatePaymentExposureJob(record.jobId, { status: "failed", lastError: message, finishedAt: new Date().toISOString() });
+    for (const record of reservations) (await updatePaymentExposureJob(record.jobId, { status: "failed", lastError: message, finishedAt: new Date().toISOString() }));
     result.failed += selected.length;
     result.errors.push(...selected.map(({ accountId }) => ({ accountId, routeKey: route.key, error: message })));
   }
@@ -479,12 +480,12 @@ export async function startTrialCheck(accountId: string): Promise<PaymentExposur
 }
 
 export async function getPaymentExposureCheckStatus(accountId: string, jobId: string): Promise<PaymentExposureJobStatus> {
-  const record = getPaymentExposureJob(accountId, jobId);
+  const record = (await getPaymentExposureJob(accountId, jobId));
   if (!record) throw new Error("支付资格检查任务不存在");
   if (!["completed", "failed", "cancelled", "interrupted"].includes(record.status)) {
     return refreshPaymentExtractorJob(record);
   }
-  const check = listPaymentExposureChecks(accountId)
+  const check = (await listPaymentExposureChecks(accountId))
     .find((item) => item.target === record.target && item.checkoutType === "local_extractor");
   return publicStatus(record, check);
 }
@@ -496,14 +497,14 @@ export async function getPaymentExposureBatchStatus(
     accountId: String(entry.accountId || "").trim(),
     jobId: String(entry.jobId || "").trim(),
   })).filter((entry) => entry.accountId && entry.jobId);
-  const records = requested.map((entry) => getPaymentExposureJob(entry.accountId, entry.jobId)).filter(
+  const records = (await asyncMap(requested, async (entry) => (await getPaymentExposureJob(entry.accountId, entry.jobId)))).filter(
     (record): record is PaymentExposureJobRecord => Boolean(record),
   );
   const statuses = new Map<string, PaymentExposureJobStatus>();
   const groups = new Map<string, PaymentExposureJobRecord[]>();
   for (const record of records) {
     if (["completed", "failed", "cancelled", "interrupted"].includes(record.status)) {
-      const check = listPaymentExposureChecks(record.accountId)
+      const check = (await listPaymentExposureChecks(record.accountId))
         .find((item) => item.target === record.target && item.checkoutType === "local_extractor");
       statuses.set(`${record.accountId}:${record.jobId}`, publicStatus(record, check));
       continue;
@@ -524,7 +525,7 @@ export async function getPaymentExposureBatchStatus(
       const key = `${record.accountId}:${record.jobId}`;
       if (remoteJob) statuses.set(key, await refreshPaymentExtractorJob(record, remoteJob));
       else {
-        const check = listPaymentExposureChecks(record.accountId)
+        const check = (await listPaymentExposureChecks(record.accountId))
           .find((item) => item.target === record.target && item.checkoutType === "local_extractor");
         statuses.set(key, publicStatus(record, check, pollError));
       }
@@ -537,7 +538,7 @@ export async function getPaymentExposureBatchStatus(
 
 /** Keep remote method probes moving even when the initiating admin page is refreshed or closed. */
 export async function refreshPendingPaymentExposureJobs(): Promise<{ checked: number; completed: number; failed: number; active: number }> {
-  const pending = listPaymentExposureJobs(["dispatching", "queued", "running"]);
+  const pending = (await listPaymentExposureJobs(["dispatching", "queued", "running"]));
   const records: PaymentExposureJobRecord[] = [];
   let failedReservations = 0;
   let pendingReservations = 0;
@@ -549,7 +550,7 @@ export async function refreshPendingPaymentExposureJobs(): Promise<{ checked: nu
       continue;
     }
     if (Date.parse(record.updatedAt || record.createdAt) <= staleBefore) {
-      updatePaymentExposureJob(record.jobId, { status: "failed", lastError: "支付方式探查未取得远程任务编号", finishedAt: new Date().toISOString() });
+      (await updatePaymentExposureJob(record.jobId, { status: "failed", lastError: "支付方式探查未取得远程任务编号", finishedAt: new Date().toISOString() }));
       failedReservations += 1;
     } else pendingReservations += 1;
   }

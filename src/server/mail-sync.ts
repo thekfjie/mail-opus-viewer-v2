@@ -91,12 +91,12 @@ function inWindow(receivedAt: string, rule: RoutingRule, allowRegistrationGrace 
   return true;
 }
 
-function routingRules(): RoutingRule[] {
-  const rows = db.prepare(`SELECT r.id, r.binding_id, b.account_id, b.email_enc, r.sender_pattern, r.recipient_pattern,
+async function routingRules(): Promise<RoutingRule[]> {
+  const rows = (await db.prepare(`SELECT r.id, r.binding_id, b.account_id, b.email_enc, r.sender_pattern, r.recipient_pattern,
       r.valid_from, r.valid_to, b.receive_disabled_at, b.is_current
     FROM mail_routing_rules r JOIN email_bindings b ON b.id=r.binding_id
     JOIN gpt_accounts a ON a.id=b.account_id
-    WHERE NOT (a.source_status='recovered' AND a.lifecycle_status='retired' AND b.is_current=0)`).all() as Array<RoutingRule & { email_enc: string }>;
+    WHERE NOT (a.source_status='recovered' AND a.lifecycle_status='retired' AND b.is_current=0)`).all()) as Array<RoutingRule & { email_enc: string }>;
   return rows.map((row) => {
     let bindingEmail = "";
     try { bindingEmail = normalizeEmail(decryptSecret(String(row.email_enc || ""))); } catch {}
@@ -192,15 +192,15 @@ function uniqueICloudBaseOwner(rules: RoutingRule[], recipients: string[], recei
   return winners.length === 1 ? winners[0].binding_id : "";
 }
 
-function pendingMailboxIdsForBaseRecipient(recipient: string): string[] {
+async function pendingMailboxIdsForBaseRecipient(recipient: string): Promise<string[]> {
   const target = normalizeEmail(recipient);
   const parts = splitEmail(target);
   if (!target || !parts.localPart || !parts.domain || parts.localPart.includes("+")
     || !(parts.domain === "icloud.com" || parts.domain.endsWith(".icloud.com"))) return [];
   // Pending tasks are bounded by the OpenAI batch limit. The explicit limit
   // keeps a malformed or abandoned pool from becoming a table-wide scan.
-  const rows = db.prepare(`SELECT id,email_enc FROM pending_mailboxes
-    WHERE created_at<=? ORDER BY created_at DESC,id LIMIT 200`).all(new Date().toISOString()) as any[];
+  const rows = (await db.prepare(`SELECT id,email_enc FROM pending_mailboxes
+    WHERE created_at<=? ORDER BY created_at DESC,id LIMIT 200`).all(new Date().toISOString())) as any[];
   return rows.flatMap((row) => {
     try {
       const pending = splitEmail(normalizeEmail(decryptSecret(String(row.email_enc || ""))));
@@ -255,43 +255,43 @@ async function normalizeSharedMail(mail: any): Promise<NormalizedMail | null> {
   };
 }
 
-function persistBillingEvidence(accountId: string, messageId: string, mail: NormalizedMail, source: string, now: string): void {
+async function persistBillingEvidence(accountId: string, messageId: string, mail: NormalizedMail, source: string, now: string): Promise<void> {
   if (config.readOnly || !mail.billingEvidence.confirmedPlus || !mail.receivedAt) return;
-  db.prepare(`UPDATE gpt_accounts SET
+  (await db.prepare(`UPDATE gpt_accounts SET
       plan=CASE WHEN LOWER(TRIM(plan)) IN ('', 'unknown', 'free') THEN 'plus' ELSE plan END,
       billing_channel=CASE WHEN billing_channel='' AND ?!='' THEN ? ELSE billing_channel END,
       updated_at=? WHERE id=? AND deleted_at=''`).run(
     mail.billingEvidence.billingChannel, mail.billingEvidence.billingChannel, now, accountId,
-  );
-  db.prepare(`INSERT INTO account_business_evidence(account_id,billing_started_at,newest_mail_at,updated_at)
+  ));
+  (await db.prepare(`INSERT INTO account_business_evidence(account_id,billing_started_at,newest_mail_at,updated_at)
     VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET
       billing_started_at=CASE WHEN account_business_evidence.billing_started_at='' THEN excluded.billing_started_at
         ELSE MIN(account_business_evidence.billing_started_at,excluded.billing_started_at) END,
       newest_mail_at=MAX(account_business_evidence.newest_mail_at,excluded.newest_mail_at),
-      updated_at=excluded.updated_at`).run(accountId, mail.receivedAt, mail.receivedAt, now);
-  db.prepare(`INSERT OR IGNORE INTO lifecycle_events(
+      updated_at=excluded.updated_at`).run(accountId, mail.receivedAt, mail.receivedAt, now));
+  (await db.prepare(`INSERT OR IGNORE INTO lifecycle_events(
       id,account_id,event_type,occurred_at,source,payload_json,created_at
     ) VALUES(?,?,'plus_activated_by_mail',?,?,?,?)`).run(
     stableId("event-plus-activation-mail", accountId, messageId), accountId, mail.receivedAt, source,
     JSON.stringify({ messageId, evidence: "account_level_subscription_body" }), now,
-  );
+  ));
   if (mail.billingEvidence.billingChannel) {
-    db.prepare(`INSERT INTO billing_channel_observations(
+    (await db.prepare(`INSERT INTO billing_channel_observations(
         id,account_id,channel,source,evidence_id,observed_at,active
       ) VALUES(?,?,?,?,?,?,1)
       ON CONFLICT(id) DO UPDATE SET channel=excluded.channel,source=excluded.source,
         observed_at=excluded.observed_at,active=1`).run(
       stableId("billing-channel-observation", accountId, messageId), accountId,
       mail.billingEvidence.billingChannel, source, messageId, mail.receivedAt,
-    );
+    ));
   }
 }
 
-function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[], fixedBinding?: FixedBindingClaim): { inserted: boolean; claims: number; deactivated: boolean } {
+async function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[], fixedBinding?: FixedBindingClaim): Promise<{ inserted: boolean; claims: number; deactivated: boolean }> {
   const now = new Date().toISOString();
   const id = stableId("mail-message", provider, mail.providerMessageId);
   const classification = classifyMail(mail.subject, mail.sender, mail.bodyText || "", mail.bodyHtml || "");
-  const existing = db.prepare("SELECT * FROM mail_messages WHERE provider=? AND provider_message_id=?").get(provider, mail.providerMessageId) as any;
+  const existing = (await db.prepare("SELECT * FROM mail_messages WHERE provider=? AND provider_message_id=?").get(provider, mail.providerMessageId)) as any;
   // A migrated index does not verify this event's complete routing headers.
   // Preserve its known values while the event still waits for an upstream ID read.
   const preserveExisting = Boolean(existing && !mail.receivedAt);
@@ -305,7 +305,7 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
     ? [fixedBinding]
     : expandMatchedMailboxBatches(senderRules, preferExactRecipientOwners(
       senderRules.filter((rule) => matchesRecipientRule(mail.recipients, rule)), mail.recipients));
-  let notice = resolveNoticeEvidence(mail.noticeEvidence, [...new Set(matchedRules.map((rule) => rule.account_id))], mail.receivedAt);
+  let notice = (await resolveNoticeEvidence(mail.noticeEvidence, [...new Set(matchedRules.map((rule) => rule.account_id))], mail.receivedAt));
   let baseOwnerBindingId = "";
   if (!fixedBinding && !notice.accountId && !notice.conflict) {
     baseOwnerBindingId = uniqueICloudBaseOwner(matchedRules as RoutingRule[], mail.recipients, mail.receivedAt);
@@ -319,8 +319,8 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
     ? preferExactRecipientOwners(rules.filter((rule) => Boolean(rule.recipient_pattern)
       && matchesRecipientRule(mail.recipients, rule)), mail.recipients) : [];
   if (recipientRules.length && mail.noticeEvidence?.identityHashes.length) {
-    const verified = resolveNoticeEvidence(mail.noticeEvidence,
-      [...new Set(recipientRules.map((rule) => rule.account_id))], mail.receivedAt);
+    const verified = (await resolveNoticeEvidence(mail.noticeEvidence,
+      [...new Set(recipientRules.map((rule) => rule.account_id))], mail.receivedAt));
     if (verified.accountId && !verified.conflict) {
       matchedRules = recipientRules.filter((rule) => rule.binding_id === verified.bindingId);
       notice = verified;
@@ -341,8 +341,8 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
     ? mailboxBatchKey(String(rule.binding_email || "")) : String(rule.binding_id)));
   const visible = distinctBatches.size === 1 ? 1 : 0;
   let deactivated = false;
-  db.transaction(() => {
-    db.prepare(`INSERT INTO mail_messages(
+  (await db.transaction(async () => {
+    (await db.prepare(`INSERT INTO mail_messages(
         id, provider, provider_message_id, sender, recipient_enc, subject, received_at, folder, category, is_security, metadata_json, indexed_at
       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(provider, provider_message_id) DO UPDATE SET sender=excluded.sender,
@@ -354,22 +354,22 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
       preserveExisting ? existing.category : classification.category,
       preserveExisting ? existing.is_security : classification.isSecurity ? 1 : 0,
       preserveExisting ? existing.metadata_json : JSON.stringify(mail.metadata), now,
-    );
+    ));
     if (!preserveExisting) {
-      db.prepare("DELETE FROM mail_recipient_index WHERE message_id=?").run(id);
-      indexMailRecipients(db, id, mail.recipients.length ? mail.recipients : [decryptSecret(storedRecipient)]);
+      (await db.prepare("DELETE FROM mail_recipient_index WHERE message_id=?").run(id));
+      (await indexMailRecipients(db, id, mail.recipients.length ? mail.recipients : [decryptSecret(storedRecipient)]));
       // These claims are projections of the current parsed headers/rules. A
       // verified re-read must replace stale projections rather than append a
       // second owner. Imported legacy index claims remain intact.
-      db.prepare(`DELETE FROM mail_ownership_claims WHERE message_id=?
-        AND claim_type IN ('routing_rule','account_notice','admin_verification','outlook_connection')`).run(id);
+      (await db.prepare(`DELETE FROM mail_ownership_claims WHERE message_id=?
+        AND claim_type IN ('routing_rule','account_notice','admin_verification','outlook_connection')`).run(id));
     }
     if (notice.accountId) {
       // A verified account notice replaces guesses made from a shared/base recipient.
-      db.prepare("DELETE FROM mail_ownership_claims WHERE message_id=? AND binding_id<>?").run(id, notice.bindingId);
+      (await db.prepare("DELETE FROM mail_ownership_claims WHERE message_id=? AND binding_id<>?").run(id, notice.bindingId));
     }
     for (const rule of candidates) {
-      db.prepare(`INSERT INTO mail_ownership_claims(
+      (await db.prepare(`INSERT INTO mail_ownership_claims(
           message_id, account_id, binding_id, claim_type, confidence, reason, visible_to_customer, created_at
         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id, binding_id) DO UPDATE SET account_id=excluded.account_id,
@@ -378,16 +378,16 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
         id, rule.account_id, rule.binding_id, fixedBinding ? "outlook_connection" : "routing_rule",
         fixedBinding ? 1.1 : 1, fixedBinding ? "V2 Outlook 连接与邮箱绑定一致" : "V25 邮箱批次路由和绑定时间窗口一致",
         visible, now,
-      );
+      ));
     }
     if (notice.accountId && notice.bindingId) {
-      db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,confidence,reason,visible_to_customer,created_at)
+      (await db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,confidence,reason,visible_to_customer,created_at)
         VALUES(?,?,?,'account_notice',1,'associated_account_and_identity_evidence',?,?)
         ON CONFLICT(message_id,binding_id) DO UPDATE SET claim_type=excluded.claim_type,confidence=excluded.confidence,
           reason=excluded.reason,visible_to_customer=excluded.visible_to_customer`)
-        .run(id, notice.accountId, notice.bindingId, Number(distinctBatches.size === 1), now);
-      db.prepare("UPDATE mail_messages SET metadata_json=? WHERE id=?")
-        .run(JSON.stringify({ ...mail.metadata, method: "associated_account_notice" }), id);
+        .run(id, notice.accountId, notice.bindingId, Number(distinctBatches.size === 1), now));
+      (await db.prepare("UPDATE mail_messages SET metadata_json=? WHERE id=?")
+        .run(JSON.stringify({ ...mail.metadata, method: "associated_account_notice" }), id));
     }
     const historicalSecurityRules = classification.category === "security" && mail.receivedAt
       && new Set(matchedRules.map((rule) => rule.account_id)).size === 1
@@ -395,16 +395,16 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
         && (fixedBinding || ("recipient_pattern" in rule && Boolean(rule.recipient_pattern)))) : [];
     for (const rule of historicalSecurityRules) {
       // Only the explicit administrator OTP override may use this claim.
-      db.prepare(`INSERT OR IGNORE INTO mail_ownership_claims(
+      (await db.prepare(`INSERT OR IGNORE INTO mail_ownership_claims(
         message_id,account_id,binding_id,claim_type,confidence,reason,visible_to_customer,created_at)
         VALUES(?,?,?,'admin_verification',1,'unique_recipient_outside_binding_window',0,?)`)
-        .run(id, rule.account_id, rule.binding_id, now);
+        .run(id, rule.account_id, rule.binding_id, now));
     }
     if (distinctBatches.size > 1) {
-      db.prepare("UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id=?").run(id);
+      (await db.prepare("UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id=?").run(id));
     }
     if (distinctAccounts.size === 1 && !notice.conflict) {
-      persistBillingEvidence([...distinctAccounts][0], id, mail, `${provider}-sync`, now);
+      (await persistBillingEvidence([...distinctAccounts][0], id, mail, `${provider}-sync`, now));
     }
     // A deactivation message is evidence only. It must never become an account
     // lock: only an explicit administrator action owns that state transition.
@@ -415,32 +415,32 @@ function upsertMail(provider: string, mail: NormalizedMail, rules: RoutingRule[]
     const deactivationAccounts = new Set(notice.accountId ? [notice.accountId] : deactivationRules.map((rule) => rule.account_id));
     if (classification.category === "deactivation" && deactivationAccounts.size === 1 && !notice.conflict) {
       const accountId = [...deactivationAccounts][0];
-      const account = db.prepare("SELECT id FROM gpt_accounts WHERE id=? AND deleted_at='' ").get(accountId) as any;
-      if (account) db.prepare(`INSERT OR IGNORE INTO lifecycle_events(
+      const account = (await db.prepare("SELECT id FROM gpt_accounts WHERE id=? AND deleted_at='' ").get(accountId)) as any;
+      if (account) (await db.prepare(`INSERT OR IGNORE INTO lifecycle_events(
           id,account_id,event_type,occurred_at,source,payload_json,created_at)
         VALUES(?,?,'deactivation_mail_detected',?,?,?,?)`).run(
         stableId("deactivation-mail-detected", accountId, id), accountId, mail.receivedAt || now, `${provider}-sync`,
         JSON.stringify({ messageId: id, automaticStateChange: false }), now,
-      );
+      ));
     }
     if (classification.category === "deactivation" && distinctBatches.size !== 1) {
       // No account may see an unresolved multi-generation ban, even if its date
       // happens to match the newest binding's normal delivery window.
-      db.prepare("UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id=?").run(id);
-      db.prepare(`INSERT INTO pending_reviews(id, review_type, candidate_email_enc, candidate_email_hash, reason, evidence_json, created_at, updated_at)
+      (await db.prepare("UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id=?").run(id));
+      (await db.prepare(`INSERT INTO pending_reviews(id, review_type, candidate_email_enc, candidate_email_hash, reason, evidence_json, created_at, updated_at)
         VALUES(?, 'mail_ownership_ambiguous', ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET candidate_email_enc=excluded.candidate_email_enc,
           evidence_json=excluded.evidence_json,reason=excluded.reason,updated_at=excluded.updated_at`).run(
         stableId("mail-review", id), encryptSecret(mail.recipients[0] || ""), emailHash(mail.recipients.join(",")),
         deactivationAccounts.size === 0 ? "deactivation_owner_unresolved" : "deactivation_recipient_has_multiple_identities",
         JSON.stringify({ messageId: id, accountIds: [...new Set([...deactivationAccounts, ...recipientRules.map((rule) => rule.account_id)])] }), now, now,
-      );
+      ));
     } else if (deactivationAccounts.size === 1 && !notice.conflict) {
       const resolvedAccountId = notice.accountId || [...deactivationAccounts][0];
-      db.prepare(`UPDATE pending_reviews SET status='resolved',account_id=?,candidate_email_enc=?,updated_at=?
-        WHERE id=? AND status='pending'`).run(resolvedAccountId, encryptSecret(mail.recipients[0] || ""), now, stableId("mail-review", id));
+      (await db.prepare(`UPDATE pending_reviews SET status='resolved',account_id=?,candidate_email_enc=?,updated_at=?
+        WHERE id=? AND status='pending'`).run(resolvedAccountId, encryptSecret(mail.recipients[0] || ""), now, stableId("mail-review", id)));
     }
-  })();
+  })());
   return { inserted: !existing, claims: candidateBindingCount, deactivated };
 }
 
@@ -451,8 +451,8 @@ export async function recheckBillingEvidenceForMail(
   providerMessageId: string,
   reader: Pick<D1MailReader, "byId"> = sharedMailReader,
 ): Promise<{ matched: boolean; accountIds: string[]; messageId: string; billingChannel: string }> {
-  const message = db.prepare(`SELECT id,provider,provider_message_id FROM mail_messages
-    WHERE provider='shared-mail-api' AND provider_message_id=?`).get(providerMessageId) as any;
+  const message = (await db.prepare(`SELECT id,provider,provider_message_id FROM mail_messages
+    WHERE provider='shared-mail-api' AND provider_message_id=?`).get(providerMessageId)) as any;
   if (!message) throw new MailReadError("mail_event_not_found", 404);
   const row = await reader.byId(providerMessageId);
   if (!row) throw new MailReadError("mail_upstream_missing", 404);
@@ -461,9 +461,9 @@ export async function recheckBillingEvidenceForMail(
   // Rebuild the indexed projection from the exact upstream message so stale
   // webhook metadata cannot leave an old category or ownership decision in
   // place. The normalized body is used only in memory by upsertMail.
-  if (normalized.receivedAt) upsertMail("shared-mail-api", normalized, routingRules());
-  const accountIds = [...new Set((db.prepare(`SELECT account_id FROM mail_ownership_claims
-      WHERE message_id=? AND visible_to_customer=1`).all(String(message.id)) as any[])
+  if (normalized.receivedAt) (await upsertMail("shared-mail-api", normalized, (await routingRules())));
+  const accountIds = [...new Set(((await db.prepare(`SELECT account_id FROM mail_ownership_claims
+      WHERE message_id=? AND visible_to_customer=1`).all(String(message.id))) as any[])
     .map((item) => String(item.account_id)).filter(Boolean))];
   const billingChannel = normalized.billingEvidence.billingChannel;
   if (!normalized.receivedAt || !normalized.billingEvidence.confirmedPlus) {
@@ -471,9 +471,9 @@ export async function recheckBillingEvidenceForMail(
   }
   if (accountIds.length === 1) {
     const now = new Date().toISOString();
-    db.transaction(() => persistBillingEvidence(
+    (await db.transaction(async () => (await persistBillingEvidence(
       accountIds[0], String(message.id), normalized, "admin-billing-recheck", now,
-    ))();
+    )))());
   }
   return { matched: true, accountIds, messageId: String(message.id), billingChannel };
 }
@@ -491,33 +491,33 @@ export function reprocessReviewedMail(reviewId: string, reader: Pick<D1MailReade
 }
 
 async function performMailReview(reviewId: string, reader: Pick<D1MailReader, "byId">) {
-  const review = db.prepare("SELECT evidence_json FROM pending_reviews WHERE id=? AND review_type='mail_ownership_ambiguous' AND status='pending'")
-    .get(reviewId) as any;
+  const review = (await db.prepare("SELECT evidence_json FROM pending_reviews WHERE id=? AND review_type='mail_ownership_ambiguous' AND status='pending'")
+    .get(reviewId)) as any;
   if (!review) throw new MailReadError("mail_review_not_pending", 409);
   const evidence = JSON.parse(review.evidence_json);
-  const message = db.prepare("SELECT provider,provider_message_id FROM mail_messages WHERE id=?").get(evidence.messageId) as any;
+  const message = (await db.prepare("SELECT provider,provider_message_id FROM mail_messages WHERE id=?").get(evidence.messageId)) as any;
   if (message?.provider !== "shared-mail-api") throw new MailReadError("mail_review_provider_unsupported", 400);
   const row = await reader.byId(message.provider_message_id);
   if (!row) throw new MailReadError("mail_upstream_missing", 404);
   const mail = await normalizeSharedMail(row);
   if (!mail?.receivedAt || mail.providerMessageId !== message.provider_message_id) throw new MailReadError("mail_review_invalid_upstream");
-  return db.transaction(() => {
-    if (!(db.prepare("SELECT 1 FROM pending_reviews WHERE id=? AND status='pending'").get(reviewId))) throw new MailReadError("mail_review_not_pending", 409);
-    const result = upsertMail("shared-mail-api", mail, routingRules());
-    const status = (db.prepare("SELECT status FROM pending_reviews WHERE id=?").get(reviewId) as any).status;
+  return (await db.transaction(async () => {
+    if (!((await db.prepare("SELECT 1 FROM pending_reviews WHERE id=? AND status='pending'").get(reviewId)))) throw new MailReadError("mail_review_not_pending", 409);
+    const result = (await upsertMail("shared-mail-api", mail, (await routingRules())));
+    const status = ((await db.prepare("SELECT status FROM pending_reviews WHERE id=?").get(reviewId)) as any).status;
     return { ...result, reviewId, status };
-  }).immediate();
+  }).immediate());
 }
 
-function updateSyncState(source: string, cursor: string, error = "", newestAt = ""): void {
+async function updateSyncState(source: string, cursor: string, error = "", newestAt = ""): Promise<void> {
   const now = new Date().toISOString();
   const newest = Date.parse(newestAt);
   const lag = error || !Number.isFinite(newest) ? 0 : Math.max(0, (Date.now() - newest) / 1_000);
-  db.prepare(`INSERT INTO mailbox_sync_state(source, cursor, source_revision, lag_seconds, last_success_at, last_error, updated_at)
+  (await db.prepare(`INSERT INTO mailbox_sync_state(source, cursor, source_revision, lag_seconds, last_success_at, last_error, updated_at)
     VALUES(?, ?, '', ?, ?, ?, ?)
     ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor, lag_seconds=excluded.lag_seconds,
       last_success_at=CASE WHEN excluded.last_error='' THEN excluded.last_success_at ELSE mailbox_sync_state.last_success_at END,
-      last_error=excluded.last_error, updated_at=excluded.updated_at`).run(source, cursor, lag, error ? "" : now, error, now);
+      last_error=excluded.last_error, updated_at=excluded.updated_at`).run(source, cursor, lag, error ? "" : now, error, now));
 }
 
 export interface MailIngestionResult {
@@ -527,47 +527,47 @@ export interface MailIngestionResult {
 const INGESTION_RETRY_COOLDOWN_MS = 60_000;
 const INGESTION_LEASE_MS = 90_000;
 
-function claimIngestion(messageId: string): string {
-  return db.transaction(() => {
-    const state = db.prepare("SELECT attempts,status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId) as any;
+async function claimIngestion(messageId: string): Promise<string> {
+  return (await db.transaction(async () => {
+    const state = (await db.prepare("SELECT attempts,status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId)) as any;
     if (!state) throw new MailReadError("mail_event_not_found", 404);
     if (state.status === "processed") return "";
-    const lease = db.prepare("SELECT * FROM mail_ingestion_leases WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId) as any;
+    const lease = (await db.prepare("SELECT * FROM mail_ingestion_leases WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId)) as any;
     const now = Date.now();
     if (Number(lease?.lease_until) > now) throw new MailReadError("mail_event_busy", 429);
     if (Number(state.attempts) >= 3) throw new MailReadError("mail_event_retry_exhausted", 409);
     if (Number(lease?.retry_after) > now) throw new MailReadError("mail_event_cooling_down", 429);
     const owner = crypto.randomUUID();
-    db.prepare(`INSERT INTO mail_ingestion_leases(provider,provider_message_id,owner,lease_until)
+    (await db.prepare(`INSERT INTO mail_ingestion_leases(provider,provider_message_id,owner,lease_until)
       VALUES('shared-mail-api',?,?,?) ON CONFLICT(provider,provider_message_id)
-      DO UPDATE SET owner=excluded.owner,lease_until=excluded.lease_until`).run(messageId, owner, now + INGESTION_LEASE_MS);
-    db.prepare("UPDATE mail_ingestion_state SET attempts=attempts+1,updated_at=? WHERE provider='shared-mail-api' AND provider_message_id=?")
-      .run(new Date(now).toISOString(), messageId);
+      DO UPDATE SET owner=excluded.owner,lease_until=excluded.lease_until`).run(messageId, owner, now + INGESTION_LEASE_MS));
+    (await db.prepare("UPDATE mail_ingestion_state SET attempts=attempts+1,updated_at=? WHERE provider='shared-mail-api' AND provider_message_id=?")
+      .run(new Date(now).toISOString(), messageId));
     return owner;
-  }).immediate();
+  }).immediate());
 }
 
-function processingFailure(messageId: string, owner: string, error: unknown): void {
+async function processingFailure(messageId: string, owner: string, error: unknown): Promise<void> {
   const code = error instanceof MailReadError ? error.code : "mail_processing_failed";
   const notAttempted = ["mail_d1_not_configured", "mail_read_busy", "mail_read_cooling_down", "mail_read_budget_exhausted"].includes(code);
-  db.transaction(() => {
-    const lease = db.prepare(`UPDATE mail_ingestion_leases SET retry_after=?
+  (await db.transaction(async () => {
+    const lease = (await db.prepare(`UPDATE mail_ingestion_leases SET retry_after=?
       WHERE provider='shared-mail-api' AND provider_message_id=? AND owner=?`)
-      .run(Date.now() + INGESTION_RETRY_COOLDOWN_MS, messageId, owner);
+      .run(Date.now() + INGESTION_RETRY_COOLDOWN_MS, messageId, owner));
     if (!lease.changes) return;
-    db.prepare(`UPDATE mail_ingestion_state SET error_code=?, updated_at=?,
+    (await db.prepare(`UPDATE mail_ingestion_state SET error_code=?, updated_at=?,
       attempts=MAX(0,attempts-?) WHERE provider='shared-mail-api' AND provider_message_id=? AND status<>'processed'`)
-      .run(code, new Date().toISOString(), Number(notAttempted), messageId);
-  }).immediate();
+      .run(code, new Date().toISOString(), Number(notAttempted), messageId));
+  }).immediate());
 }
 
-function commitSharedMail(mail: NormalizedMail): MailIngestionResult {
-  return db.transaction(() => {
-    const previous = db.prepare("SELECT status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(mail.providerMessageId) as any;
+async function commitSharedMail(mail: NormalizedMail): Promise<MailIngestionResult> {
+  return (await db.transaction(async () => {
+    const previous = (await db.prepare("SELECT status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(mail.providerMessageId)) as any;
     if (previous?.status === "processed" || (previous?.status === "pending_time" && !mail.receivedAt)) {
       return { inserted: false, claims: 0, deactivated: false, processingStatus: previous.status, messageId: mail.providerMessageId };
     }
-    const result = upsertMail("shared-mail-api", mail, routingRules());
+    const result = (await upsertMail("shared-mail-api", mail, (await routingRules())));
     const now = new Date().toISOString();
     const processingStatus = mail.receivedAt ? "processed" : "pending_time";
     if (mail.receivedAt) {
@@ -577,25 +577,25 @@ function commitSharedMail(mail: NormalizedMail): MailIngestionResult {
       const baseClaim = db.prepare(`INSERT OR IGNORE INTO pending_mail_claims(pending_id,message_id,created_at)
         SELECT id,?,? FROM pending_mailboxes WHERE id=? AND created_at<=?`);
       for (const recipient of mail.recipients) {
-        claim.run(messageId, now, emailHash(recipient), mail.receivedAt);
-        for (const pendingId of pendingMailboxIdsForBaseRecipient(recipient)) {
-          baseClaim.run(messageId, now, pendingId, mail.receivedAt);
+        (await claim.run(messageId, now, emailHash(recipient), mail.receivedAt));
+        for (const pendingId of (await pendingMailboxIdsForBaseRecipient(recipient))) {
+          (await baseClaim.run(messageId, now, pendingId, mail.receivedAt));
         }
       }
     }
-    db.prepare(`INSERT INTO mail_ingestion_state(provider, provider_message_id, status, discovered_at, updated_at)
+    (await db.prepare(`INSERT INTO mail_ingestion_state(provider, provider_message_id, status, discovered_at, updated_at)
       VALUES('shared-mail-api', ?, ?, ?, ?) ON CONFLICT(provider,provider_message_id)
       DO UPDATE SET status=excluded.status, error_code='', updated_at=excluded.updated_at`)
-      .run(mail.providerMessageId, processingStatus, now, now);
+      .run(mail.providerMessageId, processingStatus, now, now));
     return { ...result, processingStatus, messageId: mail.providerMessageId };
-  })();
+  })());
 }
 
 export async function ingestSharedMailEvent(payload: unknown, reader: Pick<D1MailReader, "byId"> = sharedMailReader): Promise<MailIngestionResult> {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new MailReadError("invalid_mail_event", 400);
   const providerMessageId = String((payload as any).id || "");
   if (!/^[1-9][0-9]{0,15}$/.test(providerMessageId) || !Number.isSafeInteger(Number(providerMessageId))) throw new MailReadError("invalid_mail_id", 400);
-  const existing = db.prepare("SELECT status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(providerMessageId) as any;
+  const existing = (await db.prepare("SELECT status FROM mail_ingestion_state WHERE provider='shared-mail-api' AND provider_message_id=?").get(providerMessageId)) as any;
   if (existing?.status === "processed") {
     return { inserted: false, claims: 0, deactivated: false, processingStatus: "processed", messageId: providerMessageId };
   }
@@ -604,13 +604,13 @@ export async function ingestSharedMailEvent(payload: unknown, reader: Pick<D1Mai
     mail = await normalizeSharedMail(payload);
   } catch (error) {
     const now = new Date().toISOString();
-    db.prepare(`INSERT INTO mail_ingestion_state(provider, provider_message_id, status, error_code, discovered_at, updated_at)
+    (await db.prepare(`INSERT INTO mail_ingestion_state(provider, provider_message_id, status, error_code, discovered_at, updated_at)
       VALUES('shared-mail-api', ?, 'pending_parse', 'mail_processing_failed', ?, ?)
-      ON CONFLICT(provider,provider_message_id) DO NOTHING`).run(providerMessageId, now, now);
+      ON CONFLICT(provider,provider_message_id) DO NOTHING`).run(providerMessageId, now, now));
     return { inserted: false, claims: 0, deactivated: false, processingStatus: "pending_parse", messageId: providerMessageId };
   }
   if (!mail) throw new MailReadError("invalid_mail_event", 400);
-  const result = commitSharedMail(mail);
+  const result = (await commitSharedMail(mail));
   if (result.processingStatus !== "pending_time") return result;
   // Metadata-only production webhooks perform the exact-ID read immediately.
   // The reader serializes in-process D1 access; lease/budget failures remain
@@ -632,8 +632,8 @@ export async function reconcileSharedMailOwnership(
   if (!/^[1-9][0-9]{0,15}$/.test(providerMessageId) || !Number.isSafeInteger(Number(providerMessageId))) {
     throw new MailReadError("invalid_mail_id", 400);
   }
-  const indexed = db.prepare(`SELECT 1 FROM mail_messages
-    WHERE provider='shared-mail-api' AND provider_message_id=?`).get(providerMessageId);
+  const indexed = (await db.prepare(`SELECT 1 FROM mail_messages
+    WHERE provider='shared-mail-api' AND provider_message_id=?`).get(providerMessageId));
   if (!indexed) throw new MailReadError("mail_event_not_found", 404);
   const row = await reader.byId(providerMessageId);
   if (!row) throw new MailReadError("mail_upstream_missing", 404);
@@ -641,39 +641,39 @@ export async function reconcileSharedMailOwnership(
   if (!normalized?.receivedAt || normalized.providerMessageId !== providerMessageId) {
     throw new MailReadError("mail_upstream_id_mismatch", 409);
   }
-  return upsertMail("shared-mail-api", normalized, routingRules());
+  return (await upsertMail("shared-mail-api", normalized, (await routingRules())));
 }
 
 export async function retrySharedMailEvent(messageId: string, reader: Pick<D1MailReader, "byId"> = sharedMailReader): Promise<MailIngestionResult> {
-  const owner = claimIngestion(messageId);
+  const owner = (await claimIngestion(messageId));
   if (!owner) return { inserted: false, claims: 0, deactivated: false, processingStatus: "processed", messageId };
   try {
     const row = await reader.byId(messageId);
     if (!row) throw new MailReadError("mail_upstream_missing", 404);
     const normalized = await normalizeSharedMail(row);
     if (!normalized?.receivedAt) throw new MailReadError("mail_received_time_missing");
-    return db.transaction(() => {
-      const lease = db.prepare("SELECT owner FROM mail_ingestion_leases WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId) as any;
+    return (await db.transaction(async () => {
+      const lease = (await db.prepare("SELECT owner FROM mail_ingestion_leases WHERE provider='shared-mail-api' AND provider_message_id=?").get(messageId)) as any;
       if (lease?.owner !== owner) throw new MailReadError("mail_event_lease_expired", 409);
-      return commitSharedMail(normalized);
-    }).immediate();
+      return (await commitSharedMail(normalized));
+    }).immediate());
   } catch (error) {
-    processingFailure(messageId, owner, error);
+    (await processingFailure(messageId, owner, error));
     throw error instanceof MailReadError ? error : new MailReadError("mail_processing_failed");
   } finally {
-    db.prepare(`UPDATE mail_ingestion_leases SET owner='',lease_until=0
-      WHERE provider='shared-mail-api' AND provider_message_id=? AND owner=?`).run(messageId, owner);
+    (await db.prepare(`UPDATE mail_ingestion_leases SET owner='',lease_until=0
+      WHERE provider='shared-mail-api' AND provider_message_id=? AND owner=?`).run(messageId, owner));
   }
 }
 
 export async function retryPendingSharedMailEvents(): Promise<{ processed: number; errors: number }> {
   if (!config.cfAccountId || !config.cfD1DatabaseId || !config.cfD1ReadToken) return { processed: 0, errors: 0 };
   const before = new Date(Date.now() - config.pendingMailRetryDelayMs).toISOString();
-  const rows = db.prepare(`SELECT s.provider_message_id FROM mail_ingestion_state s
+  const rows = (await db.prepare(`SELECT s.provider_message_id FROM mail_ingestion_state s
     LEFT JOIN mail_ingestion_leases l ON l.provider=s.provider AND l.provider_message_id=s.provider_message_id
     WHERE s.provider='shared-mail-api' AND s.status IN ('pending_time','pending_parse') AND s.attempts<3 AND s.updated_at<=?
       AND COALESCE(l.lease_until,0)<=? AND COALESCE(l.retry_after,0)<=?
-    ORDER BY s.updated_at ASC LIMIT ?`).all(before, Date.now(), Date.now(), config.pendingMailBatchSize) as any[];
+    ORDER BY s.updated_at ASC LIMIT ?`).all(before, Date.now(), Date.now(), config.pendingMailBatchSize)) as any[];
   let processed = 0;
   let errors = 0;
   for (const row of rows) {
@@ -695,12 +695,12 @@ export async function manualSharedMailBackfill(window: BackfillWindow, reader: P
   for (const row of page.rows) {
     const normalized = await normalizeSharedMail(row);
     if (!normalized?.receivedAt) throw new MailReadError("mail_received_time_missing");
-    const result = commitSharedMail(normalized);
+    const result = (await commitSharedMail(normalized));
     inserted += Number(result.inserted);
     claims += result.claims;
     deactivated += Number(result.deactivated);
   }
-  updateSyncState("shared-mail-api", JSON.stringify(page.cursor), "", page.cursor?.createdAt || "");
+  (await updateSyncState("shared-mail-api", JSON.stringify(page.cursor), "", page.cursor?.createdAt || ""));
   return { fetched: page.rows.length, inserted, claims, deactivated, complete: page.complete, cursor: page.cursor };
 }
 
@@ -733,11 +733,11 @@ function outlookMail(item: any): NormalizedMail | null {
 export async function syncOutlookMailboxes(): Promise<{ mailboxes: number; fetched: number; inserted: number; errors: number }> {
   const managerAccounts = await listOutlookManagerAccounts();
   const byHash = new Map(managerAccounts.map((item) => [emailHash(normalizeEmail(item?.email)), item]));
-  const connections = db.prepare(`SELECT c.id, c.binding_id, c.external_account_id, b.account_id,
+  const connections = (await db.prepare(`SELECT c.id, c.binding_id, c.external_account_id, b.account_id,
       b.valid_from, b.valid_to, b.receive_disabled_at
     FROM mailbox_connections c JOIN email_bindings b ON b.id=c.binding_id
-    WHERE c.provider='outlook-manager' AND c.status='active'`).all() as any[];
-  const rules = routingRules();
+    WHERE c.provider='outlook-manager' AND c.status='active'`).all()) as any[];
+  const rules = (await routingRules());
   let mailboxes = 0;
   let fetched = 0;
   let inserted = 0;
@@ -756,21 +756,21 @@ export async function syncOutlookMailboxes(): Promise<{ mailboxes: number; fetch
         const normalized = outlookMail(row);
         if (!normalized) continue;
         if (Date.parse(normalized.receivedAt) > Date.parse(newestAt || "")) newestAt = normalized.receivedAt;
-        const result = upsertMail(source, normalized, rules, {
+        const result = (await upsertMail(source, normalized, rules, {
           binding_id: String(connection.binding_id),
           account_id: String(connection.account_id),
           valid_from: String(connection.valid_from || ""),
           valid_to: String(connection.valid_to || ""),
           receive_disabled_at: String(connection.receive_disabled_at || ""),
-        });
+        }));
         inserted += result.inserted ? 1 : 0;
       }
-      updateSyncState(source, newestAt, "", newestAt);
-      db.prepare("UPDATE mailbox_connections SET last_checked_at=?, updated_at=? WHERE id=?")
-        .run(new Date().toISOString(), new Date().toISOString(), connection.id);
+      (await updateSyncState(source, newestAt, "", newestAt));
+      (await db.prepare("UPDATE mailbox_connections SET last_checked_at=?, updated_at=? WHERE id=?")
+        .run(new Date().toISOString(), new Date().toISOString(), connection.id));
     } catch (error) {
       errors += 1;
-      updateSyncState(source, "", error instanceof Error ? error.message : String(error));
+      (await updateSyncState(source, "", error instanceof Error ? error.message : String(error)));
     }
   }
   return { mailboxes, fetched, inserted, errors };

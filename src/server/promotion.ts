@@ -1,3 +1,4 @@
+import { asyncMap } from './async-collections.js';
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { config } from "./config.js";
@@ -231,10 +232,10 @@ export function parsePromotionResponse(payload: unknown, targetAccountId: string
   };
 }
 
-function promotionCampaignCandidates(): string[] {
+async function promotionCampaignCandidates(): Promise<string[]> {
   const candidates = [...config.promotionCampaignCandidates];
   try {
-    const rows = db.prepare(`SELECT evidence_json FROM promotion_observations ORDER BY checked_at DESC LIMIT 1000`).all() as any[];
+    const rows = (await db.prepare(`SELECT evidence_json FROM promotion_observations ORDER BY checked_at DESC LIMIT 1000`).all()) as any[];
     for (const row of rows) {
       const evidence = object(JSON.parse(String(row.evidence_json || "{}")));
       for (const campaign of uniqueCampaigns(evidence.campaigns)) candidates.push(campaign.id);
@@ -271,9 +272,9 @@ function retryDelay(attempt: number): number {
   return [10 * 60_000, 60 * 60_000, 6 * 60 * 60_000, 24 * 60 * 60_000][Math.min(3, Math.max(0, attempt - 1))];
 }
 
-function activeJob(accountId: string): any {
-  return db.prepare(`SELECT * FROM promotion_jobs WHERE account_id=? AND campaign=?
-    AND status IN ('queued','running','retry_wait') ORDER BY created_at DESC LIMIT 1`).get(accountId, CAMPAIGN);
+async function activeJob(accountId: string): Promise<any> {
+  return (await db.prepare(`SELECT * FROM promotion_jobs WHERE account_id=? AND campaign=?
+    AND status IN ('queued','running','retry_wait') ORDER BY created_at DESC LIMIT 1`).get(accountId, CAMPAIGN));
 }
 
 class PromotionCheckNotNeededError extends Error {
@@ -287,9 +288,9 @@ export function promotionLifecycleEligible(status: unknown): boolean {
   return ["active", "third_party_registered"].includes(String(status || ""));
 }
 
-function assertPromotionCheckNeeded(accountId: string): void {
-  const account = db.prepare(`SELECT lifecycle_status, deactivation_locked, plan, deleted_at
-    FROM gpt_accounts WHERE id=?`).get(accountId) as any;
+async function assertPromotionCheckNeeded(accountId: string): Promise<void> {
+  const account = (await db.prepare(`SELECT lifecycle_status, deactivation_locked, plan, deleted_at
+    FROM gpt_accounts WHERE id=?`).get(accountId)) as any;
   if (!account || String(account.deleted_at || "")) {
     throw new PromotionCheckNotNeededError("missing", "账号不存在或已删除，已跳过优惠检测");
   }
@@ -301,35 +302,35 @@ function assertPromotionCheckNeeded(accountId: string): void {
   }
 }
 
-export function queuePromotionCheck(accountId: string, checkKind: "manual" | "auto" = "manual", dueAt = new Date().toISOString()): Record<string, unknown> {
-  assertPromotionCheckNeeded(accountId);
-  if (!effectiveCheckProxy("promotion_jp")) throw new Error("JP 优惠检查出口尚未配置");
-  const credentials = getPaymentExposureCredentials(accountId);
+export async function queuePromotionCheck(accountId: string, checkKind: "manual" | "auto" = "manual", dueAt = new Date().toISOString()): Promise<Record<string, unknown>> {
+  (await assertPromotionCheckNeeded(accountId));
+  if (!(await effectiveCheckProxy("promotion_jp"))) throw new Error("JP 优惠检查出口尚未配置");
+  const credentials = (await getPaymentExposureCredentials(accountId));
   if (!credentials?.accessToken) throw new Error("账号没有可用的 Access Token");
-  const current = activeJob(accountId);
-  if (current && ["queued", "running"].includes(String(current.status))) return promotionJob(String(current.id))!;
+  const current = (await activeJob(accountId));
+  if (current && ["queued", "running"].includes(String(current.status))) return (await promotionJob(String(current.id)))!;
   const now = new Date().toISOString();
   if (current && String(current.status) === "retry_wait") {
-    db.prepare(`UPDATE promotion_jobs SET check_kind=?, due_at=?, status='queued', next_retry_at='',
-      error_class='', error_detail='', updated_at=? WHERE id=?`).run(checkKind, dueAt, now, current.id);
-    return promotionJob(String(current.id))!;
+    (await db.prepare(`UPDATE promotion_jobs SET check_kind=?, due_at=?, status='queued', next_retry_at='',
+      error_class='', error_detail='', updated_at=? WHERE id=?`).run(checkKind, dueAt, now, current.id));
+    return (await promotionJob(String(current.id)))!;
   }
   const id = crypto.randomUUID();
-  db.prepare(`INSERT INTO promotion_jobs(id, account_id, credential_version_id, campaign, region, check_kind, due_at,
+  (await db.prepare(`INSERT INTO promotion_jobs(id, account_id, credential_version_id, campaign, region, check_kind, due_at,
     status, created_at, updated_at) VALUES(?, ?, ?, ?, 'JP', ?, ?, 'queued', ?, ?)`).run(
     id, accountId, credentials.credentialVersionId || null, CAMPAIGN, checkKind, dueAt, now, now,
-  );
-  return promotionJob(id)!;
+  ));
+  return (await promotionJob(id))!;
 }
 
-export function queuePromotionChecks(accountIds: unknown[]): { requested: number; queued: number; alreadyRunning: number; skipped: number; failed: number; jobs: Array<Record<string, unknown>>; errors: Array<{ accountId: string; error: string; skipped?: boolean; reason?: string }> } {
+export async function queuePromotionChecks(accountIds: unknown[]): Promise<{ requested: number; queued: number; alreadyRunning: number; skipped: number; failed: number; jobs: Array<Record<string, unknown>>; errors: Array<{ accountId: string; error: string; skipped?: boolean; reason?: string }> }> {
   const ids = [...new Set((Array.isArray(accountIds) ? accountIds : []).map((value) => String(value || "").trim()).filter(Boolean))].slice(0, 500);
   const result = { requested: ids.length, queued: 0, alreadyRunning: 0, skipped: 0, failed: 0,
     jobs: [] as Array<Record<string, unknown>>, errors: [] as Array<{ accountId: string; error: string; skipped?: boolean; reason?: string }> };
   for (const accountId of ids) {
     try {
-      const before = activeJob(accountId);
-      const job = queuePromotionCheck(accountId, "manual");
+      const before = (await activeJob(accountId));
+      const job = (await queuePromotionCheck(accountId, "manual"));
       result.jobs.push(job);
       if (before && ["queued", "running"].includes(String(before.status))) result.alreadyRunning += 1;
       else result.queued += 1;
@@ -346,16 +347,15 @@ export function queuePromotionChecks(accountIds: unknown[]): { requested: number
   return result;
 }
 
-export function promotionJobs(ids: unknown[]): Array<Record<string, unknown>> {
-  return [...new Set((Array.isArray(ids) ? ids : []).map((value) => String(value || "").trim()).filter(Boolean))]
-    .slice(0, 500)
-    .map((id) => promotionJob(id))
+export async function promotionJobs(ids: unknown[]): Promise<Array<Record<string, unknown>>> {
+  return (await asyncMap([...new Set((Array.isArray(ids) ? ids : []).map((value) => String(value || "").trim()).filter(Boolean))]
+    .slice(0, 500), async (id) => (await promotionJob(id))))
     .filter((item): item is Record<string, unknown> => Boolean(item));
 }
 
-export function scheduleDuePromotionChecks(now = new Date()): { queued: number } {
+export async function scheduleDuePromotionChecks(now = new Date()): Promise<{ queued: number }> {
   const cutoff = new Date(now.getTime() - config.autoTrialDelayMs).toISOString();
-  const rows = db.prepare(`SELECT a.id account_id, cv.id credential_version_id, cv.first_seen_at
+  const rows = (await db.prepare(`SELECT a.id account_id, cv.id credential_version_id, cv.first_seen_at
     FROM gpt_accounts a
     JOIN account_current_credentials cc ON cc.account_id=a.id
     JOIN credential_versions cv ON cv.id=cc.credential_version_id
@@ -365,17 +365,17 @@ export function scheduleDuePromotionChecks(now = new Date()): { queued: number }
       AND NOT EXISTS(SELECT 1 FROM promotion_jobs j WHERE j.account_id=a.id AND j.credential_version_id=cv.id
         AND j.campaign=? AND (j.status IN ('queued','running') OR (j.status='retry_wait' AND j.next_retry_at>?)))
       AND NOT EXISTS(SELECT 1 FROM promotion_observations o WHERE o.account_id=a.id AND o.credential_version_id=cv.id)
-    ORDER BY cv.first_seen_at ASC LIMIT ?`).all(cutoff, CAMPAIGN, now.toISOString(), config.autoTrialBatchSize) as any[];
+    ORDER BY cv.first_seen_at ASC LIMIT ?`).all(cutoff, CAMPAIGN, now.toISOString(), config.autoTrialBatchSize)) as any[];
   let queued = 0;
   for (const row of rows) {
-    queuePromotionCheck(String(row.account_id), "auto", new Date(Date.parse(String(row.first_seen_at)) + config.autoTrialDelayMs).toISOString());
+    (await queuePromotionCheck(String(row.account_id), "auto", new Date(Date.parse(String(row.first_seen_at)) + config.autoTrialDelayMs).toISOString()));
     queued += 1;
   }
   return { queued };
 }
 
-export function promotionJob(id: string): Record<string, unknown> | null {
-  const row = db.prepare("SELECT * FROM promotion_jobs WHERE id=?").get(id) as any;
+export async function promotionJob(id: string): Promise<Record<string, unknown> | null> {
+  const row = (await db.prepare("SELECT * FROM promotion_jobs WHERE id=?").get(id)) as any;
   if (!row) return null;
   return {
     id: row.id, accountId: row.account_id, credentialVersionId: row.credential_version_id || "",
@@ -389,53 +389,53 @@ export function promotionJob(id: string): Record<string, unknown> | null {
 export async function runPromotionQueue(limit = config.autoTrialBatchSize, concurrency = config.promotionConcurrency): Promise<{ checked: number; eligible: number; ineligible: number; retryable: number; invalid: number }> {
   const now = new Date().toISOString();
   const staleBefore = new Date(Date.now() - Math.max(10 * 60_000, config.promotionTimeoutMs * 3)).toISOString();
-  db.prepare(`UPDATE promotion_jobs SET status='retry_wait', error_class='interrupted_runtime',
+  (await db.prepare(`UPDATE promotion_jobs SET status='retry_wait', error_class='interrupted_runtime',
     error_detail='运行中的优惠任务超时，已恢复为可重试', next_retry_at=?, updated_at=?
-    WHERE status='running' AND updated_at<=?`).run(now, now, staleBefore);
-  db.prepare(`UPDATE promotion_jobs SET status='cancelled', error_class='account_not_eligible',
+    WHERE status='running' AND updated_at<=?`).run(now, now, staleBefore));
+  (await db.prepare(`UPDATE promotion_jobs SET status='cancelled', error_class='account_not_eligible',
     error_detail=CASE WHEN lower(trim((SELECT plan FROM gpt_accounts WHERE id=promotion_jobs.account_id)))='plus'
       THEN '账号已经开通 Plus，无需检测优惠' ELSE '账号已停用或不再活跃，无需检测优惠' END,
     next_retry_at='', finished_at=?, updated_at=?
     WHERE status IN ('queued','retry_wait') AND EXISTS(SELECT 1 FROM gpt_accounts a
       WHERE a.id=promotion_jobs.account_id AND
       (a.deleted_at!='' OR a.lifecycle_status NOT IN ('active','third_party_registered')
-        OR a.deactivation_locked=1 OR lower(trim(a.plan))='plus'))`).run(now, now);
-  const rows = db.prepare(`SELECT * FROM promotion_jobs WHERE
+        OR a.deactivation_locked=1 OR lower(trim(a.plan))='plus'))`).run(now, now));
+  const rows = (await db.prepare(`SELECT * FROM promotion_jobs WHERE
       status='queued' OR (status='retry_wait' AND next_retry_at!='' AND next_retry_at<=?)
-    ORDER BY CASE WHEN check_kind='manual' THEN 0 ELSE 1 END, due_at ASC LIMIT ?`).all(now, limit) as any[];
+    ORDER BY CASE WHEN check_kind='manual' THEN 0 ELSE 1 END, due_at ASC LIMIT ?`).all(now, limit)) as any[];
   const result = { checked: 0, eligible: 0, ineligible: 0, retryable: 0, invalid: 0 };
   let cursor = 0;
   const processRow = async (row: any): Promise<void> => {
-    try { assertPromotionCheckNeeded(String(row.account_id)); }
+    try { (await assertPromotionCheckNeeded(String(row.account_id))); }
     catch (error) {
       if (!(error instanceof PromotionCheckNotNeededError)) throw error;
       const cancelledAt = new Date().toISOString();
-      db.prepare(`UPDATE promotion_jobs SET status='cancelled', error_class='account_not_eligible', error_detail=?,
+      (await db.prepare(`UPDATE promotion_jobs SET status='cancelled', error_class='account_not_eligible', error_detail=?,
         next_retry_at='', finished_at=?, updated_at=? WHERE id=? AND status IN ('queued','retry_wait')`)
-        .run(error.message, cancelledAt, cancelledAt, row.id);
+        .run(error.message, cancelledAt, cancelledAt, row.id));
       return;
     }
-    const credentials = getPaymentExposureCredentials(String(row.account_id));
+    const credentials = (await getPaymentExposureCredentials(String(row.account_id)));
     if (!credentials?.accessToken || (row.credential_version_id && credentials.credentialVersionId !== row.credential_version_id)) {
-      const invalidated = db.prepare(`UPDATE promotion_jobs SET status='credential_invalid', error_class='credential_replaced',
-        error_detail='任务凭证已失效或被替换', finished_at=?, updated_at=? WHERE id=? AND status!='running'`).run(now, now, row.id);
+      const invalidated = (await db.prepare(`UPDATE promotion_jobs SET status='credential_invalid', error_class='credential_replaced',
+        error_detail='任务凭证已失效或被替换', finished_at=?, updated_at=? WHERE id=? AND status!='running'`).run(now, now, row.id));
       if (invalidated.changes) result.invalid += 1;
       return;
     }
     const startedAt = new Date().toISOString();
     const attempt = Number(row.attempt || 0) + 1;
-    const claimed = db.prepare(`UPDATE promotion_jobs SET status='running', attempt=?, started_at=?, error_class='', error_detail='', updated_at=?
+    const claimed = (await db.prepare(`UPDATE promotion_jobs SET status='running', attempt=?, started_at=?, error_class='', error_detail='', updated_at=?
       WHERE id=? AND (status='queued' OR (status='retry_wait' AND next_retry_at!='' AND next_retry_at<=?))`)
-      .run(attempt, startedAt, startedAt, row.id, now);
+      .run(attempt, startedAt, startedAt, row.id, now));
     if (!claimed.changes) return;
     let parsed: ParsedPromotionResult;
     try {
       const targetAccountId = accountIdFromToken(credentials.accessToken);
-      const promotionProxy = effectiveCheckProxy("promotion_jp");
+      const promotionProxy = (await effectiveCheckProxy("promotion_jp"));
       if (!promotionProxy) throw new Error("JP 优惠检查出口尚未配置");
       const response = await runBridge({ accessToken: credentials.accessToken, accountId: targetAccountId,
         email: credentials.email, proxy: promotionProxy,
-        campaigns: promotionCampaignCandidates(),
+        campaigns: (await promotionCampaignCandidates()),
         timeout: Math.ceil(config.promotionTimeoutMs / 1000) });
       parsed = parsePromotionResponse(response, targetAccountId, CAMPAIGN);
     } catch (error) {
@@ -447,8 +447,8 @@ export async function runPromotionQueue(limit = config.autoTrialBatchSize, concu
     result.checked += 1;
     if (parsed.resultStatus === "unknown_retryable") {
       const nextRetryAt = new Date(Date.now() + retryDelay(attempt)).toISOString();
-      db.prepare(`UPDATE promotion_jobs SET status='retry_wait', error_class=?, error_detail=?, next_retry_at=?,
-        finished_at=?, updated_at=? WHERE id=?`).run(parsed.errorClass, parsed.detail, nextRetryAt, finishedAt, finishedAt, row.id);
+      (await db.prepare(`UPDATE promotion_jobs SET status='retry_wait', error_class=?, error_detail=?, next_retry_at=?,
+        finished_at=?, updated_at=? WHERE id=?`).run(parsed.errorClass, parsed.detail, nextRetryAt, finishedAt, finishedAt, row.id));
       result.retryable += 1;
       return;
     }
@@ -457,21 +457,21 @@ export async function runPromotionQueue(limit = config.autoTrialBatchSize, concu
     // AT. Manual single-account and bulk actions can explicitly create newer
     // observations, while transport failures continue using retry_wait.
     const expiresAt = "";
-    db.transaction(() => {
-      db.prepare(`INSERT INTO promotion_observations(id, job_id, account_id, credential_version_id, campaign, eligible,
+    (await db.transaction(async () => {
+      (await db.prepare(`INSERT INTO promotion_observations(id, job_id, account_id, credential_version_id, campaign, eligible,
         result_status, upstream_status, evidence_json, response_hash, checked_at, expires_at, created_at)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
         crypto.randomUUID(), row.id, row.account_id, row.credential_version_id || null, CAMPAIGN,
         parsed.eligible === null ? null : parsed.eligible ? 1 : 0, parsed.resultStatus, parsed.upstreamStatus,
         JSON.stringify({ detail: parsed.detail, campaigns: parsed.campaigns, ...parsed.evidence }), parsed.responseHash, finishedAt, expiresAt, finishedAt,
-      );
-      db.prepare(`UPDATE promotion_jobs SET status=?, error_class=?, error_detail=?, next_retry_at='', finished_at=?, updated_at=? WHERE id=?`).run(
+      ));
+      (await db.prepare(`UPDATE promotion_jobs SET status=?, error_class=?, error_detail=?, next_retry_at='', finished_at=?, updated_at=? WHERE id=?`).run(
         parsed.resultStatus === "credential_invalid" ? "credential_invalid" : "completed", parsed.errorClass, parsed.detail, finishedAt, finishedAt, row.id,
-      );
+      ));
       if (parsed.resultStatus === "credential_invalid" && row.credential_version_id) {
-        invalidateCredentialVersion(String(row.credential_version_id), finishedAt);
+        (await invalidateCredentialVersion(String(row.credential_version_id), finishedAt));
       }
-    })();
+    })());
     if (eligible) result.eligible += 1;
     else if (parsed.resultStatus === "ineligible") result.ineligible += 1;
     else result.invalid += 1;
@@ -487,10 +487,10 @@ export async function runPromotionQueue(limit = config.autoTrialBatchSize, concu
   return result;
 }
 
-export function latestPromotionForAccount(accountId: string): Record<string, unknown> | null {
-  const row = db.prepare(`SELECT o.*, j.region, j.check_kind FROM promotion_observations o
+export async function latestPromotionForAccount(accountId: string): Promise<Record<string, unknown> | null> {
+  const row = (await db.prepare(`SELECT o.*, j.region, j.check_kind FROM promotion_observations o
     JOIN promotion_jobs j ON j.id=o.job_id WHERE o.account_id=? AND o.result_status IN ('eligible','ineligible')
-    ORDER BY o.checked_at DESC LIMIT 1`).get(accountId) as any;
+    ORDER BY o.checked_at DESC LIMIT 1`).get(accountId)) as any;
   return row ? { eligible: row.eligible === null ? null : Boolean(row.eligible), status: row.result_status,
     campaign: row.campaign, region: row.region, checkKind: row.check_kind, checkedAt: row.checked_at,
     expiresAt: row.expires_at, evidence: object(JSON.parse(String(row.evidence_json || "{}"))) } : null;

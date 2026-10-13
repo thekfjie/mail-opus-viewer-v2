@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import test from "node:test";
 import { smokeProduction } from "../scripts/smoke-production.js";
 
@@ -23,12 +23,12 @@ test("candidate smoke uses explicit protected credentials and local header-only 
   };
   fs.writeFileSync(environment, `VIEWER_ADMIN_PASSWORD=fake-smoke-admin-password\nCREDENTIAL_ENCRYPTION_KEY=${secret}\n`, { mode: 0o600 });
   const db = new Database(filename);
-  db.exec(`CREATE TABLE gpt_accounts(id TEXT PRIMARY KEY,deleted_at TEXT); INSERT INTO gpt_accounts VALUES('account','');
+  (await db.exec(`CREATE TABLE gpt_accounts(id TEXT PRIMARY KEY,deleted_at TEXT); INSERT INTO gpt_accounts VALUES('account','');
     CREATE TABLE access_grants(account_id TEXT,login_identifier_enc TEXT,password_plain_enc TEXT,public_token_enc TEXT,
-      login_identifier_hash TEXT,active INTEGER,scope TEXT,created_at TEXT);`);
-  db.prepare("INSERT INTO access_grants VALUES('account',?,?,?,'fake-hash',1,'current','2026-09-08T00:00:00Z')")
-    .run(encrypt(email), encrypt(password), encrypt(token));
-  db.close();
+      login_identifier_hash TEXT,active INTEGER,scope TEXT,created_at TEXT);`));
+  (await db.prepare("INSERT INTO access_grants VALUES('account',?,?,?,'fake-hash',1,'current','2026-09-08T00:00:00Z')")
+    .run(encrypt(email), encrypt(password), encrypt(token)));
+  (await db.close());
   const before = fs.readFileSync(filename);
   const paths: string[] = [];
   let leakBody = false;

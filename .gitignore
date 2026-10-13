@@ -21,3 +21,5 @@ __pycache__/
 *.py[cod]
 .state/
 .venv/
+*.sql
+*.sql.gz

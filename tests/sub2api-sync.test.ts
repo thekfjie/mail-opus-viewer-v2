@@ -72,157 +72,157 @@ test("Sub2API 只同步活 OpenAI 凭证并保持改绑隔离规则", async (t) 
     import("../src/server/crypto.js"),
     import("../src/server/sub2api-sync.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
   const now = "2026-08-19T00:00:00.000Z";
-  function seed(accountId: string, email: string, subject: string, deactivated = false, source = "legacy-v1") {
+  async function seed(accountId: string, email: string, subject: string, deactivated = false, source = "legacy-v1") {
     const [localPart, domain] = email.split("@");
     const familyId = `family-${accountId}`;
     const bindingId = `binding-${accountId}`;
-    db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, deactivation_locked, deactivated_at, plan, arrived_at, created_at, updated_at)
-      VALUES(?, ?, ?, ?, 'free', ?, ?, ?)`).run(accountId, deactivated ? "deactivated" : "active", deactivated ? 1 : 0, deactivated ? now : "", now, now, now);
-    db.prepare(`INSERT INTO mailbox_families(id, provider, canonical_address_enc, canonical_address_hash, created_at, updated_at)
-      VALUES(?, 'icloud', ?, ?, ?, ?)`).run(familyId, encryptSecret(email), emailHash(email), now, now);
-    db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
+    (await db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, deactivation_locked, deactivated_at, plan, arrived_at, created_at, updated_at)
+      VALUES(?, ?, ?, ?, 'free', ?, ?, ?)`).run(accountId, deactivated ? "deactivated" : "active", deactivated ? 1 : 0, deactivated ? now : "", now, now, now));
+    (await db.prepare(`INSERT INTO mailbox_families(id, provider, canonical_address_enc, canonical_address_hash, created_at, updated_at)
+      VALUES(?, 'icloud', ?, ?, ?, ?)`).run(familyId, encryptSecret(email), emailHash(email), now, now));
+    (await db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
       valid_from, is_current, legacy_mapping_id, created_at, updated_at)
-      VALUES(?, ?, ?, ?, ?, ?, ?, 'icloud', ?, 1, ?, ?, ?)`).run(bindingId, accountId, familyId, encryptSecret(email), emailHash(email), localPart, domain, now, `legacy-${accountId}`, now, now);
-    db.prepare(`INSERT INTO credentials(account_id, access_token_enc, refresh_token_enc, openai_subject_hash,
+      VALUES(?, ?, ?, ?, ?, ?, ?, 'icloud', ?, 1, ?, ?, ?)`).run(bindingId, accountId, familyId, encryptSecret(email), emailHash(email), localPart, domain, now, `legacy-${accountId}`, now, now));
+    (await db.prepare(`INSERT INTO credentials(account_id, access_token_enc, refresh_token_enc, openai_subject_hash,
       access_token_alive, refresh_token_alive, source, updated_at)
-      VALUES(?, '', '', ?, 0, 0, ?, ?)`).run(accountId, identityHash(subject), source, now);
+      VALUES(?, '', '', ?, 0, 0, ?, ?)`).run(accountId, identityHash(subject), source, now));
   }
 
-  seed("account-a", "same+oai@icloud.com", "identity-a", true);
-  seed("account-b", "old-local@icloud.com", "identity-b");
-  seed("account-conflict", "conflict@kfjie.me", "identity-old");
-  seed("stale-account", "stale@icloud.com", "identity-stale", false, "sub2api-active");
-  seed("stale-rebind-account", "stale-rebind@ai-mail.tech", "identity-stale-rebind");
-  db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
-  db.prepare("UPDATE email_bindings SET valid_from='2026-08-21T00:00:00.000Z' WHERE account_id='stale-rebind-account'").run();
-  db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
+  (await seed("account-a", "same+oai@icloud.com", "identity-a", true));
+  (await seed("account-b", "old-local@icloud.com", "identity-b"));
+  (await seed("account-conflict", "conflict@kfjie.me", "identity-old"));
+  (await seed("stale-account", "stale@icloud.com", "identity-stale", false, "sub2api-active"));
+  (await seed("stale-rebind-account", "stale-rebind@ai-mail.tech", "identity-stale-rebind"));
+  (await db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run());
+  (await db.prepare("UPDATE email_bindings SET valid_from='2026-08-21T00:00:00.000Z' WHERE account_id='stale-rebind-account'").run());
+  (await db.prepare(`INSERT INTO email_bindings(id, account_id, mailbox_family_id, email_enc, email_hash, local_part, domain, provider,
     valid_from, valid_to, is_current, association_method, legacy_mapping_id, created_at, updated_at)
     VALUES('binding-stale-rebind-old', 'stale-rebind-account', 'family-stale-rebind-account', ?, ?, 'stale-rebind', 'icloud.com', 'icloud',
       '2026-08-19T00:00:00.000Z', '2026-08-21T00:00:00.000Z', 0, 'legacy_explicit_rebind', 'legacy-stale-rebind-old', ?, ?)`).run(
     encryptSecret("stale-rebind@icloud.com"), emailHash("stale-rebind@icloud.com"), now, now,
-  );
-  db.prepare("UPDATE credentials SET access_token_enc=?, refresh_token_enc=?, access_token_alive=1, refresh_token_alive=1 WHERE account_id='stale-rebind-account'")
-    .run(encryptSecret("fresh-target-at"), encryptSecret("fresh-target-rt"));
-  db.prepare("UPDATE credentials SET access_token_enc=?, refresh_token_enc=?, access_token_alive=1, refresh_token_alive=1 WHERE account_id='stale-account'")
-    .run(encryptSecret("stale-at"), encryptSecret("stale-rt"));
-  db.prepare(`INSERT INTO sales(id, account_id, binding_id, status, started_at, first_used_at, last_used_at, created_at, updated_at)
-    VALUES('sale-a', 'account-a', 'binding-account-a', 'active', ?, ?, ?, ?, ?)`).run(now, now, now, now, now);
-  db.prepare(`INSERT INTO access_grants(id, account_id, binding_id, sale_id, public_token_hash, login_identifier_hash,
+  ));
+  (await db.prepare("UPDATE credentials SET access_token_enc=?, refresh_token_enc=?, access_token_alive=1, refresh_token_alive=1 WHERE account_id='stale-rebind-account'")
+    .run(encryptSecret("fresh-target-at"), encryptSecret("fresh-target-rt")));
+  (await db.prepare("UPDATE credentials SET access_token_enc=?, refresh_token_enc=?, access_token_alive=1, refresh_token_alive=1 WHERE account_id='stale-account'")
+    .run(encryptSecret("stale-at"), encryptSecret("stale-rt")));
+  (await db.prepare(`INSERT INTO sales(id, account_id, binding_id, status, started_at, first_used_at, last_used_at, created_at, updated_at)
+    VALUES('sale-a', 'account-a', 'binding-account-a', 'active', ?, ?, ?, ?, ?)`).run(now, now, now, now, now));
+  (await db.prepare(`INSERT INTO access_grants(id, account_id, binding_id, sale_id, public_token_hash, login_identifier_hash,
     login_identifier_enc, password_hash, scope, visible_from, active, first_used_at, last_used_at, created_at, updated_at)
-    VALUES('grant-a', 'account-a', 'binding-account-a', 'sale-a', 'public-a', 'login-a', '', 'password', 'current', ?, 1, ?, ?, ?, ?)`).run(now, now, now, now, now);
-  db.prepare("UPDATE gpt_accounts SET sold=1 WHERE id='account-a'").run();
+    VALUES('grant-a', 'account-a', 'binding-account-a', 'sale-a', 'public-a', 'login-a', '', 'password', 'current', ?, 1, ?, ?, ?, ?)`).run(now, now, now, now, now));
+  (await db.prepare("UPDATE gpt_accounts SET sold=1 WHERE id='account-a'").run());
 
   const result = await syncSub2ApiAlive();
   assert.deepEqual(result, { total: 7, active: 5, matched: 4, created: 1, rebinds: 1, conflicts: 2, skipped: 0 });
 
-  const stopped = db.prepare("SELECT lifecycle_status, deactivation_locked, plan FROM gpt_accounts WHERE id='account-a'").get() as any;
+  const stopped = (await db.prepare("SELECT lifecycle_status, deactivation_locked, plan FROM gpt_accounts WHERE id='account-a'").get()) as any;
   assert.deepEqual(stopped, { lifecycle_status: "deactivated", deactivation_locked: 1, plan: "plus" });
-  const rebind = db.prepare("SELECT id, is_current FROM email_bindings WHERE account_id='account-a' AND email_hash=?").get(emailHash("same+oai@ai-mail.tech")) as any;
+  const rebind = (await db.prepare("SELECT id, is_current FROM email_bindings WHERE account_id='account-a' AND email_hash=?").get(emailHash("same+oai@ai-mail.tech"))) as any;
   assert.ok(rebind);
   assert.equal(rebind.is_current, 1);
-  const newGrant = db.prepare("SELECT scope, active FROM access_grants WHERE binding_id=?").get(rebind.id) as any;
+  const newGrant = (await db.prepare("SELECT scope, active FROM access_grants WHERE binding_id=?").get(rebind.id)) as any;
   assert.deepEqual(newGrant, { scope: "admin_only", active: 0 });
-  const oldGrant = db.prepare("SELECT scope, active, visible_to FROM access_grants WHERE id='grant-a'").get() as any;
+  const oldGrant = (await db.prepare("SELECT scope, active, visible_to FROM access_grants WHERE id='grant-a'").get()) as any;
   assert.equal(oldGrant.scope, "historical");
   assert.equal(oldGrant.active, 1);
   assert.ok(oldGrant.visible_to);
 
-  assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE account_id='account-b'").get() as any).count), 1);
-  assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM pending_reviews WHERE account_id='account-b' AND status='pending'").get() as any).count), 1);
+  assert.equal(Number(((await db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE account_id='account-b'").get()) as any).count), 1);
+  assert.equal(Number(((await db.prepare("SELECT COUNT(*) AS count FROM pending_reviews WHERE account_id='account-b' AND status='pending'").get()) as any).count), 1);
 
-  const created = db.prepare("SELECT id, lifecycle_status FROM gpt_accounts WHERE id NOT IN ('account-a','account-b','account-conflict','stale-account','stale-rebind-account')").get() as any;
+  const created = (await db.prepare("SELECT id, lifecycle_status FROM gpt_accounts WHERE id NOT IN ('account-a','account-b','account-conflict','stale-account','stale-rebind-account')").get()) as any;
   assert.ok(created);
   assert.equal(created.lifecycle_status, "active");
-  const createdGrant = db.prepare("SELECT scope, active FROM access_grants WHERE account_id=?").get(created.id) as any;
+  const createdGrant = (await db.prepare("SELECT scope, active FROM access_grants WHERE account_id=?").get(created.id)) as any;
   assert.deepEqual(createdGrant, { scope: "admin_only", active: 0 });
-  db.prepare("UPDATE gpt_accounts SET plan='free' WHERE id=?").run(created.id);
-  db.prepare(`INSERT INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
-    VALUES('trial-only-correction', ?, 'plus_trial_only_corrected', ?, 'test', '{}', ?)`).run(created.id, now, now);
+  (await db.prepare("UPDATE gpt_accounts SET plan='free' WHERE id=?").run(created.id));
+  (await db.prepare(`INSERT INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
+    VALUES('trial-only-correction', ?, 'plus_trial_only_corrected', ?, 'test', '{}', ?)`).run(created.id, now, now));
   await syncSub2ApiAlive();
-  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id=?").get(created.id) as any).plan, "free");
-  assert.equal(Number((db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE email_hash=?").get(emailHash("broken@kfjie.me")) as any).count), 0);
-  const staleRebind = db.prepare(`SELECT b.domain, b.is_current, a.plan
+  assert.equal(((await db.prepare("SELECT plan FROM gpt_accounts WHERE id=?").get(created.id)) as any).plan, "free");
+  assert.equal(Number(((await db.prepare("SELECT COUNT(*) AS count FROM email_bindings WHERE email_hash=?").get(emailHash("broken@kfjie.me"))) as any).count), 0);
+  const staleRebind = (await db.prepare(`SELECT b.domain, b.is_current, a.plan
     FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
-    WHERE a.id='stale-rebind-account' ORDER BY b.is_current DESC LIMIT 1`).get() as any;
+    WHERE a.id='stale-rebind-account' ORDER BY b.is_current DESC LIMIT 1`).get()) as any;
   assert.deepEqual(staleRebind, { domain: "ai-mail.tech", is_current: 1, plan: "plus" });
-  const staleRebindCredential = db.prepare("SELECT access_token_enc, refresh_token_enc FROM credentials WHERE account_id='stale-rebind-account'").get() as any;
+  const staleRebindCredential = (await db.prepare("SELECT access_token_enc, refresh_token_enc FROM credentials WHERE account_id='stale-rebind-account'").get()) as any;
   assert.equal(decryptSecret(staleRebindCredential.access_token_enc), "fresh-target-at");
   assert.equal(decryptSecret(staleRebindCredential.refresh_token_enc), "fresh-target-rt");
 
   // An administrator-confirmed regional billing channel is durable Plus
   // evidence. A later stale Free snapshot must not erase a paid account.
-  db.prepare("UPDATE gpt_accounts SET plan='plus', billing_channel_override='vn-momo' WHERE id='account-b'").run();
+  (await db.prepare("UPDATE gpt_accounts SET plan='plus', billing_channel_override='vn-momo' WHERE id='account-b'").run());
   await syncSub2ApiAlive();
-  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='account-b'").get() as any).plan, "plus");
+  assert.equal(((await db.prepare("SELECT plan FROM gpt_accounts WHERE id='account-b'").get()) as any).plan, "plus");
 
   // Header-only "new plan" subjects are fetch candidates, not proof that a
   // paid subscription became active. A stale upstream Free snapshot may
   // therefore clear the derived plan.
-  db.prepare(`INSERT INTO mail_messages(
+  (await db.prepare(`INSERT INTO mail_messages(
     id, provider, provider_message_id, sender, subject, received_at, category, indexed_at
   ) VALUES('plus-receipt', 'shared-mail-api', 'plus-receipt', 'OpenAI', 'ChatGPT - Your new plan', ?, 'billing', ?)`)
-    .run(now, now);
-  db.prepare(`INSERT INTO mail_ownership_claims(
+    .run(now, now));
+  (await db.prepare(`INSERT INTO mail_ownership_claims(
     message_id, account_id, binding_id, claim_type, reason, visible_to_customer, created_at
   ) VALUES('plus-receipt', 'stale-rebind-account', 'binding-stale-rebind-account', 'test', 'activation evidence', 1, ?)`)
-    .run(now);
-  db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
+    .run(now));
+  (await db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run());
   await syncSub2ApiAlive();
-  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
+  assert.equal(((await db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get()) as any).plan, "plus");
 
   // Mail-confirmed Plus is authoritative even when the account has no useful
   // Sub2API plan snapshot. The sync may refresh credentials, but it cannot
   // downgrade a mail-confirmed paid result.
-  db.prepare(`INSERT OR IGNORE INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
+  (await db.prepare(`INSERT OR IGNORE INTO lifecycle_events(id, account_id, event_type, occurred_at, source, payload_json, created_at)
     VALUES('plus-mail-authority', 'stale-rebind-account', 'plus_activated_by_mail', ?, 'test', ?, ?)`)
-    .run(now, JSON.stringify({ messageId: 'mail-plus-authority', evidence: 'account_level_subscription_body' }), now);
-  db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
+    .run(now, JSON.stringify({ messageId: 'mail-plus-authority', evidence: 'account_level_subscription_body' }), now));
+  (await db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run());
   await syncSub2ApiAlive();
-  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
+  assert.equal(((await db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get()) as any).plan, "plus");
 
-  db.prepare(`INSERT INTO mail_messages(
+  (await db.prepare(`INSERT INTO mail_messages(
     id, provider, provider_message_id, sender, subject, received_at, category, indexed_at
   ) VALUES('strict-plus-receipt', 'shared-mail-api', 'strict-plus-receipt', 'OpenAI', 'Welcome to ChatGPT Plus', ?, 'billing', ?)`)
-    .run(now, now);
-  db.prepare(`INSERT INTO mail_ownership_claims(
+    .run(now, now));
+  (await db.prepare(`INSERT INTO mail_ownership_claims(
     message_id, account_id, binding_id, claim_type, reason, visible_to_customer, created_at
   ) VALUES('strict-plus-receipt', 'stale-rebind-account', 'binding-stale-rebind-account', 'test', 'strict activation evidence', 1, ?)`)
-    .run(now);
-  db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run();
+    .run(now));
+  (await db.prepare("UPDATE gpt_accounts SET plan='plus' WHERE id='stale-rebind-account'").run());
   await syncSub2ApiAlive();
-  assert.equal((db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get() as any).plan, "plus");
+  assert.equal(((await db.prepare("SELECT plan FROM gpt_accounts WHERE id='stale-rebind-account'").get()) as any).plan, "plus");
 
-  const conflict = db.prepare("SELECT lifecycle_status, identity_status FROM gpt_accounts WHERE id='account-conflict'").get() as any;
+  const conflict = (await db.prepare("SELECT lifecycle_status, identity_status FROM gpt_accounts WHERE id='account-conflict'").get()) as any;
   assert.deepEqual(conflict, { lifecycle_status: "active", identity_status: "unknown" });
-  assert.equal((db.prepare("SELECT access_token_alive FROM credentials WHERE account_id='account-conflict'").get() as any).access_token_alive, 0);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM lifecycle_events WHERE account_id='account-conflict' AND event_type='account_quarantined'").get() as any).n, 0);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM pending_reviews WHERE account_id='account-conflict' AND status='pending'").get() as any).n, 1);
+  assert.equal(((await db.prepare("SELECT access_token_alive FROM credentials WHERE account_id='account-conflict'").get()) as any).access_token_alive, 0);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM lifecycle_events WHERE account_id='account-conflict' AND event_type='account_quarantined'").get()) as any).n, 0);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM pending_reviews WHERE account_id='account-conflict' AND status='pending'").get()) as any).n, 1);
 
-  const stale = db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='stale-account'").get() as any;
+  const stale = (await db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='stale-account'").get()) as any;
   assert.deepEqual(stale, { access_token_alive: 0, refresh_token_alive: 0 });
 
-  const invalidVersion = db.prepare("SELECT credential_version_id FROM account_current_credentials WHERE account_id='account-a'").get() as any;
-  const invalidated = db.prepare("UPDATE credential_versions SET validity_status='invalid', validity_checked_at=? WHERE id=?")
-    .run(now, invalidVersion.credential_version_id);
+  const invalidVersion = (await db.prepare("SELECT credential_version_id FROM account_current_credentials WHERE account_id='account-a'").get()) as any;
+  const invalidated = (await db.prepare("UPDATE credential_versions SET validity_status='invalid', validity_checked_at=? WHERE id=?")
+    .run(now, invalidVersion.credential_version_id));
   assert.equal(invalidated.changes, 1);
-  const beforeResync = db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
+  const beforeResync = (await db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
     FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
-    WHERE cc.account_id='account-a'`).get() as any;
+    WHERE cc.account_id='account-a'`).get()) as any;
   assert.equal(beforeResync.validity_status, "invalid");
   await syncSub2ApiAlive();
-  const afterResync = db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
+  const afterResync = (await db.prepare(`SELECT cc.credential_version_id, cv.token_fingerprint, cv.validity_status
     FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
-    WHERE cc.account_id='account-a'`).get() as any;
+    WHERE cc.account_id='account-a'`).get()) as any;
   assert.deepEqual(afterResync, beforeResync);
-  assert.deepEqual(db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='account-a'").get(), {
+  assert.deepEqual((await db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id='account-a'").get()), {
     access_token_alive: 0, refresh_token_alive: 0,
   });
 
   metadata.find((item) => item.name === "brand-new")!.status = "error";
   await syncSub2ApiAlive();
-  const noLongerActive = db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id=?").get(created.id) as any;
+  const noLongerActive = (await db.prepare("SELECT access_token_alive, refresh_token_alive FROM credentials WHERE account_id=?").get(created.id)) as any;
   assert.deepEqual(noLongerActive, { access_token_alive: 0, refresh_token_alive: 0 });
 });

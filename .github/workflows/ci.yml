@@ -1,0 +1,48 @@
+name: Verify
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: integration-only-password
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: opusmail_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1"
+          --health-interval=5s --health-timeout=3s --health-retries=30
+      redis:
+        image: redis:7.4-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=3s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: sudo apt-get update && sudo apt-get install -y mysql-client
+      - run: npm run test:integration
+        env:
+          MYSQL_URL: mysql://root:integration-only-password@127.0.0.1:3306/opusmail_test
+          REDIS_URL: redis://127.0.0.1:6379
+          ENV_FILE: /dev/null
+      - run: npm run build
+      - run: cp .env.example .env && docker compose build
+        env:
+          MYSQL_PASSWORD: build-only
+          MYSQL_ROOT_PASSWORD: build-only
+          REDIS_PASSWORD: build-only
+          V2_SESSION_SECRET: build-only
+          CREDENTIAL_ENCRYPTION_KEY: build-only
+          VIEWER_ADMIN_PASSWORD: build-only
