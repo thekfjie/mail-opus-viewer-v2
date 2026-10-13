@@ -58,14 +58,14 @@ test("取得新 AT 的域名换绑目标按完成时间排序，预创建占位�
     import("../src/server/repository.js"),
     import("../src/server/legacy-import.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  syncFromV1();
-  const domainRows = repository.listAccounts({ provider: "domain", limit: 10 }).results;
+  (await syncFromV1());
+  const domainRows = (await repository.listAccounts({ provider: "domain", limit: 10 })).results;
   assert.deepEqual(domainRows.slice(0, 2).map((item) => item.primaryEmail), [
     "scree_yonder.0j@ai-mail.tech",
     "other@ai-mail.tech",
   ]);
   assert.equal(domainRows[0].arrivedAt, "2026-08-29T14:00:00.000Z");
-  assert.equal(repository.revealCredentials(domainRows[0].id)?.accessToken, "fresh-target-at");
+  assert.equal((await repository.revealCredentials(domainRows[0].id))?.accessToken, "fresh-target-at");
 });

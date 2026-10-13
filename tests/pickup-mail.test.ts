@@ -19,7 +19,7 @@ test("公开取件覆盖未注册邮箱、多语言、历史索引和收件人�
     import("../src/server/mail-classification.js"), import("../src/server/migrations.js"), import("../src/server/cf-mail.js"),
   ]);
   const app = await buildApp();
-  t.after(async () => { await app.close(); db.close(); fs.rmSync(directory, { recursive: true }); });
+  t.after(async () => { await app.close(); (await db.close()); fs.rmSync(directory, { recursive: true }); });
   const mailRows = new Map<string, any>();
   const reads: string[] = [];
   let readFailure = false;
@@ -31,7 +31,7 @@ test("公开取件覆盖未注册邮箱、多语言、历史索引和收件人�
   } };
   t.mock.method(upstream.sharedMailReader, "byId", reader.byId);
   const now = Date.now() - 60_000;
-  const since = new Date(now - 3_600_000).toISOString();
+  const since = new Date(now - 1_800_000).toISOString();
   const subject = "Mã xác minh tạm thời của bạn cho ChatGPT";
   const canary = "MAIL-BODY-CANARY-NOT-FOR-STORAGE";
   let nextId = 1000;
@@ -75,8 +75,8 @@ test("公开取件覆盖未注册邮箱、多语言、历史索引和收件人�
   await addMail(sourceEmail, sourceEmail, "999999", now + 1_000, "ChatGPT - Your new plan");
 
   await t.test("未创建账号或 pending 时也能读取越南语验证码，并合并并发请求", async () => {
-    assert.equal((db.prepare("SELECT count(*) n FROM gpt_accounts").get() as any).n, 0);
-    assert.equal((db.prepare("SELECT count(*) n FROM pending_mailboxes").get() as any).n, 0);
+    assert.equal(((await db.prepare("SELECT count(*) n FROM gpt_accounts").get()) as any).n, 0);
+    assert.equal(((await db.prepare("SELECT count(*) n FROM pending_mailboxes").get()) as any).n, 0);
     const before = reads.length;
     const result = await Promise.all(Array.from({ length: 8 }, () => pickup.pickupMailboxVerificationCode(email, options, reader)));
     assert.ok(result.every((item: any) => item.item.verificationCode === "123456"));
@@ -94,24 +94,24 @@ test("公开取件覆盖未注册邮箱、多语言、历史索引和收件人�
     assert.deepEqual(reads.slice(before), [newId]);
   });
 
-  await t.test("已有索引离线补全收件人查询和多语言分类，迁移可重复执行", () => {
-    db.prepare("DELETE FROM mail_recipient_index").run();
-    db.prepare("UPDATE mail_messages SET category='general',is_security=0 WHERE provider_message_id=?").run(firstId);
-    db.prepare("DELETE FROM schema_meta WHERE version>=16").run();
-    assert.deepEqual(runMigrations(db).map((entry) => entry.version), [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
-    assert.equal((db.prepare("SELECT category FROM mail_messages WHERE provider_message_id=?").get(firstId) as any).category, "security");
-    assert.ok((db.prepare("SELECT count(*) n FROM mail_recipient_index").get() as any).n > 0);
-    assert.deepEqual(runMigrations(db), []);
+  await t.test("已有索引离线补全收件人查询和多语言分类，迁移可重复执行", async () => {
+    (await db.prepare("DELETE FROM mail_recipient_index").run());
+    (await db.prepare("UPDATE mail_messages SET category='general',is_security=0 WHERE provider_message_id=?").run(firstId));
+    (await db.prepare("DELETE FROM schema_meta WHERE version>=16").run());
+    assert.deepEqual((await runMigrations(db)).map((entry) => entry.version), [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29]);
+    assert.equal(((await db.prepare("SELECT category FROM mail_messages WHERE provider_message_id=?").get(firstId)) as any).category, "security");
+    assert.ok(((await db.prepare("SELECT count(*) n FROM mail_recipient_index").get()) as any).n > 0);
+    assert.deepEqual((await runMigrations(db)), []);
   });
 
   await t.test("V16 升级到 V17 修复已有日语登录码，不改已确认邮件归属", async () => {
     const id = await addMail("japanese@icloud.com", "japanese@icloud.com", "445566", now, "ChatGPT 用の一時ログインコード");
-    db.prepare("UPDATE mail_messages SET category='general',is_security=0 WHERE provider_message_id=?").run(id);
-    db.prepare("DELETE FROM schema_meta WHERE version>=17").run();
-    const claims = JSON.stringify(db.prepare("SELECT * FROM mail_ownership_claims ORDER BY message_id,binding_id").all());
-    assert.deepEqual(runMigrations(db).map((entry) => entry.version), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
-    assert.equal((db.prepare("SELECT category FROM mail_messages WHERE provider_message_id=?").get(id) as any).category, "security");
-    assert.equal(JSON.stringify(db.prepare("SELECT * FROM mail_ownership_claims ORDER BY message_id,binding_id").all()), claims);
+    (await db.prepare("UPDATE mail_messages SET category='general',is_security=0 WHERE provider_message_id=?").run(id));
+    (await db.prepare("DELETE FROM schema_meta WHERE version>=17").run());
+    const claims = JSON.stringify((await db.prepare("SELECT * FROM mail_ownership_claims ORDER BY message_id,binding_id").all()));
+    assert.deepEqual((await runMigrations(db)).map((entry) => entry.version), [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29]);
+    assert.equal(((await db.prepare("SELECT category FROM mail_messages WHERE provider_message_id=?").get(id)) as any).category, "security");
+    assert.equal(JSON.stringify((await db.prepare("SELECT * FROM mail_ownership_claims ORDER BY message_id,binding_id").all())), claims);
     const result = await pickup.pickupMailboxVerificationCode("japanese+oai123@icloud.com", {
       sourceEmail: "japanese@icloud.com", since, allowBaseRecipient: true,
     }, reader) as any;
@@ -157,7 +157,7 @@ test("公开取件覆盖未注册邮箱、多语言、历史索引和收件人�
   await t.test("Opus 中的同源注册任务也阻止不明确的源邮箱回退", async () => {
     const { upsertCompatibilityAccount, SIGNUP_NOTE } = await import("../src/server/compatibility-state.js");
     const source = "pending-peer@icloud.com";
-    upsertCompatibilityAccount({ email: "pending-peer+oaisecond@icloud.com", note: SIGNUP_NOTE });
+    (await upsertCompatibilityAccount({ email: "pending-peer+oaisecond@icloud.com", note: SIGNUP_NOTE }));
     await addMail(source, source, "335566");
     await assert.rejects(pickup.pickupMailboxVerificationCode("pending-peer+oaifirst@icloud.com", {
       sourceEmail: source, since, allowBaseRecipient: true,

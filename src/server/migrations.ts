@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type Database from "better-sqlite3";
+import type { Database } from "./storage/types.js";
 import { isPlanOrderSubject } from "./plus-evidence.js";
 import { applyMailIngestionSchema } from "./cf-mail.js";
 import { applyBusinessEvidenceSchema } from "./business-evidence.js";
@@ -8,28 +8,28 @@ import { applyMailRecipientIndex, repairVerificationCategories } from "./mail-re
 import { decryptSecret } from "./crypto.js";
 import { normalizeEmail, splitEmail } from "./association.js";
 
-type SqliteDatabase = Database.Database;
+type SqliteDatabase = Database;
 
 function sha256(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function hasColumn(database: SqliteDatabase, table: string, column: string): boolean {
-  return (database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((row) => row.name === column);
+async function hasColumn(database: SqliteDatabase, table: string, column: string): Promise<boolean> {
+  return ((await database.prepare(`PRAGMA table_info(${table})`).all()) as Array<{ name: string }>).some((row) => row.name === column);
 }
 
-function hasTable(database: SqliteDatabase, table: string): boolean {
-  return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table));
+async function hasTable(database: SqliteDatabase, table: string): Promise<boolean> {
+  return Boolean((await database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)));
 }
 
-function addColumn(database: SqliteDatabase, table: string, column: string, declaration: string): void {
-  if (!hasColumn(database, table, column)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
+async function addColumn(database: SqliteDatabase, table: string, column: string, declaration: string): Promise<void> {
+  if (!(await hasColumn(database, table, column))) (await database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`));
 }
 
-function applySchemaV7(database: SqliteDatabase): void {
-  addColumn(database, "email_bindings", "receive_disabled_at", "TEXT NOT NULL DEFAULT ''");
-  addColumn(database, "gpt_accounts", "billing_channel_override", "TEXT NOT NULL DEFAULT ''");
-  database.exec(`
+async function applySchemaV7(database: SqliteDatabase): Promise<void> {
+  (await addColumn(database, "email_bindings", "receive_disabled_at", "TEXT NOT NULL DEFAULT ''"));
+  (await addColumn(database, "gpt_accounts", "billing_channel_override", "TEXT NOT NULL DEFAULT ''"));
+  (await database.exec(`
     CREATE TABLE IF NOT EXISTS account_origins (
       account_id TEXT NOT NULL REFERENCES gpt_accounts(id) ON DELETE CASCADE,
       source_type TEXT NOT NULL,
@@ -248,14 +248,14 @@ function applySchemaV7(database: SqliteDatabase): void {
     CREATE INDEX IF NOT EXISTS idx_promotion_jobs_due ON promotion_jobs(status, next_retry_at, due_at);
     CREATE INDEX IF NOT EXISTS idx_promotion_observations_account ON promotion_observations(account_id, checked_at DESC);
     CREATE INDEX IF NOT EXISTS idx_outbox_committed ON change_outbox(sequence, committed_at);
-  `);
+  `));
 }
 
-function backfillCredentialVersions(database: SqliteDatabase, now: string): void {
-  const rows = database.prepare(`SELECT c.*,
+async function backfillCredentialVersions(database: SqliteDatabase, now: string): Promise<void> {
+  const rows = (await database.prepare(`SELECT c.*,
       (SELECT b.id FROM email_bindings b WHERE b.account_id=c.account_id AND b.is_current=1 ORDER BY b.valid_from DESC LIMIT 1) binding_id
     FROM credentials c
-    WHERE c.access_token_enc!='' OR c.refresh_token_enc!='' OR c.id_token_enc!='' OR c.session_token_enc!=''`).all() as any[];
+    WHERE c.access_token_enc!='' OR c.refresh_token_enc!='' OR c.id_token_enc!='' OR c.session_token_enc!=''`).all()) as any[];
   const insertVersion = database.prepare(`INSERT OR IGNORE INTO credential_versions(
     id, account_id, observed_binding_id, subject_hash, access_token_enc, refresh_token_enc, id_token_enc, session_token_enc,
     openai_password_enc, token_fingerprint, first_seen_at, last_seen_at, validity_status, validity_checked_at, source,
@@ -273,20 +273,20 @@ function backfillCredentialVersions(database: SqliteDatabase, now: string): void
     const versionId = sha256(`credential-version:${accountId}:${fingerprint}`).slice(0, 32);
     const firstSeen = String(row.access_token_first_seen_at || row.source_updated_at || row.updated_at || now);
     const validity = Number(row.access_token_alive) ? "alive" : "unknown";
-    insertVersion.run(
+    (await insertVersion.run(
       versionId, accountId, row.binding_id || null, String(row.openai_subject_hash || ""), String(row.access_token_enc || ""),
       String(row.refresh_token_enc || ""), String(row.id_token_enc || ""), String(row.session_token_enc || ""),
       String(row.openai_password_enc || ""), fingerprint, firstSeen, String(row.updated_at || now), validity,
       validity === "alive" ? String(row.updated_at || now) : "", String(row.source || "legacy-credentials"), firstSeen, now,
-    );
-    if (!selectCurrent.get(accountId)) insertCurrent.run(accountId, versionId, now);
-    insertObservation.run(sha256(`credential-observation:${versionId}:${row.binding_id || "none"}:backfill`).slice(0, 32), versionId, row.binding_id || null, "legacy-backfill", firstSeen);
+    ));
+    if (!(await selectCurrent.get(accountId))) (await insertCurrent.run(accountId, versionId, now));
+    (await insertObservation.run(sha256(`credential-observation:${versionId}:${row.binding_id || "none"}:backfill`).slice(0, 32), versionId, row.binding_id || null, "legacy-backfill", firstSeen));
   }
 }
 
-function migrateBindingTransitions(database: SqliteDatabase, now: string): number {
-  const rows = database.prepare(`SELECT * FROM account_relations
-    WHERE relation_type='email_rebind' AND from_account_id=to_account_id`).all() as any[];
+async function migrateBindingTransitions(database: SqliteDatabase, now: string): Promise<number> {
+  const rows = (await database.prepare(`SELECT * FROM account_relations
+    WHERE relation_type='email_rebind' AND from_account_id=to_account_id`).all()) as any[];
   const binding = database.prepare("SELECT account_id FROM email_bindings WHERE id=?");
   const insert = database.prepare(`INSERT OR IGNORE INTO binding_transitions(
     id, account_id, from_binding_id, to_binding_id, changed_at, method, task_id, evidence_json, created_at
@@ -298,47 +298,47 @@ function migrateBindingTransitions(database: SqliteDatabase, now: string): numbe
     try { evidence = JSON.parse(String(row.evidence_json || "{}")); } catch { evidence = {}; }
     const fromBindingId = String(evidence.previousBindingId || evidence.fromBindingId || "");
     const toBindingId = String(evidence.nextBindingId || evidence.toBindingId || "");
-    const from = fromBindingId ? binding.get(fromBindingId) as any : null;
-    const to = toBindingId ? binding.get(toBindingId) as any : null;
+    const from = fromBindingId ? (await binding.get(fromBindingId)) as any : null;
+    const to = toBindingId ? (await binding.get(toBindingId)) as any : null;
     if (!from || !to || String(from.account_id) !== String(row.from_account_id) || String(to.account_id) !== String(row.from_account_id)) continue;
-    insert.run(String(row.id), String(row.from_account_id), fromBindingId, toBindingId, String(row.changed_at || now),
-      String(row.association_method || "legacy_rebind"), String(evidence.taskId || ""), String(row.evidence_json || "{}"), String(row.created_at || now));
-    remove.run(String(row.id));
+    (await insert.run(String(row.id), String(row.from_account_id), fromBindingId, toBindingId, String(row.changed_at || now),
+      String(row.association_method || "legacy_rebind"), String(evidence.taskId || ""), String(row.evidence_json || "{}"), String(row.created_at || now)));
+    (await remove.run(String(row.id)));
     migrated += 1;
   }
   return migrated;
 }
 
-function resolveActiveWithoutBinding(database: SqliteDatabase, now: string): { retired: number; quarantined: number } {
-  const rows = database.prepare(`SELECT a.*,
+async function resolveActiveWithoutBinding(database: SqliteDatabase, now: string): Promise<{ retired: number; quarantined: number }> {
+  const rows = (await database.prepare(`SELECT a.*,
       EXISTS(SELECT 1 FROM credentials c WHERE c.account_id=a.id AND (c.access_token_enc!='' OR c.openai_subject_hash!='')) has_identity
     FROM gpt_accounts a WHERE a.lifecycle_status='active' AND a.deleted_at=''
-      AND NOT EXISTS(SELECT 1 FROM email_bindings b WHERE b.account_id=a.id AND b.is_current=1)`).all() as any[];
+      AND NOT EXISTS(SELECT 1 FROM email_bindings b WHERE b.account_id=a.id AND b.is_current=1)`).all()) as any[];
   let retired = 0;
   let quarantined = 0;
   for (const row of rows) {
     if (String(row.source_status) === "recovered" && !Number(row.has_identity)) {
-      database.prepare(`UPDATE gpt_accounts SET lifecycle_status='retired', source_status='historical_only',
-        retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END, updated_at=? WHERE id=?`).run(now, now, row.id);
+      (await database.prepare(`UPDATE gpt_accounts SET lifecycle_status='retired', source_status='historical_only',
+        retired_at=CASE WHEN retired_at='' THEN ? ELSE retired_at END, updated_at=? WHERE id=?`).run(now, now, row.id));
       retired += 1;
       continue;
     }
     const reason = "身份记录存在但没有可证实的当前邮箱绑定，已隔离等待核对";
-    database.prepare(`UPDATE gpt_accounts SET lifecycle_status='quarantined', quarantined_at=CASE WHEN quarantined_at='' THEN ? ELSE quarantined_at END,
-      quarantine_reason=?, updated_at=? WHERE id=?`).run(now, reason, now, row.id);
-    database.prepare(`INSERT OR IGNORE INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, evidence_json, created_at, updated_at)
+    (await database.prepare(`UPDATE gpt_accounts SET lifecycle_status='quarantined', quarantined_at=CASE WHEN quarantined_at='' THEN ? ELSE quarantined_at END,
+      quarantine_reason=?, updated_at=? WHERE id=?`).run(now, reason, now, row.id));
+    (await database.prepare(`INSERT OR IGNORE INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, evidence_json, created_at, updated_at)
       VALUES(?, 'active_identity_without_binding', ?, ?, ?, ?, ?, ?)`).run(
       sha256(`active-identity-without-binding:${row.id}`).slice(0, 32), row.id, sha256(`no-current-binding:${row.id}`), reason,
       JSON.stringify({ sourceStatus: row.source_status, identityStatus: row.identity_status }), now, now,
-    );
+    ));
     quarantined += 1;
   }
   return { retired, quarantined };
 }
 
-function backfillOriginsAndRouting(database: SqliteDatabase, now: string): void {
-  const rows = database.prepare(`SELECT a.id account_id, a.source_status, a.created_at, b.id binding_id, b.provider, b.source_json
-    FROM gpt_accounts a LEFT JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1`).all() as any[];
+async function backfillOriginsAndRouting(database: SqliteDatabase, now: string): Promise<void> {
+  const rows = (await database.prepare(`SELECT a.id account_id, a.source_status, a.created_at, b.id binding_id, b.provider, b.source_json
+    FROM gpt_accounts a LEFT JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1`).all()) as any[];
   const insertOrigin = database.prepare(`INSERT OR IGNORE INTO account_origins(account_id, source_type, source_id, is_auto, first_seen_at, metadata_json)
     VALUES(?, ?, ?, ?, ?, ?)`);
   const insertPreference = database.prepare(`INSERT OR IGNORE INTO account_preferences(account_id, hide_promotion, updated_at)
@@ -349,16 +349,16 @@ function backfillOriginsAndRouting(database: SqliteDatabase, now: string): void 
     const sourcePath = String(source.sourcePath || "");
     const auto = /auto|api/i.test(sourcePath) || String(row.source_status).toLowerCase().includes("sub2api");
     const sourceType = auto ? "auto_api" : String(row.source_status || "legacy_v1");
-    insertOrigin.run(row.account_id, sourceType, String(sourcePath || row.binding_id || ""), auto ? 1 : 0,
-      String(row.created_at || now), JSON.stringify({ provider: row.provider || "", importedFrom: row.source_status || "" }));
-    insertPreference.run(now, row.account_id);
+    (await insertOrigin.run(row.account_id, sourceType, String(sourcePath || row.binding_id || ""), auto ? 1 : 0,
+      String(row.created_at || now), JSON.stringify({ provider: row.provider || "", importedFrom: row.source_status || "" })));
+    (await insertPreference.run(now, row.account_id));
   }
 }
 
-function migratePromotionJobs(database: SqliteDatabase, now: string): void {
-  const jobs = database.prepare(`SELECT j.*,
+async function migratePromotionJobs(database: SqliteDatabase, now: string): Promise<void> {
+  const jobs = (await database.prepare(`SELECT j.*,
       (SELECT credential_version_id FROM account_current_credentials cc WHERE cc.account_id=j.account_id) credential_version_id
-    FROM payment_exposure_jobs j WHERE j.job_kind='auto_trial'`).all() as any[];
+    FROM payment_exposure_jobs j WHERE j.job_kind='auto_trial'`).all()) as any[];
   const insert = database.prepare(`INSERT OR IGNORE INTO promotion_jobs(
     id, account_id, credential_version_id, campaign, region, check_kind, due_at, attempt, status, error_class, error_detail,
     next_retry_at, started_at, finished_at, created_at, updated_at
@@ -369,53 +369,53 @@ function migratePromotionJobs(database: SqliteDatabase, now: string): void {
     const status = completed ? "completed" : "retry_wait";
     const errorClass = completed ? "" : oldStatus === "dispatching" ? "interrupted_dispatch" : "legacy_unclassified_failure";
     const detail = completed ? "" : String(row.last_error || "") || `历史 ${oldStatus || "unknown"} 任务未保存上游 item 错误，已转为可重试`;
-    insert.run(`legacy:${row.job_id}`, row.account_id, row.credential_version_id || null, "plus-1-month-free",
+    (await insert.run(`legacy:${row.job_id}`, row.account_id, row.credential_version_id || null, "plus-1-month-free",
       String(row.scheduled_at || row.created_at || now), completed ? 1 : 0, status, errorClass, detail,
-      completed ? "" : now, String(row.started_at || ""), String(row.finished_at || ""), String(row.created_at || now), now);
+      completed ? "" : now, String(row.started_at || ""), String(row.finished_at || ""), String(row.created_at || now), now));
   }
 }
 
-function applyDataBackfillV8(database: SqliteDatabase): void {
+async function applyDataBackfillV8(database: SqliteDatabase): Promise<void> {
   const now = new Date().toISOString();
-  backfillCredentialVersions(database, now);
-  const migratedTransitions = migrateBindingTransitions(database, now);
-  const noBinding = resolveActiveWithoutBinding(database, now);
-  backfillOriginsAndRouting(database, now);
-  migratePromotionJobs(database, now);
-  database.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('migration_v8_summary', ?, ?)
+  (await backfillCredentialVersions(database, now));
+  const migratedTransitions = (await migrateBindingTransitions(database, now));
+  const noBinding = (await resolveActiveWithoutBinding(database, now));
+  (await backfillOriginsAndRouting(database, now));
+  (await migratePromotionJobs(database, now));
+  (await database.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('migration_v8_summary', ?, ?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(
     JSON.stringify({ migratedTransitions, ...noBinding }), now,
-  );
+  ));
 }
 
-function preservePromotionInvalidCredentialsV9(database: SqliteDatabase): void {
+async function preservePromotionInvalidCredentialsV9(database: SqliteDatabase): Promise<void> {
   const now = new Date().toISOString();
   const latestInvalid = `WITH ranked AS (
     SELECT id, credential_version_id, status,
       ROW_NUMBER() OVER(PARTITION BY credential_version_id ORDER BY datetime(updated_at) DESC, id DESC) position
     FROM promotion_jobs WHERE credential_version_id IS NOT NULL
   ) SELECT credential_version_id FROM ranked WHERE position=1 AND status='credential_invalid'`;
-  const repaired = database.prepare(`UPDATE credential_versions
+  const repaired = (await database.prepare(`UPDATE credential_versions
     SET validity_status='invalid', validity_checked_at=CASE WHEN validity_checked_at='' THEN ? ELSE validity_checked_at END, updated_at=?
-    WHERE id IN (${latestInvalid}) AND validity_status NOT IN ('invalid','conflict')`).run(now, now).changes;
-  const compatibility = database.prepare(`UPDATE credentials SET access_token_alive=0, refresh_token_alive=0, updated_at=?
+    WHERE id IN (${latestInvalid}) AND validity_status NOT IN ('invalid','conflict')`).run(now, now)).changes;
+  const compatibility = (await database.prepare(`UPDATE credentials SET access_token_alive=0, refresh_token_alive=0, updated_at=?
     WHERE account_id IN (
       SELECT cc.account_id FROM account_current_credentials cc
       JOIN credential_versions cv ON cv.id=cc.credential_version_id
       WHERE cv.validity_status IN ('invalid','conflict')
-    ) AND (access_token_alive<>0 OR refresh_token_alive<>0)`).run(now).changes;
-  database.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('migration_v9_summary', ?, ?)
+    ) AND (access_token_alive<>0 OR refresh_token_alive<>0)`).run(now)).changes;
+  (await database.prepare(`INSERT INTO settings(key, value, updated_at) VALUES('migration_v9_summary', ?, ?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).run(
     JSON.stringify({ repairedCredentialVersions: repaired, clearedCompatibilityRows: compatibility }), now,
-  );
+  ));
 }
 
-function applyIndependentRuntimeV10(database: SqliteDatabase): void {
-  if (hasTable(database, "mailbox_connections")) {
-    addColumn(database, "mailbox_connections", "manager_email_enc", "TEXT NOT NULL DEFAULT ''");
-    addColumn(database, "mailbox_connections", "credentials_enc", "TEXT NOT NULL DEFAULT ''");
+async function applyIndependentRuntimeV10(database: SqliteDatabase): Promise<void> {
+  if ((await hasTable(database, "mailbox_connections"))) {
+    (await addColumn(database, "mailbox_connections", "manager_email_enc", "TEXT NOT NULL DEFAULT ''"));
+    (await addColumn(database, "mailbox_connections", "credentials_enc", "TEXT NOT NULL DEFAULT ''"));
   }
-  database.exec(`
+  (await database.exec(`
     CREATE TABLE IF NOT EXISTS share_links (
       id TEXT PRIMARY KEY,
       token_hash TEXT NOT NULL UNIQUE,
@@ -437,49 +437,49 @@ function applyIndependentRuntimeV10(database: SqliteDatabase): void {
       PRIMARY KEY(link_id, visitor_hash)
     );
     CREATE INDEX IF NOT EXISTS idx_share_links_created ON share_links(created_at DESC);
-  `);
-  if (hasTable(database, "mailbox_sync_state")) database.exec("CREATE INDEX IF NOT EXISTS idx_mailbox_sync_updated ON mailbox_sync_state(updated_at DESC)");
-  if (hasTable(database, "email_bindings") && hasColumn(database, "email_bindings", "email_hash")) {
-    database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_binding_per_account
-      ON email_bindings(account_id) WHERE is_current=1`);
-    database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_owner_per_email
-      ON email_bindings(email_hash) WHERE is_current=1`);
+  `));
+  if ((await hasTable(database, "mailbox_sync_state"))) (await database.exec("CREATE INDEX IF NOT EXISTS idx_mailbox_sync_updated ON mailbox_sync_state(updated_at DESC)"));
+  if ((await hasTable(database, "email_bindings")) && (await hasColumn(database, "email_bindings", "email_hash"))) {
+    (await database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_binding_per_account
+      ON email_bindings(account_id) WHERE is_current=1`));
+    (await database.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_current_owner_per_email
+      ON email_bindings(email_hash) WHERE is_current=1`));
   }
-  if (hasTable(database, "mail_ownership_claims")) {
-    database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id IN (
+  if ((await hasTable(database, "mail_ownership_claims"))) {
+    (await database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0 WHERE message_id IN (
       SELECT message_id FROM mail_ownership_claims GROUP BY message_id
       HAVING COUNT(DISTINCT account_id)>1
         AND SUM(CASE WHEN claim_type<>'legacy_mapping_index' THEN 1 ELSE 0 END)>0
-    )`).run();
+    )`).run());
   }
 }
 
 interface Migration {
   version: number;
   name: string;
-  apply: (database: SqliteDatabase) => void;
+  apply: (database: SqliteDatabase) => Promise<void>;
 }
 
-function repairPlanOrderMailCategoriesV14(database: SqliteDatabase): void {
-  if (!hasTable(database, "mail_messages")) return;
-  const rows = database.prepare("SELECT id,subject FROM mail_messages WHERE category!='billing'").all() as Array<{ id: string; subject: string }>;
+async function repairPlanOrderMailCategoriesV14(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "mail_messages"))) return;
+  const rows = (await database.prepare("SELECT id,subject FROM mail_messages WHERE category!='billing'").all()) as Array<{ id: string; subject: string }>;
   const update = database.prepare("UPDATE mail_messages SET category='billing' WHERE id=?");
-  for (const row of rows) if (isPlanOrderSubject(row.subject)) update.run(row.id);
+  for (const row of rows) if (isPlanOrderSubject(row.subject)) (await update.run(row.id));
 }
 
-function restoreLegacyIndexedMailVisibilityV15(database: SqliteDatabase): void {
-  if (!hasTable(database, "mail_ownership_claims") || !hasColumn(database, "mail_ownership_claims", "claim_type")) return;
+async function restoreLegacyIndexedMailVisibilityV15(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "mail_ownership_claims")) || !(await hasColumn(database, "mail_ownership_claims", "claim_type"))) return;
   // V1 stored a per-mapping view, so one shared/iCloud message may appear in
   // several mapping indexes after alias rotation or a rebind. Those rows are
   // not an identity conflict. Restore each exact V1 mapping view only when all
   // claims came from that index; any native/routing claim keeps the message
   // isolated for review.
-  database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=1
+  (await database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=1
     WHERE claim_type='legacy_mapping_index' AND message_id IN (
       SELECT message_id FROM mail_ownership_claims GROUP BY message_id
       HAVING COUNT(DISTINCT account_id)>1
         AND SUM(CASE WHEN claim_type<>'legacy_mapping_index' THEN 1 ELSE 0 END)=0
-    )`).run();
+    )`).run());
 }
 
 const COMPATIBILITY_RELAY_SENDER_PATTERN = "(^|<|\\b)[a-z]+_at_tm[a-z0-9]*_openai_com_[a-z0-9]+_[a-z0-9]+@icloud\\.com(>|\\b|$)";
@@ -496,11 +496,11 @@ function isCompatibilityOpenAiSender(address: string): boolean {
     || /^[a-z]+_at_tm[a-z0-9]*_openai_com_[a-z0-9]+_[a-z0-9]+@icloud\.com$/.test(normalized);
 }
 
-function repairCompatibilityCustomerSenderRulesV18(database: SqliteDatabase): void {
-  if (!hasTable(database, "email_bindings") || !hasTable(database, "mail_routing_rules")) return;
-  const rows = database.prepare(`SELECT r.id,r.sender_pattern,b.provider,b.source_json
+async function repairCompatibilityCustomerSenderRulesV18(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "email_bindings")) || !(await hasTable(database, "mail_routing_rules"))) return;
+  const rows = (await database.prepare(`SELECT r.id,r.sender_pattern,b.provider,b.source_json
     FROM mail_routing_rules r JOIN email_bindings b ON b.id=r.binding_id
-    WHERE r.source='v2-compatibility'`).all() as Array<{
+    WHERE r.source='v2-compatibility'`).all()) as Array<{
       id: string; sender_pattern: string; provider: string; source_json: string;
     }>;
   const update = database.prepare("UPDATE mail_routing_rules SET sender_pattern=?,updated_at=? WHERE id=?");
@@ -514,37 +514,37 @@ function repairCompatibilityCustomerSenderRulesV18(database: SqliteDatabase): vo
     // Only replace the exact rule generated from sourceEmail. Explicit custom
     // fromPatterns remain untouched.
     if (String(row.sender_pattern) !== compatibilityMailboxPattern(sourceEmail)) continue;
-    update.run(row.provider === "domain" ? COMPATIBILITY_DIRECT_SENDER_PATTERN : COMPATIBILITY_RELAY_SENDER_PATTERN, now, row.id);
+    (await update.run(row.provider === "domain" ? COMPATIBILITY_DIRECT_SENDER_PATTERN : COMPATIBILITY_RELAY_SENDER_PATTERN, now, row.id));
     repaired += 1;
   }
-  if (hasTable(database, "settings")) database.prepare(`INSERT INTO settings(key,value,updated_at)
+  if ((await hasTable(database, "settings"))) (await database.prepare(`INSERT INTO settings(key,value,updated_at)
     VALUES('migration_v18_summary',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`)
-    .run(JSON.stringify({ repairedCompatibilitySenderRules: repaired }), now);
+    .run(JSON.stringify({ repairedCompatibilitySenderRules: repaired }), now));
 }
 
-function applyOpenAiAuthenticationMetadataV19(database: SqliteDatabase): void {
-  if (!hasTable(database, "gpt_accounts")) return;
-  addColumn(database, "gpt_accounts", "openai_mfa_enabled", "INTEGER NOT NULL DEFAULT 0");
-  addColumn(database, "gpt_accounts", "openai_auth_methods_json", "TEXT NOT NULL DEFAULT '[]'");
+async function applyOpenAiAuthenticationMetadataV19(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "gpt_accounts"))) return;
+  (await addColumn(database, "gpt_accounts", "openai_mfa_enabled", "INTEGER NOT NULL DEFAULT 0"));
+  (await addColumn(database, "gpt_accounts", "openai_auth_methods_json", "TEXT NOT NULL DEFAULT '[]'"));
 }
 
-function applyOpenAiTotpSecretV20(database: SqliteDatabase): void {
-  if (!hasTable(database, "account_passwords")) return;
-  addColumn(database, "account_passwords", "totp_secret_enc", "TEXT NOT NULL DEFAULT ''");
+async function applyOpenAiTotpSecretV20(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "account_passwords"))) return;
+  (await addColumn(database, "account_passwords", "totp_secret_enc", "TEXT NOT NULL DEFAULT ''"));
 }
 
-function repairAutomaticMailDeactivations(database: SqliteDatabase): number {
-  if (!hasTable(database, "lifecycle_events") || !hasColumn(database, "gpt_accounts", "deactivation_locked")
-    || !hasColumn(database, "gpt_accounts", "deactivated_at") || !hasColumn(database, "gpt_accounts", "retired_at")) return 0;
+async function repairAutomaticMailDeactivations(database: SqliteDatabase): Promise<number> {
+  if (!(await hasTable(database, "lifecycle_events")) || !(await hasColumn(database, "gpt_accounts", "deactivation_locked"))
+    || !(await hasColumn(database, "gpt_accounts", "deactivated_at")) || !(await hasColumn(database, "gpt_accounts", "retired_at"))) return 0;
   const now = new Date().toISOString();
-  const falseLocks = database.prepare(`SELECT a.id,a.identity_status,a.note FROM gpt_accounts a
+  const falseLocks = (await database.prepare(`SELECT a.id,a.identity_status,a.note FROM gpt_accounts a
     WHERE a.deleted_at='' AND a.deactivation_locked=1 AND a.retired_at=''
       AND EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.account_id=a.id
         AND e.event_type='account_deactivated' AND e.source LIKE '%-sync'
         AND json_extract(e.payload_json,'$.reason') LIKE 'mail_deactivation_detected%')
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.account_id=a.id
         AND ((e.event_type='account_deactivated' AND e.source LIKE 'v2-admin%')
-          OR e.event_type='mailbox_recycled_out'))`).all() as Array<{
+          OR e.event_type='mailbox_recycled_out'))`).all()) as Array<{
           id: string; identity_status: string; note: string;
         }>;
   const repair = database.prepare(`UPDATE gpt_accounts SET
@@ -558,29 +558,29 @@ function repairAutomaticMailDeactivations(database: SqliteDatabase): number {
     id,account_id,event_type,occurred_at,source,payload_json,created_at)
     VALUES(?,?,'automatic_deactivation_reverted',?,'v2-migration',?,?)`);
   for (const account of falseLocks) {
-    repair.run(now, account.id);
-    insertAudit.run(sha256(`automatic-deactivation-reverted:${account.id}`), account.id, now,
-      JSON.stringify({ reason: "mail_detection_is_evidence_only" }), now);
+    (await repair.run(now, account.id));
+    (await insertAudit.run(sha256(`automatic-deactivation-reverted:${account.id}`), account.id, now,
+      JSON.stringify({ reason: "mail_detection_is_evidence_only" }), now));
   }
   return falseLocks.length;
 }
 
-function writeMigrationRepairSummary(database: SqliteDatabase, key: string, repaired: number): void {
+async function writeMigrationRepairSummary(database: SqliteDatabase, key: string, repaired: number): Promise<void> {
   const now = new Date().toISOString();
-  if (hasTable(database, "settings")) database.prepare(`INSERT INTO settings(key,value,updated_at)
+  if ((await hasTable(database, "settings"))) (await database.prepare(`INSERT INTO settings(key,value,updated_at)
     VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`)
-    .run(key, JSON.stringify({ revertedAutomaticMailDeactivations: repaired }), now);
+    .run(key, JSON.stringify({ revertedAutomaticMailDeactivations: repaired }), now));
 }
 
-function applyAdministratorDeactivationBoundaryV21(database: SqliteDatabase): void {
-  if (!hasTable(database, "gpt_accounts")) return;
-  addColumn(database, "gpt_accounts", "admin_deactivated_at", "TEXT NOT NULL DEFAULT ''");
-  writeMigrationRepairSummary(database, "migration_v21_summary", repairAutomaticMailDeactivations(database));
+async function applyAdministratorDeactivationBoundaryV21(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "gpt_accounts"))) return;
+  (await addColumn(database, "gpt_accounts", "admin_deactivated_at", "TEXT NOT NULL DEFAULT ''"));
+  (await writeMigrationRepairSummary(database, "migration_v21_summary", (await repairAutomaticMailDeactivations(database))));
 }
 
-function repairAdministratorEventScopeV22(database: SqliteDatabase): void {
-  if (!hasTable(database, "gpt_accounts")) return;
-  writeMigrationRepairSummary(database, "migration_v22_summary", repairAutomaticMailDeactivations(database));
+async function repairAdministratorEventScopeV22(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "gpt_accounts"))) return;
+  (await writeMigrationRepairSummary(database, "migration_v22_summary", (await repairAutomaticMailDeactivations(database))));
 }
 
 function iCloudPoolAddress(emailInput: string): string {
@@ -590,12 +590,12 @@ function iCloudPoolAddress(emailInput: string): string {
   return `${parts.localPart.replace(/\+oai[a-z0-9]+$/i, "")}@${parts.domain}`;
 }
 
-function hideAmbiguousICloudBaseClaimsV23(database: SqliteDatabase): void {
-  if (!hasTable(database, "email_bindings") || !hasTable(database, "mail_messages")
-    || !hasTable(database, "mail_ownership_claims") || !hasTable(database, "gpt_accounts")
-    || !hasColumn(database, "email_bindings", "receive_disabled_at")) return;
-  const bindings = database.prepare(`SELECT b.id,b.account_id,b.email_enc,b.valid_from,b.valid_to,b.receive_disabled_at
-    FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id WHERE a.deleted_at=''`).all() as any[];
+async function hideAmbiguousICloudBaseClaimsV23(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "email_bindings")) || !(await hasTable(database, "mail_messages"))
+    || !(await hasTable(database, "mail_ownership_claims")) || !(await hasTable(database, "gpt_accounts"))
+    || !(await hasColumn(database, "email_bindings", "receive_disabled_at"))) return;
+  const bindings = (await database.prepare(`SELECT b.id,b.account_id,b.email_enc,b.valid_from,b.valid_to,b.receive_disabled_at
+    FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id WHERE a.deleted_at=''`).all()) as any[];
   const byId = new Map<string, any>();
   const byPool = new Map<string, any[]>();
   for (const binding of bindings) {
@@ -609,9 +609,9 @@ function hideAmbiguousICloudBaseClaimsV23(database: SqliteDatabase): void {
     group.push(item);
     byPool.set(pool, group);
   }
-  const rows = database.prepare(`SELECT m.id,m.received_at,m.recipient_enc,c.binding_id
+  const rows = (await database.prepare(`SELECT m.id,m.received_at,m.recipient_enc,c.binding_id
     FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
-    WHERE m.provider='shared-mail-api' AND c.claim_type='routing_rule' AND c.visible_to_customer=1`).all() as any[];
+    WHERE m.provider='shared-mail-api' AND c.claim_type='routing_rule' AND c.visible_to_customer=1`).all()) as any[];
   const messageIds = new Set<string>();
   const poolKeys = new Set<string>();
   for (const row of rows) {
@@ -636,32 +636,32 @@ function hideAmbiguousICloudBaseClaimsV23(database: SqliteDatabase): void {
   }
   const hide = database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0
     WHERE message_id=? AND claim_type='routing_rule'`);
-  for (const messageId of messageIds) hide.run(messageId);
+  for (const messageId of messageIds) (await hide.run(messageId));
   const now = new Date().toISOString();
-  if (hasTable(database, "settings")) database.prepare(`INSERT INTO settings(key,value,updated_at)
+  if ((await hasTable(database, "settings"))) (await database.prepare(`INSERT INTO settings(key,value,updated_at)
     VALUES('migration_v23_summary',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`)
-    .run(JSON.stringify({ hiddenAmbiguousBaseMessages: messageIds.size, affectedPools: poolKeys.size }), now);
+    .run(JSON.stringify({ hiddenAmbiguousBaseMessages: messageIds.size, affectedPools: poolKeys.size }), now));
 }
 
-function repairReviewedTrialAttributionV24(database: SqliteDatabase): void {
-  if (!hasTable(database, "gpt_accounts") || !hasTable(database, "mail_messages")
-    || !hasTable(database, "mail_ownership_claims") || !hasTable(database, "lifecycle_events")) return;
+async function repairReviewedTrialAttributionV24(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "gpt_accounts")) || !(await hasTable(database, "mail_messages"))
+    || !(await hasTable(database, "mail_ownership_claims")) || !(await hasTable(database, "lifecycle_events"))) return;
   // This pair was reviewed from the original MIME headers and OpenAI account
   // identity. Keep the repair deliberately bounded: other legacy index rows
   // remain evidence candidates until their original message is reviewed.
   const rejectedAccountId = "99f6a2b4-5f11-f621-83bb-cbace5f67266";
   const acceptedAccountId = "12c8c11b-ae4f-2638-a19b-5ad4c89d9c86";
-  const messages = database.prepare(`SELECT id,provider_message_id FROM mail_messages
-    WHERE provider='shared-mail-api' AND provider_message_id IN ('5556','5619')`).all() as any[];
+  const messages = (await database.prepare(`SELECT id,provider_message_id FROM mail_messages
+    WHERE provider='shared-mail-api' AND provider_message_id IN ('5556','5619')`).all()) as any[];
   const rejectedClaims: Array<{ messageId: string; bindingId: string }> = [];
   for (const message of messages) {
-    const accepted = database.prepare(`SELECT 1 FROM mail_ownership_claims
-      WHERE message_id=? AND account_id=? LIMIT 1`).get(message.id, acceptedAccountId);
+    const accepted = (await database.prepare(`SELECT 1 FROM mail_ownership_claims
+      WHERE message_id=? AND account_id=? LIMIT 1`).get(message.id, acceptedAccountId));
     if (!accepted) continue;
-    const rows = database.prepare(`SELECT binding_id FROM mail_ownership_claims
+    const rows = (await database.prepare(`SELECT binding_id FROM mail_ownership_claims
       WHERE message_id=? AND account_id=? AND claim_type='legacy_mapping_index'`).all(
       message.id, rejectedAccountId,
-    ) as any[];
+    )) as any[];
     for (const row of rows) rejectedClaims.push({ messageId: String(message.id), bindingId: String(row.binding_id) });
   }
   const now = new Date().toISOString();
@@ -671,36 +671,36 @@ function repairReviewedTrialAttributionV24(database: SqliteDatabase): void {
   const hide = database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=0,
     reason='reviewed_recipient_identity_mismatch' WHERE message_id=? AND account_id=? AND binding_id=?`);
   for (const claim of rejectedClaims) {
-    insertEvent.run(sha256(`reviewed-mail-claim-rejected:${claim.messageId}:${claim.bindingId}`), rejectedAccountId,
-      claim.bindingId, now, JSON.stringify({ messageId: claim.messageId, reason: "reviewed_recipient_identity_mismatch" }), now);
-    hide.run(claim.messageId, rejectedAccountId, claim.bindingId);
+    (await insertEvent.run(sha256(`reviewed-mail-claim-rejected:${claim.messageId}:${claim.bindingId}`), rejectedAccountId,
+      claim.bindingId, now, JSON.stringify({ messageId: claim.messageId, reason: "reviewed_recipient_identity_mismatch" }), now));
+    (await hide.run(claim.messageId, rejectedAccountId, claim.bindingId));
   }
   if (rejectedClaims.length) {
-    database.prepare(`INSERT OR IGNORE INTO lifecycle_events(
+    (await database.prepare(`INSERT OR IGNORE INTO lifecycle_events(
         id,account_id,binding_id,event_type,occurred_at,source,payload_json,created_at)
       VALUES(?,?,NULL,'plus_trial_only_corrected',?,'v2-migration',?,?)`).run(
       sha256(`reviewed-plus-trial-only:${rejectedAccountId}`), rejectedAccountId, now,
       JSON.stringify({ reason: "zero_charge_trial_and_wrong_mail_attribution" }), now,
-    );
-    database.prepare(`UPDATE gpt_accounts SET plan='free',billing_channel='',billing_channel_override='',updated_at=?
-      WHERE id=?`).run(now, rejectedAccountId);
-    if (hasTable(database, "account_business_evidence")) database.prepare(`UPDATE account_business_evidence
-      SET billing_started_at='',updated_at=? WHERE account_id=?`).run(now, rejectedAccountId);
-    if (hasTable(database, "billing_channel_observations")) database.prepare(`UPDATE billing_channel_observations
-      SET active=0 WHERE account_id=?`).run(rejectedAccountId);
+    ));
+    (await database.prepare(`UPDATE gpt_accounts SET plan='free',billing_channel='',billing_channel_override='',updated_at=?
+      WHERE id=?`).run(now, rejectedAccountId));
+    if ((await hasTable(database, "account_business_evidence"))) (await database.prepare(`UPDATE account_business_evidence
+      SET billing_started_at='',updated_at=? WHERE account_id=?`).run(now, rejectedAccountId));
+    if ((await hasTable(database, "billing_channel_observations"))) (await database.prepare(`UPDATE billing_channel_observations
+      SET active=0 WHERE account_id=?`).run(rejectedAccountId));
   }
-  if (hasTable(database, "settings")) database.prepare(`INSERT INTO settings(key,value,updated_at)
+  if ((await hasTable(database, "settings"))) (await database.prepare(`INSERT INTO settings(key,value,updated_at)
     VALUES('migration_v24_summary',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(
       JSON.stringify({ rejectedClaims: rejectedClaims.length, correctedAccounts: rejectedClaims.length ? 1 : 0 }), now,
-    );
+    ));
 }
 
-function restoreMailboxBatchVisibilityV25(database: SqliteDatabase): void {
-  if (!hasTable(database, "email_bindings") || !hasTable(database, "mail_messages")
-    || !hasTable(database, "mail_ownership_claims") || !hasTable(database, "gpt_accounts")
-    || !hasColumn(database, "email_bindings", "receive_disabled_at")) return;
-  const bindings = database.prepare(`SELECT b.id,b.account_id,b.email_enc,b.valid_from,b.valid_to,b.receive_disabled_at
-    FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id WHERE a.deleted_at=''`).all() as any[];
+async function restoreMailboxBatchVisibilityV25(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "email_bindings")) || !(await hasTable(database, "mail_messages"))
+    || !(await hasTable(database, "mail_ownership_claims")) || !(await hasTable(database, "gpt_accounts"))
+    || !(await hasColumn(database, "email_bindings", "receive_disabled_at"))) return;
+  const bindings = (await database.prepare(`SELECT b.id,b.account_id,b.email_enc,b.valid_from,b.valid_to,b.receive_disabled_at
+    FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id WHERE a.deleted_at=''`).all()) as any[];
   const byId = new Map<string, any>();
   const byPool = new Map<string, any[]>();
   for (const binding of bindings) {
@@ -712,9 +712,9 @@ function restoreMailboxBatchVisibilityV25(database: SqliteDatabase): void {
     byId.set(String(binding.id), item);
     byPool.set(pool, [...(byPool.get(pool) || []), item]);
   }
-  const rows = database.prepare(`SELECT DISTINCT m.id,m.received_at,m.recipient_enc,c.binding_id
+  const rows = (await database.prepare(`SELECT DISTINCT m.id,m.received_at,m.recipient_enc,c.binding_id
     FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
-    WHERE m.provider='shared-mail-api' AND c.claim_type='routing_rule'`).all() as any[];
+    WHERE m.provider='shared-mail-api' AND c.claim_type='routing_rule'`).all()) as any[];
   const messageIds = new Set<string>();
   const poolKeys = new Set<string>();
   for (const row of rows) {
@@ -740,26 +740,26 @@ function restoreMailboxBatchVisibilityV25(database: SqliteDatabase): void {
   const restore = database.prepare(`UPDATE mail_ownership_claims SET visible_to_customer=1,
     reason='mailbox_batch_shared_visibility_v25' WHERE message_id=? AND claim_type='routing_rule'`);
   let restoredClaims = 0;
-  for (const messageId of messageIds) restoredClaims += restore.run(messageId).changes;
+  for (const messageId of messageIds) restoredClaims += (await restore.run(messageId)).changes;
   const now = new Date().toISOString();
-  if (hasTable(database, "settings")) database.prepare(`INSERT INTO settings(key,value,updated_at)
+  if ((await hasTable(database, "settings"))) (await database.prepare(`INSERT INTO settings(key,value,updated_at)
     VALUES('migration_v25_summary',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(
       JSON.stringify({ sharedBatchMessages: messageIds.size, restoredClaims, affectedBatches: poolKeys.size,
         v24AuditEvidenceRetained: true }), now,
-    );
+    ));
 }
 
-function repairLocalizedPlanOrderMailCategoriesV26(database: SqliteDatabase): void {
-  if (!hasTable(database, "mail_messages") || !hasColumn(database, "mail_messages", "category")) return;
-  const rows = database.prepare("SELECT id,subject FROM mail_messages WHERE category!='billing'").all() as Array<{ id: string; subject: string }>;
+async function repairLocalizedPlanOrderMailCategoriesV26(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "mail_messages")) || !(await hasColumn(database, "mail_messages", "category"))) return;
+  const rows = (await database.prepare("SELECT id,subject FROM mail_messages WHERE category!='billing'").all()) as Array<{ id: string; subject: string }>;
   const update = database.prepare("UPDATE mail_messages SET category='billing' WHERE id=?");
-  for (const row of rows) if (isPlanOrderSubject(row.subject)) update.run(row.id);
+  for (const row of rows) if (isPlanOrderSubject(row.subject)) (await update.run(row.id));
 }
 
-function addPaymentExposureRemoteJobIdV29(database: SqliteDatabase): void {
-  if (!hasTable(database, "payment_exposure_jobs")) return;
-  addColumn(database, "payment_exposure_jobs", "remote_job_id", "TEXT NOT NULL DEFAULT ''");
-  database.prepare("UPDATE payment_exposure_jobs SET remote_job_id=job_id WHERE TRIM(remote_job_id)='' ").run();
+async function addPaymentExposureRemoteJobIdV29(database: SqliteDatabase): Promise<void> {
+  if (!(await hasTable(database, "payment_exposure_jobs"))) return;
+  (await addColumn(database, "payment_exposure_jobs", "remote_job_id", "TEXT NOT NULL DEFAULT ''"));
+  (await database.prepare("UPDATE payment_exposure_jobs SET remote_job_id=job_id WHERE TRIM(remote_job_id)='' ").run());
 }
 
 const migrations: Migration[] = [
@@ -767,12 +767,12 @@ const migrations: Migration[] = [
   { version: 8, name: "lossless-production-backfill", apply: applyDataBackfillV8 },
   { version: 9, name: "preserve-promotion-invalid-credentials", apply: preservePromotionInvalidCredentialsV9 },
   { version: 10, name: "independent-runtime-and-share-links", apply: applyIndependentRuntimeV10 },
-  { version: 11, name: "bounded-mail-ingestion-and-business-evidence", apply: (database) => {
-    applyMailIngestionSchema(database);
-    applyBusinessEvidenceSchema(database);
-    if (hasTable(database, "raw_import_records")) {
+  { version: 11, name: "bounded-mail-ingestion-and-business-evidence", apply: async (database) => {
+    (await applyMailIngestionSchema(database));
+    (await applyBusinessEvidenceSchema(database));
+    if ((await hasTable(database, "raw_import_records"))) {
       // Preserve provenance hashes, discard legacy whole-record envelopes.
-      database.exec("UPDATE raw_import_records SET payload_json='{}'");
+      (await database.exec("UPDATE raw_import_records SET payload_json='{}'"));
     }
   } },
   { version: 12, name: "independent-pending-mailbox-intake", apply: applyCompatibilitySchema },
@@ -793,15 +793,15 @@ const migrations: Migration[] = [
   { version: 29, name: "payment-exposure-remote-batch-job-id", apply: addPaymentExposureRemoteJobIdV29 },
 ];
 
-export function runMigrations(database: SqliteDatabase): Array<{ version: number; name: string }> {
-  const current = Number((database.prepare("SELECT COALESCE(MAX(version), 0) version FROM schema_meta").get() as any)?.version || 0);
+export async function runMigrations(database: SqliteDatabase): Promise<Array<{ version: number; name: string }>> {
+  const current = Number(((await database.prepare("SELECT COALESCE(MAX(version), 0) version FROM schema_meta").get()) as any)?.version || 0);
   const applied: Array<{ version: number; name: string }> = [];
   for (const migration of migrations) {
     if (migration.version <= current) continue;
-    database.transaction(() => {
-      migration.apply(database);
-      database.prepare("INSERT INTO schema_meta(version, applied_at) VALUES(?, ?)").run(migration.version, new Date().toISOString());
-    })();
+    (await database.transaction(async () => {
+      await migration.apply(database);
+      (await database.prepare("INSERT INTO schema_meta(version, applied_at) VALUES(?, ?)").run(migration.version, new Date().toISOString()));
+    })());
     applied.push({ version: migration.version, name: migration.name });
   }
   return applied;

@@ -18,15 +18,15 @@ test("支付方式检查按 OpenAI subject hash 批量匹配并安全 upsert", a
     import("../src/server/db.js"),
     import("../src/server/repository.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
   const subjectHash = crypto.createHash("sha256").update("openai-exposure-subject").digest("base64url");
-  const imported = repository.importAccounts([{
+  const imported = (await repository.importAccounts([{
     email: "exposure+oai@icloud.com",
     accessToken: "exposure-at",
     openaiSubject: "openai-exposure-subject",
     plan: "free",
-  }]);
+  }]));
   assert.deepEqual(imported, { imported: 1, created: 1, rebound: 0, errors: [] });
 
   const checks = [
@@ -34,29 +34,29 @@ test("支付方式检查按 OpenAI subject hash 批量匹配并安全 upsert", a
     { target: "paypal", ipCountry: "DE", billingCountry: "DE", billingCurrency: "EUR", expectedMethod: "paypal", availableMethods: ["card"], matchedMethods: [], exposed: false, status: "complete" },
     { target: "gcash", ipCountry: "PH", billingCountry: "PH", billingCurrency: "PHP", expectedMethod: "gcash", availableMethods: ["card", "gcash"], matchedMethods: ["gcash"], exposed: true, status: "complete" },
   ];
-  assert.deepEqual(repository.ingestPaymentExposureChecks(checks.map((check) => ({ ...check, openaiSubjectHash: subjectHash, promoEligible: null }))), {
+  assert.deepEqual((await repository.ingestPaymentExposureChecks(checks.map((check) => ({ ...check, openaiSubjectHash: subjectHash, promoEligible: null })))), {
     accepted: 3,
     updated: 0,
     errors: [],
   });
 
-  const account = repository.listAccounts({ limit: 10 }).results[0];
+  const account = (await repository.listAccounts({ limit: 10 })).results[0];
   assert.equal(account.paymentExposureStatus, "never");
   assert.equal(account.paymentExposureCount, 0);
   assert.equal(account.paymentExposureExposedCount, 0);
   assert.equal(account.paymentExposureUnknownCount, 0);
 
-  const changed = repository.ingestPaymentExposureChecks([{
+  const changed = (await repository.ingestPaymentExposureChecks([{
     ...checks[0], openaiSubjectHash: subjectHash, exposed: false, availableMethods: ["apple_pay"], matchedMethods: [],
     paymentMethods: [
       { type: "card", displayName: "Card", source: "oaics" },
       { type: "apple_pay", displayName: "Apple Pay", source: "oaics" },
     ],
     promoEligible: false,
-  }]);
+  }]));
   assert.deepEqual(changed, { accepted: 1, updated: 1, errors: [] });
 
-  const detail = repository.getAccountDetail(account.id);
+  const detail = (await repository.getAccountDetail(account.id));
   assert.ok(detail);
   assert.equal(detail.paymentExposureChecks.length, 3);
   assert.equal(detail.paymentExposureChecks.find((check) => check.target === "ideal")?.exposed, false);

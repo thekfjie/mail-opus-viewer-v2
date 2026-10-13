@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../../src/server/storage/sqlite-test.js";
 import { D1MailReader } from "../../src/server/cf-mail.js";
 
 const database = new Database(process.argv[2]);
@@ -17,6 +17,6 @@ try {
 } catch (error: any) {
   process.send?.({ status: "error", code: error.code });
 } finally {
-  database.close();
+  (await database.close());
   process.disconnect?.();
 }

@@ -10,7 +10,7 @@ test("external mailbox adapters retain V1 ownership while reading only the reque
     V2_SESSION_SECRET: "external-offline-session", CREDENTIAL_ENCRYPTION_KEY: "external-offline-encryption" });
   const external = await import("../src/server/external-mailbox.js");
   const { db } = await import("../src/server/db.js");
-  t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { (await db.close()); fs.rmSync(directory, { recursive: true, force: true }); });
 
   await t.test("parser keeps V1 providers and rejects hostname suffix confusion", () => {
     assert.equal(external.parseExternalMailbox("https://yangyang.website/messages/offline-token/a%40example.test")?.email, "a@example.test");

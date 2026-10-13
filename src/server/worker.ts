@@ -32,18 +32,18 @@ export function createWorker(overrides: Partial<WorkerDependencies> = {}) {
   let lastPendingMailAt = 0;
   const startedAt = new Date(dependencies.now()).toISOString();
 
-  function heartbeat(detail: Record<string, unknown>, status = "ok"): void {
+  async function heartbeat(detail: Record<string, unknown>, status = "ok"): Promise<void> {
     let artifact = "";
     try {
       artifact = String(JSON.parse(fs.readFileSync(path.join(config.projectRoot, "dist/release-manifest.json"), "utf8")).artifactSha256 || "");
     } catch {}
-    db.prepare(`INSERT INTO worker_heartbeats(worker_name,artifact_sha256,process_id,status,detail_json,heartbeat_at,started_at)
+    (await db.prepare(`INSERT INTO worker_heartbeats(worker_name,artifact_sha256,process_id,status,detail_json,heartbeat_at,started_at)
       VALUES('native-sync-worker',?,?,?,?,?,?)
       ON CONFLICT(worker_name) DO UPDATE SET artifact_sha256=excluded.artifact_sha256,
         process_id=excluded.process_id,status=excluded.status,detail_json=excluded.detail_json,
         heartbeat_at=excluded.heartbeat_at,started_at=excluded.started_at`).run(
       artifact, process.pid, status, JSON.stringify(detail), new Date(dependencies.now()).toISOString(), startedAt,
-    );
+    ));
   }
 
   async function runOnce(): Promise<Record<string, unknown>> {
@@ -71,7 +71,7 @@ export function createWorker(overrides: Partial<WorkerDependencies> = {}) {
         await attempt("trialJobs", dependencies.promotions);
         await attempt("paymentExposureJobs", dependencies.paymentExposure);
       } else detail.tasks = { skipped: true, reason: "read_only" };
-      heartbeat(detail, Object.values(detail).some((value: any) => value?.error) ? "degraded" : "ok");
+      (await heartbeat(detail, Object.values(detail).some((value: any) => value?.error) ? "degraded" : "ok"));
       return detail;
     });
     return execution.acquired ? execution.value : { skipped: true, reason: "already_running" };

@@ -52,14 +52,14 @@ test("V2 does not project task placeholders as accounts and keeps actionable mis
     import("../src/server/repository.js"),
     import("../src/server/legacy-import.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  syncFromV1();
-  const normal = repository.listAccounts({ pending: "exclude", limit: 20 }).results;
+  (await syncFromV1());
+  const normal = (await repository.listAccounts({ pending: "exclude", limit: 20 })).results;
   assert.deepEqual(normal.map((item) => item.primaryEmail), ["completed+oai@icloud.com"]);
   assert.equal(normal[0].credentialState, "completed_missing_at");
   assert.equal(normal[0].internalPending, false);
 
-  const pending = repository.listAccounts({ pending: "true", limit: 20 }).results;
+  const pending = (await repository.listAccounts({ pending: "true", limit: 20 })).results;
   assert.deepEqual(pending, []);
 });

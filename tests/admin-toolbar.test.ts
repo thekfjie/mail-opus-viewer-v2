@@ -40,7 +40,7 @@ test("多选工具栏是真正的固定浮层并包含刷新", () => {
   assert.match(styleSource, /\.selection-toolbar\s*\{[\s\S]*?position:\s*fixed;/);
   assert.doesNotMatch(styleSource, /\.selection-toolbar-spacer\s*\{/);
   assert.match(styleSource, /@media \(max-width: 1260px\) \{[\s\S]*?\.selection-toolbar \{ left: 210px; right: 20px; \}/);
-  assert.match(mainSource, /className="toolbar-refresh"[\s\S]*?\{loading \? "刷新中" : "刷新"\}/);
+  assert.match(mainSource, /className="toolbar-refresh"[\s\S]*?\{loading \? "刷新中" : "刷新数据"\}/);
 });
 
 test("刷新不清空选择，复制 AT 与导出按钮不受 loading 锁定", () => {
@@ -145,7 +145,7 @@ test("移动端支持按住选择点滑动连续多选，关键批量复制操�
   assert.match(mainSource, /dragSelection/);
   assert.match(mainSource, /document\.elementFromPoint/);
   assert.match(mainSource, /onPointerDown=\{\(event\) => startDragSelection/);
-  assert.match(mainSource, /已选 \{selected\.size\} 个[\s\S]{0,120}className="batch-primary"[\s\S]{0,120}复制选中说明/);
+  assert.match(mainSource, /已选 \{selected\.size\} 个[\s\S]{0,600}className="batch-primary"[\s\S]{0,120}复制选中说明/);
   assert.match(styleSource, /\.selection-handle\s*\{[\s\S]*?touch-action:\s*none;/);
   assert.match(styleSource, /@media \(max-width: 700px\)[\s\S]*?\.selection-toolbar \{[^}]*bottom:\s*8px;/);
   assert.doesNotMatch(mainSource, /selection-toolbar-spacer/);

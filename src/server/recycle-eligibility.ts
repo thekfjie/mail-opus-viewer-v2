@@ -11,21 +11,21 @@ const SIGNUP_PENDING = "automyai OpenAI signup pool pending";
 const REGISTERED_PENDING = "automyai UC signup registered; OAuth pending";
 const asBoolean = (value: unknown) => Boolean(Number(value));
 
-export function recycleGeneration(accountId: string): number {
-  const explicit = db.prepare("SELECT recycle_generation FROM account_business_evidence WHERE account_id=?").get(accountId) as any;
+export async function recycleGeneration(accountId: string): Promise<number> {
+  const explicit = (await db.prepare("SELECT recycle_generation FROM account_business_evidence WHERE account_id=?").get(accountId)) as any;
   const value = Number(explicit?.recycle_generation);
   if (explicit?.recycle_generation != null && Number.isInteger(value) && value >= 0) return value;
-  const row = db.prepare(`WITH RECURSIVE lineage(id, depth) AS (
+  const row = (await db.prepare(`WITH RECURSIVE lineage(id, depth) AS (
     SELECT ?, 0 UNION ALL SELECT r.from_account_id, lineage.depth+1 FROM account_relations r
     JOIN lineage ON r.to_account_id=lineage.id
     WHERE r.relation_type='mailbox_recycle' AND r.status='confirmed' AND lineage.depth<20
-  ) SELECT COALESCE(MAX(depth),0) depth FROM lineage`).get(accountId) as any;
+  ) SELECT COALESCE(MAX(depth),0) depth FROM lineage`).get(accountId)) as any;
   return Number(row?.depth || 0);
 }
 
-export function getRecycleEligibility(accountId: string, nowMs = Date.now()): RecycleEligibility | null {
+export async function getRecycleEligibility(accountId: string, nowMs = Date.now()): Promise<RecycleEligibility | null> {
   if (!Number.isFinite(nowMs)) throw new Error("回收资格检查时间无效");
-  const row = db.prepare(`SELECT a.*,b.id binding_id,b.provider,b.domain,b.valid_from,
+  const row = (await db.prepare(`SELECT a.*,b.id binding_id,b.provider,b.domain,b.valid_from,
       EXISTS(SELECT 1 FROM account_origins o WHERE o.account_id=a.id AND o.is_auto=1) is_auto,
       EXISTS(SELECT 1 FROM mailbox_connections mc WHERE mc.binding_id=b.id) direct_mailbox,
       EXISTS(SELECT 1 FROM access_grants g WHERE g.account_id=a.id AND g.first_used_at!='') customer_opened,
@@ -35,9 +35,9 @@ export function getRecycleEligibility(accountId: string, nowMs = Date.now()): Re
     LEFT JOIN account_current_credentials cc ON cc.account_id=a.id
     LEFT JOIN credential_versions cv ON cv.id=cc.credential_version_id
     LEFT JOIN account_business_evidence e ON e.account_id=a.id WHERE a.id=?
-    ORDER BY b.valid_from DESC LIMIT 1`).get(accountId) as any;
+    ORDER BY b.valid_from DESC LIMIT 1`).get(accountId)) as any;
   if (!row) return null;
-  const generation = recycleGeneration(accountId);
+  const generation = (await recycleGeneration(accountId));
   let tokenPlan: "free" | "paid" | "unknown" = "unknown";
   let hasAccessToken = false, hasRefreshToken = false, credentialUnreadable = false;
   try {
@@ -108,8 +108,8 @@ export function getRecycleEligibility(accountId: string, nowMs = Date.now()): Re
     modes: { deactivated: mode(deactivatedReason, eligibleAt), untagged_free: mode(freeReason), invalid_at: mode(invalidReason), alias_rotate: mode(aliasReason) } };
 }
 
-export function assertRecycleEligibility(accountId: string, mode: RecycleMode, nowMs = Date.now()): RecycleEligibility {
-  const result = getRecycleEligibility(accountId, nowMs);
+export async function assertRecycleEligibility(accountId: string, mode: RecycleMode, nowMs = Date.now()): Promise<RecycleEligibility> {
+  const result = (await getRecycleEligibility(accountId, nowMs));
   if (!result) throw new Error("账号不存在");
   if (!result.modes[mode]?.eligible) throw new Error(result.modes[mode]?.reason || "回收模式无效");
   return result;

@@ -19,11 +19,16 @@ fi
 # V2 serves compiled output from dist/.  A source edit is not a release until
 # the server and browser bundles are rebuilt and the running process is
 # restarted.  Keeping those operations together prevents source/dist drift.
+npm run typecheck
+npm test
 npm run build
+# Existing MySQL deployments only; first SQLite cutover follows docs/mysql-redis.md.
+npm run backup
+npm run db:migrate
 sudo -n systemctl restart mail-opus-viewer-v2-worker.service
 sudo -n systemctl restart mail-opus-viewer-v2.service
 sudo -n systemctl is-active --quiet mail-opus-viewer-v2-worker.service
 sudo -n systemctl is-active --quiet mail-opus-viewer-v2.service
 
-curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-connrefused --max-time 5 http://127.0.0.1:8790/health >/dev/null
+curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-connrefused --max-time 5 http://127.0.0.1:8790/ready >/dev/null
 echo "Opus Mail V2 release deployed from $ROOT"

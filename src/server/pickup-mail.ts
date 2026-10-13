@@ -13,10 +13,10 @@ const pendingReads = new Map<string, Promise<Record<string, unknown>>>();
 
 /** 并发注册任务占用同源邮箱时，不能把折叠后的收件人归给当前子邮箱。
  * 历史/已导入账号由可信调用方的活跃取件授权隔离，不能永久阻塞源邮箱复用。 */
-function hasOtherPendingMailbox(email: string, sourceEmail: string): boolean {
+async function hasOtherPendingMailbox(email: string, sourceEmail: string): Promise<boolean> {
   const base = sourceEmail.split("@")[0];
   const prefix = `${base}+`;
-  return (db.prepare("SELECT email_enc FROM pending_mailboxes WHERE email_hash<>?").all(emailHash(email)) as any[])
+  return ((await db.prepare("SELECT email_enc FROM pending_mailboxes WHERE email_hash<>?").all(emailHash(email))) as any[])
     .some((row) => {
       const other = normalizeEmail(decryptSecret(row.email_enc));
       return other === sourceEmail || other.startsWith(prefix) && other.endsWith("@icloud.com");
@@ -40,15 +40,15 @@ export async function pickupMailboxVerificationCode(
   if (!match || sourceEmail !== `${match[1]}@icloud.com` || !Number.isFinite(since) || since > Date.now() || (options.until && !Number.isFinite(until)) || until < since) {
     throw new MailReadError("invalid_pickup_scope", 400);
   }
-  const allowBase = options.allowBaseRecipient === true && !hasOtherPendingMailbox(email, sourceEmail);
+  const allowBase = options.allowBaseRecipient === true && !(await hasOtherPendingMailbox(email, sourceEmail));
   const sql = `SELECT DISTINCT m.* FROM mail_recipient_index r JOIN mail_messages m ON m.id=r.message_id
     WHERE r.email_hash IN (?,?) AND m.provider='shared-mail-api' AND julianday(m.received_at)>=julianday(?)`;
   const rows = (until === Number.POSITIVE_INFINITY
-    ? db.prepare(`${sql} ORDER BY julianday(m.received_at) DESC,m.id DESC LIMIT 20`)
-      .all(emailHash(email), emailHash(sourceEmail), new Date(since).toISOString())
-    : db.prepare(`${sql} AND julianday(m.received_at)<=julianday(?) ORDER BY julianday(m.received_at) DESC,m.id DESC LIMIT 20`)
-      .all(emailHash(email), emailHash(sourceEmail), new Date(since).toISOString(), new Date(until).toISOString())) as any[];
-  const key = JSON.stringify([email, sourceEmail, since, until, allowBase, rows.map((row) => [row.id, row.indexed_at])]);
+    ? (await db.prepare(`${sql} ORDER BY julianday(m.received_at) DESC,m.id DESC LIMIT 20`)
+      .all(emailHash(email), emailHash(sourceEmail), new Date(since).toISOString()))
+    : (await db.prepare(`${sql} AND julianday(m.received_at)<=julianday(?) ORDER BY julianday(m.received_at) DESC,m.id DESC LIMIT 20`)
+      .all(emailHash(email), emailHash(sourceEmail), new Date(since).toISOString(), new Date(until).toISOString()))) as any[];
+  const key = JSON.stringify([email, sourceEmail, since, options.until ? until : "latest", allowBase, rows.map((row) => [row.id, row.indexed_at])]);
   const cached = results.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.result;
   const inflight = pendingReads.get(key);

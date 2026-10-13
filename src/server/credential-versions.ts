@@ -42,15 +42,15 @@ function encrypted(value: string | undefined): string {
   return value ? encryptSecret(String(value)) : "";
 }
 
-function currentBindingId(accountId: string): string {
-  const row = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId) as any;
+async function currentBindingId(accountId: string): Promise<string> {
+  const row = (await db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1 ORDER BY valid_from DESC LIMIT 1").get(accountId)) as any;
   return String(row?.id || "");
 }
 
-function compatibilityProjection(versionId: string): void {
-  const row = db.prepare("SELECT * FROM credential_versions WHERE id=?").get(versionId) as any;
+async function compatibilityProjection(versionId: string): Promise<void> {
+  const row = (await db.prepare("SELECT * FROM credential_versions WHERE id=?").get(versionId)) as any;
   if (!row) return;
-  db.prepare(`INSERT INTO credentials(
+  (await db.prepare(`INSERT INTO credentials(
       account_id, access_token_enc, refresh_token_enc, id_token_enc, session_token_enc, openai_password_enc,
       openai_subject_hash, access_token_alive, refresh_token_alive, source, source_updated_at,
       access_token_fingerprint, access_token_first_seen_at, updated_at
@@ -67,12 +67,12 @@ function compatibilityProjection(versionId: string): void {
     row.openai_password_enc, row.subject_hash, row.validity_status === "alive" ? 1 : 0,
     row.validity_status === "alive" && row.refresh_token_enc ? 1 : 0, row.source, row.last_seen_at,
     row.token_fingerprint, row.first_seen_at, row.updated_at,
-  );
+  ));
 }
 
-export function observeCredentialVersion(input: CredentialObservationInput): CredentialObservationResult {
-  const account = db.prepare(`SELECT id, plan, billing_channel, billing_channel_override
-    FROM gpt_accounts WHERE id=? AND deleted_at=''`).get(input.accountId) as any;
+export async function observeCredentialVersion(input: CredentialObservationInput): Promise<CredentialObservationResult> {
+  const account = (await db.prepare(`SELECT id, plan, billing_channel, billing_channel_override
+    FROM gpt_accounts WHERE id=? AND deleted_at=''`).get(input.accountId)) as any;
   if (!account) throw new Error("凭证目标账号不存在");
   const observedAt = timestamp(input.observedAt);
   const accessToken = String(input.accessToken || "");
@@ -83,12 +83,12 @@ export function observeCredentialVersion(input: CredentialObservationInput): Cre
   const tokenFingerprint = accessToken
     ? sha256(accessToken)
     : `bundle:${sha256(`${refreshToken}\0${idToken}\0${sessionToken}`)}`;
-  const bindingId = String(input.bindingId || currentBindingId(input.accountId) || "");
-  const currentBinding = currentBindingId(input.accountId);
-  const existing = db.prepare("SELECT * FROM credential_versions WHERE account_id=? AND token_fingerprint=?").get(input.accountId, tokenFingerprint) as any;
+  const bindingId = String(input.bindingId || (await currentBindingId(input.accountId)) || "");
+  const currentBinding = (await currentBindingId(input.accountId));
+  const existing = (await db.prepare("SELECT * FROM credential_versions WHERE account_id=? AND token_fingerprint=?").get(input.accountId, tokenFingerprint)) as any;
   const versionId = String(existing?.id || sha256(`credential-version:${input.accountId}:${tokenFingerprint}`).slice(0, 32));
-  const selected = db.prepare(`SELECT cc.credential_version_id, cv.subject_hash, cv.token_fingerprint
-    FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(input.accountId) as any;
+  const selected = (await db.prepare(`SELECT cc.credential_version_id, cv.subject_hash, cv.token_fingerprint
+    FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=?`).get(input.accountId)) as any;
   const subjectHash = String(input.subjectHash || existing?.subject_hash || "");
   const subjectConflict = Boolean(selected?.subject_hash && subjectHash && String(selected.subject_hash) !== subjectHash);
   const protectedPaidAccount = String(account.plan || "") === "plus"
@@ -109,8 +109,8 @@ export function observeCredentialVersion(input: CredentialObservationInput): Cre
   const previousVersionId = canSelect && selected && String(selected.credential_version_id) !== versionId
     ? String(selected.credential_version_id) : null;
 
-  db.transaction(() => {
-    db.prepare(`INSERT INTO credential_versions(
+  (await db.transaction(async () => {
+    (await db.prepare(`INSERT INTO credential_versions(
         id, account_id, observed_binding_id, subject_hash, access_token_enc, refresh_token_enc, id_token_enc,
         session_token_enc, openai_password_enc, token_fingerprint, first_seen_at, last_seen_at, validity_status,
         validity_checked_at, source, supersedes_id, retired_reason, created_at, updated_at
@@ -145,76 +145,76 @@ export function observeCredentialVersion(input: CredentialObservationInput): Cre
       encrypted(input.idToken), encrypted(input.sessionToken), encrypted(input.openaiPassword), tokenFingerprint,
       firstSeenAt, observedAt, validity, validityCheckedAt, input.source,
       previousVersionId, observedAt, observedAt,
-    );
+    ));
     const observationId = sha256(`credential-observation:${versionId}:${bindingId || "none"}:${input.source}:${input.observationKey || tokenFingerprint}`).slice(0, 32);
-    db.prepare(`INSERT INTO credential_observations(id, credential_version_id, binding_id, source, observed_at, evidence_json)
+    (await db.prepare(`INSERT INTO credential_observations(id, credential_version_id, binding_id, source, observed_at, evidence_json)
       VALUES(?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at, evidence_json=excluded.evidence_json`).run(
       observationId, versionId, bindingId || null, input.source, observedAt,
       JSON.stringify({ historicalObservation, ...input.evidence }),
-    );
+    ));
     if (canSelect) {
-      if (previousVersionId) db.prepare("UPDATE credential_versions SET retired_reason='superseded', updated_at=? WHERE id=? AND retired_reason=''")
-        .run(observedAt, previousVersionId);
-      db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
+      if (previousVersionId) (await db.prepare("UPDATE credential_versions SET retired_reason='superseded', updated_at=? WHERE id=? AND retired_reason=''")
+        .run(observedAt, previousVersionId));
+      (await db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
         VALUES(?, ?, ?, ?)
         ON CONFLICT(account_id) DO UPDATE SET credential_version_id=excluded.credential_version_id,
           selected_at=excluded.selected_at, selection_reason=excluded.selection_reason`).run(
         input.accountId, versionId, observedAt, previousVersionId ? "new_credential_observation" : "matching_credential_observation",
-      );
-      compatibilityProjection(versionId);
+      ));
+      (await compatibilityProjection(versionId));
     }
     if (subjectConflict && input.allowAccountMutation !== false) {
       const reason = protectedPaidAccount
         ? "新凭证 subject 与管理员确认的付费账号冲突，版本已保留且未切换当前指针"
         : "新凭证 subject 与账号当前凭证冲突，版本已保留但未切换当前指针";
       if (!protectedPaidAccount) {
-        quarantineAccount(input.accountId, reason, input.source, { versionId, bindingId });
+        (await quarantineAccount(input.accountId, reason, input.source, { versionId, bindingId }));
       }
-      db.prepare(`INSERT OR IGNORE INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, evidence_json, created_at, updated_at)
+      (await db.prepare(`INSERT OR IGNORE INTO pending_reviews(id, review_type, account_id, candidate_email_hash, reason, evidence_json, created_at, updated_at)
         VALUES(?, 'credential_subject_conflict', ?, ?, ?, ?, ?, ?)`).run(
         sha256(`credential-conflict:${input.accountId}:${tokenFingerprint}`).slice(0, 32), input.accountId,
         sha256(`credential:${versionId}`), reason, JSON.stringify({ versionId, bindingId, source: input.source }), observedAt, observedAt,
-      );
+      ));
     }
-  })();
+  })());
 
   return { credentialVersionId: versionId, tokenFingerprint, firstSeenAt, current: canSelect, changed, conflict: subjectConflict };
 }
 
-export function invalidateCredentialVersion(versionId: string, checkedAt: string): void {
-  db.prepare("UPDATE credential_versions SET validity_status='invalid', validity_checked_at=?, updated_at=? WHERE id=?")
-    .run(checkedAt, checkedAt, versionId);
-  const current = db.prepare("SELECT 1 FROM account_current_credentials WHERE credential_version_id=?").get(versionId);
-  if (current) compatibilityProjection(versionId);
+export async function invalidateCredentialVersion(versionId: string, checkedAt: string): Promise<void> {
+  (await db.prepare("UPDATE credential_versions SET validity_status='invalid', validity_checked_at=?, updated_at=? WHERE id=?")
+    .run(checkedAt, checkedAt, versionId));
+  const current = (await db.prepare("SELECT 1 FROM account_current_credentials WHERE credential_version_id=?").get(versionId));
+  if (current) (await compatibilityProjection(versionId));
 }
 
-export function invalidateCurrentCredentialWithoutCurrentBindingObservation(
+export async function invalidateCurrentCredentialWithoutCurrentBindingObservation(
   accountId: string,
   currentBindingId: string,
   checkedAt: string,
-): boolean {
-  const selected = db.prepare(`SELECT cv.id FROM account_current_credentials cc
+): Promise<boolean> {
+  const selected = (await db.prepare(`SELECT cv.id FROM account_current_credentials cc
     JOIN credential_versions cv ON cv.id=cc.credential_version_id
-    WHERE cc.account_id=?`).get(accountId) as any;
+    WHERE cc.account_id=?`).get(accountId)) as any;
   if (!selected?.id || !currentBindingId) return false;
-  const observedOnCurrent = db.prepare(`SELECT 1 FROM credential_observations
-    WHERE credential_version_id=? AND binding_id=? LIMIT 1`).get(selected.id, currentBindingId);
+  const observedOnCurrent = (await db.prepare(`SELECT 1 FROM credential_observations
+    WHERE credential_version_id=? AND binding_id=? LIMIT 1`).get(selected.id, currentBindingId));
   if (observedOnCurrent) return false;
-  db.prepare(`UPDATE credential_versions SET validity_status='invalid', validity_checked_at=?,
+  (await db.prepare(`UPDATE credential_versions SET validity_status='invalid', validity_checked_at=?,
     retired_reason=CASE WHEN retired_reason='' THEN 'binding_changed_without_current_credential' ELSE retired_reason END,
-    updated_at=? WHERE id=?`).run(checkedAt, checkedAt, selected.id);
-  compatibilityProjection(String(selected.id));
+    updated_at=? WHERE id=?`).run(checkedAt, checkedAt, selected.id));
+  (await compatibilityProjection(String(selected.id)));
   return true;
 }
 
-export function credentialHistory(accountId: string): Array<Record<string, unknown>> {
-  return (db.prepare(`SELECT cv.id, cv.subject_hash subjectHash, cv.token_fingerprint tokenFingerprint,
+export async function credentialHistory(accountId: string): Promise<Array<Record<string, unknown>>> {
+  return ((await db.prepare(`SELECT cv.id, cv.subject_hash subjectHash, cv.token_fingerprint tokenFingerprint,
       cv.first_seen_at firstSeenAt, cv.last_seen_at lastSeenAt, cv.validity_status validityStatus,
       cv.validity_checked_at validityCheckedAt, cv.source, cv.supersedes_id supersedesId,
       cv.retired_reason retiredReason, cv.observed_binding_id observedBindingId,
       CASE WHEN cc.credential_version_id=cv.id THEN 1 ELSE 0 END current,
       (SELECT count(*) FROM credential_observations co WHERE co.credential_version_id=cv.id) observationCount
     FROM credential_versions cv LEFT JOIN account_current_credentials cc ON cc.account_id=cv.account_id
-    WHERE cv.account_id=? ORDER BY cv.first_seen_at DESC, cv.id DESC`).all(accountId) as any[]).map((row) => ({ ...row, current: Boolean(row.current) }));
+    WHERE cv.account_id=? ORDER BY cv.first_seen_at DESC, cv.id DESC`).all(accountId)) as any[]).map((row) => ({ ...row, current: Boolean(row.current) }));
 }

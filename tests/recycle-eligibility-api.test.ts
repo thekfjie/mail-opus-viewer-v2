@@ -16,20 +16,20 @@ test("recycle qualification reads and worker cycles never reclaim; explicit admi
     import("../src/server/server.js"), import("../src/server/crypto.js"), import("../src/server/worker.js"),
   ]);
   const app = await buildApp();
-  t.after(async () => { await app.close(); db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { await app.close(); (await db.close()); fs.rmSync(directory, { recursive: true, force: true }); });
   const email = "recycle-qualification@icloud.com";
   const token = [Buffer.from("{}").toString("base64url"), Buffer.from(JSON.stringify({ sub: "offline-recycle-sub", email,
     "https://api.openai.com/auth": { chatgpt_plan_type: "free" } })).toString("base64url"), "offline-signature"].join(".");
-  assert.equal(repository.importAccounts([{ email, accessToken: token }]).errors.length, 0);
-  const owner = repository.listAccounts({ search: email }).results[0];
-  const binding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(owner.id) as any;
-  const grant = repository.createCustomerGrant(owner.id, binding.id, { password: "offline-customer-password" });
-  transitions.freezeAccountTransition(owner.id, "fixture_ban", "test", new Date(Date.now() - 6 * 86_400_000).toISOString());
+  assert.equal((await repository.importAccounts([{ email, accessToken: token }])).errors.length, 0);
+  const owner = (await repository.listAccounts({ search: email })).results[0];
+  const binding = (await db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(owner.id)) as any;
+  const grant = (await repository.createCustomerGrant(owner.id, binding.id, { password: "offline-customer-password" }));
+  (await transitions.freezeAccountTransition(owner.id, "fixture_ban", "test", new Date(Date.now() - 6 * 86_400_000).toISOString()));
   const headers = { cookie: `mail_opus_v2_admin=${signSession("admin", "administrator")}` };
   const url = `/api/v2/admin/accounts/${owner.id}/recycle-eligibility`;
   const writeUrl = `/api/v2/admin/accounts/${owner.id}/recycle`;
-  const originalGrant = db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId);
-  const originalEvents = (db.prepare("SELECT COUNT(*) n FROM lifecycle_events").get() as any).n;
+  const originalGrant = (await db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId));
+  const originalEvents = ((await db.prepare("SELECT COUNT(*) n FROM lifecycle_events").get()) as any).n;
   assert.equal((await app.inject(url)).statusCode, 401);
   assert.equal((await app.inject({ url: "/api/v2/admin/accounts/missing/recycle-eligibility", headers })).statusCode, 404);
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -40,17 +40,17 @@ test("recycle qualification reads and worker cycles never reclaim; explicit admi
     assert.equal(qualification.modes.deactivated.trigger, "admin_only");
     assert.ok(!response.body.includes(token) && !response.body.includes("offline-customer-password"));
   }
-  assert.deepEqual(db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId), originalGrant);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM lifecycle_events").get() as any).n, originalEvents);
+  assert.deepEqual((await db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId)), originalGrant);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM lifecycle_events").get()) as any).n, originalEvents);
   for (const payload of [{ mode: "deactivated", confirmRevokeCustomerAccess: true }, { email: "cannot-bypass@icloud.com", confirmRevokeCustomerAccess: true }]) {
     assert.equal((await app.inject({ method: "POST", url: writeUrl, headers, payload })).statusCode, 400);
   }
   assert.equal((await app.inject({ method: "POST", url: writeUrl, payload: { mode: "deactivated" } })).statusCode, 401);
   const foreign = await app.inject({ method: "POST", url: writeUrl, headers: { ...headers, origin: "https://foreign.example.test" }, payload: { mode: "deactivated" } });
   assert.ok([400, 403].includes(foreign.statusCode));
-  assert.deepEqual(db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId), originalGrant);
+  assert.deepEqual((await db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId)), originalGrant);
 
-  db.prepare("UPDATE gpt_accounts SET deactivated_at=? WHERE id=?").run(new Date(Date.now() - 8 * 86_400_000).toISOString(), owner.id);
+  (await db.prepare("UPDATE gpt_accounts SET deactivated_at=? WHERE id=?").run(new Date(Date.now() - 8 * 86_400_000).toISOString(), owner.id));
   assert.equal((await app.inject({ url, headers })).json().modes.deactivated.eligible, true);
   for (const confirmation of [undefined, false, "true"]) {
     assert.equal((await app.inject({ method: "POST", url: writeUrl, headers,
@@ -66,11 +66,11 @@ test("recycle qualification reads and worker cycles never reclaim; explicit admi
   // without a separate customer-revoke confirmation. V2 may preserve that
   // contract only when no customer grant is active.
   const pendingEmail = "pending-alias-compat@icloud.com";
-  assert.equal(repository.importAccounts([{ email: pendingEmail }]).errors.length, 0);
-  const pending = repository.listAccounts({ search: pendingEmail }).results[0];
-  db.prepare("UPDATE gpt_accounts SET note='automyai OpenAI signup pool pending' WHERE id=?").run(pending.id);
-  db.prepare("INSERT INTO account_origins(account_id,source_type,source_id,is_auto,first_seen_at) VALUES(?,'test','compat-pending',1,?)")
-    .run(pending.id, new Date().toISOString());
+  assert.equal((await repository.importAccounts([{ email: pendingEmail }])).errors.length, 0);
+  const pending = (await repository.listAccounts({ search: pendingEmail })).results[0];
+  (await db.prepare("UPDATE gpt_accounts SET note='automyai OpenAI signup pool pending' WHERE id=?").run(pending.id));
+  (await db.prepare("INSERT INTO account_origins(account_id,source_type,source_id,is_auto,first_seen_at) VALUES(?,'test','compat-pending',1,?)")
+    .run(pending.id, new Date().toISOString()));
   const rotatedPending = await app.inject({ method: "POST", url: "/api/admin/mappings/recycle", headers,
     payload: { ids: [pending.id], mode: "alias_rotate" } });
   assert.equal(rotatedPending.statusCode, 200);
@@ -83,12 +83,12 @@ test("recycle qualification reads and worker cycles never reclaim; explicit admi
         payload: { ids: [owner.id], mode, confirmRevokeCustomerAccess: true } })).statusCode, 400);
     }
   }
-  const recycleRelationsBeforeWorker = (db.prepare("SELECT COUNT(*) n FROM account_relations WHERE relation_type='mailbox_recycle'").get() as any).n;
+  const recycleRelationsBeforeWorker = ((await db.prepare("SELECT COUNT(*) n FROM account_relations WHERE relation_type='mailbox_recycle'").get()) as any).n;
   const worker = createWorker({ sub2api: async () => ({ total: 0, active: 0, matched: 0, created: 0, rebinds: 0, conflicts: 0, skipped: 0 }),
     pendingMail: async () => ({ processed: 0, errors: 0 }) });
   await worker.runOnce();
-  assert.deepEqual(db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId), originalGrant);
-  assert.equal((db.prepare("SELECT COUNT(*) n FROM account_relations WHERE relation_type='mailbox_recycle'").get() as any).n, recycleRelationsBeforeWorker);
+  assert.deepEqual((await db.prepare("SELECT * FROM access_grants WHERE id=?").get(grant.grantId)), originalGrant);
+  assert.equal(((await db.prepare("SELECT COUNT(*) n FROM account_relations WHERE relation_type='mailbox_recycle'").get()) as any).n, recycleRelationsBeforeWorker);
   assert.equal((await app.inject(`/api/preset?m=${encodeURIComponent(grant.publicToken)}`)).statusCode, 200);
   const login = await app.inject({ method: "POST", url: "/api/login", payload: { email, password: grant.password } });
   assert.equal(login.statusCode, 200);
@@ -99,25 +99,25 @@ test("recycle qualification reads and worker cycles never reclaim; explicit admi
   assert.equal((await app.inject({ url: "/api/session", headers: { cookie } })).statusCode, 401);
   assert.equal((await app.inject({ url, headers })).json().modes.deactivated.eligible, false);
   assert.equal((await app.inject({ method: "POST", url: writeUrl, headers, payload: { mode: "deactivated", confirmRevokeCustomerAccess: true } })).statusCode, 400);
-  assert.equal((db.prepare("SELECT deactivation_locked FROM gpt_accounts WHERE id=?").get(owner.id) as any).deactivation_locked, 1);
+  assert.equal(((await db.prepare("SELECT deactivation_locked FROM gpt_accounts WHERE id=?").get(owner.id)) as any).deactivation_locked, 1);
   for (const routeMode of ["custom", "compat"] as const) {
     const address = `${routeMode}-recycle@icloud.com`;
-    assert.equal(repository.importAccounts([{ email: address }]).errors.length, 0);
-    const account = repository.listAccounts({ search: address }).results[0];
-    db.prepare("INSERT INTO account_business_evidence(account_id,recycle_generation,updated_at) VALUES(?,1,?)")
-      .run(account.id, new Date().toISOString());
-    transitions.freezeAccountTransition(account.id, "fixture_ban", "test", new Date(Date.now() - 8 * 86_400_000).toISOString());
+    assert.equal((await repository.importAccounts([{ email: address }])).errors.length, 0);
+    const account = (await repository.listAccounts({ search: address })).results[0];
+    (await db.prepare("INSERT INTO account_business_evidence(account_id,recycle_generation,updated_at) VALUES(?,1,?)")
+      .run(account.id, new Date().toISOString()));
+    (await transitions.freezeAccountTransition(account.id, "fixture_ban", "test", new Date(Date.now() - 8 * 86_400_000).toISOString()));
     const response = await app.inject({ method: "POST", headers,
       url: routeMode === "custom" ? `/api/v2/admin/accounts/${account.id}/recycle` : "/api/admin/mappings/recycle",
       payload: routeMode === "custom" ? { email: "custom-replacement@icloud.com", confirmRevokeCustomerAccess: true }
         : { ids: [account.id], mode: "deactivated", confirmRevokeCustomerAccess: true } });
     assert.equal(response.statusCode, 200);
-    const audit = JSON.parse((db.prepare("SELECT evidence_json FROM account_relations WHERE from_account_id=? AND relation_type='mailbox_recycle'").get(account.id) as any).evidence_json);
+    const audit = JSON.parse(((await db.prepare("SELECT evidence_json FROM account_relations WHERE from_account_id=? AND relation_type='mailbox_recycle'").get(account.id)) as any).evidence_json);
     assert.equal(audit.mode, "deactivated");
     assert.equal(audit.eligibility.trigger, "admin_only");
     assert.equal(audit.eligibility.account.deactivationLocked, true);
-    const replacementId = (db.prepare("SELECT to_account_id FROM account_relations WHERE from_account_id=? AND relation_type='mailbox_recycle'").get(account.id) as any).to_account_id;
-    transitions.freezeAccountTransition(replacementId, "fixture_ban", "test", new Date(Date.now() - 8 * 86_400_000).toISOString());
+    const replacementId = ((await db.prepare("SELECT to_account_id FROM account_relations WHERE from_account_id=? AND relation_type='mailbox_recycle'").get(account.id)) as any).to_account_id;
+    (await transitions.freezeAccountTransition(replacementId, "fixture_ban", "test", new Date(Date.now() - 8 * 86_400_000).toISOString()));
     const replacementQualification = (await app.inject({ url: `/api/v2/admin/accounts/${replacementId}/recycle-eligibility`, headers })).json();
     assert.equal(replacementQualification.generation, 2);
     assert.equal(replacementQualification.modes.deactivated.eligible, false);

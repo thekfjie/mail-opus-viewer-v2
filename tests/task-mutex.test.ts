@@ -44,7 +44,7 @@ test("worker accepts injected admission control and preserves skip and recovery 
   process.env.V2_SESSION_SECRET = "fake-session";
   process.env.CREDENTIAL_ENCRYPTION_KEY = "fake-encryption";
   const [{ createWorker }, { db }] = await Promise.all([import("../src/server/worker.js"), import("../src/server/db.js")]);
-  t.after(() => { db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  t.after(async () => { (await db.close()); fs.rmSync(directory, { recursive: true, force: true }); });
   const calls: string[] = [];
   const held = barrier();
   let currentTime = Date.now();
@@ -61,7 +61,7 @@ test("worker accepts injected admission control and preserves skip and recovery 
   const rejectedWorker = createWorker({ ...dependencies, taskMutex: rejectAll });
   assert.deepEqual(await rejectedWorker.runOnce(), { skipped: true, reason: "already_running" });
   assert.deepEqual(calls, []);
-  assert.equal(db.prepare("SELECT 1 FROM worker_heartbeats").get(), undefined);
+  assert.equal((await db.prepare("SELECT 1 FROM worker_heartbeats").get()), undefined);
 
   const taskMutex = new InProcessTaskMutex();
   const firstWorker = createWorker({ ...dependencies, taskMutex });

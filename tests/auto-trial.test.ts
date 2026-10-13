@@ -14,7 +14,7 @@ test("旧 payment_exposure 自动任务入口已停用，优惠定时任务由 p
   });
   const paymentExposure = await import("../src/server/payment-exposure.js");
   const { db } = await import("../src/server/db.js");
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
   assert.deepEqual(await paymentExposure.runAutomaticTrialChecks(), {
     enabled: false, candidates: 0, started: 0, failed: 0, skipped: 0, errors: [],
   });

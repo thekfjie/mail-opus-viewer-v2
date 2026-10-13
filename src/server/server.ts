@@ -1,3 +1,5 @@
+import { createRedisRateLimiter, memoryRateLimiter } from "./infrastructure/rate-limiter.js";
+import { asyncMap } from './async-collections.js';
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -84,7 +86,7 @@ import { registerCompatibilityRoutes } from "./compatibility-routes.js";
 import { ingestSharedMailEvent, manualSharedMailBackfill, recheckBillingEvidenceForMail, reprocessReviewedMail } from "./mail-sync.js";
 
 export async function buildApp(options: { logger?: boolean } = {}) {
-const app = Fastify({ logger: options.logger ?? false, disableRequestLogging: true, trustProxy: true, bodyLimit: 2 * 1024 * 1024 });
+const app = Fastify({ logger: options.logger ?? false, disableRequestLogging: true, trustProxy: (process.env.TRUST_PROXY || "127.0.0.1,::1").split(",").map(value => value.trim()).filter(Boolean), bodyLimit: 2 * 1024 * 1024 });
 await app.register(cookie);
 app.addHook("onRequest", async (request, reply) => {
   if (request.headers.origin && !sameOrigin(request)) return reply.code(403).send({ error: "请求来源不允许" });
@@ -122,19 +124,20 @@ app.addHook("onSend", async (_request, reply, payload) => {
   return payload;
 });
 
-const rateBuckets = new Map<string, { count: number; resetAt: number }>();
-function consumeRate(request: FastifyRequest, scope: string, max: number): boolean {
-  const key = `${scope}:${request.ip}`;
-  const now = Date.now();
-  const bucket = rateBuckets.get(key);
-  if (!bucket || bucket.resetAt <= now) {
-    rateBuckets.set(key, { count: 1, resetAt: now + 10 * 60 * 1000 });
-    return true;
-  }
-  if (bucket.count >= max) return false;
-  bucket.count += 1;
-  return true;
+const limiter = process.env.OPUS_SQLITE_TEST === '1'
+  ? memoryRateLimiter()
+  : await createRedisRateLimiter(config.redisUrl, config.redisPrefix);
+app.addHook('onClose', async () => { await limiter.close(); });
+async function consumeRate(request: FastifyRequest, scope: string, max: number): Promise<boolean> {
+  return limiter.consume(scope, request.ip, max);
 }
+app.get('/ready', async (_request, reply) => {
+  try {
+    await db.health();
+    if (!await limiter.ready()) throw new Error('Redis unavailable');
+    return { ready: true, database: 'mysql', rateLimiter: 'redis' };
+  } catch { return reply.code(503).send({ ready: false }); }
+});
 
 function sameOrigin(request: FastifyRequest): boolean {
   const origin = String(request.headers.origin || "");
@@ -203,15 +206,15 @@ app.get("/health", async () => ({
 }));
 app.get("/api/v2/health/coexistence", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  const worker = db.prepare("SELECT status,heartbeat_at,artifact_sha256 FROM worker_heartbeats WHERE worker_name='native-sync-worker'").get() || null;
+  const worker = (await db.prepare("SELECT status,heartbeat_at,artifact_sha256 FROM worker_heartbeats WHERE worker_name='native-sync-worker'").get()) || null;
   const v1 = { mode: "retired", probed: false };
   return { v1, v2: { ok: true, nativeReadOnly: config.readOnly, worker }, commandWriter: commandWriterLabel(), hardDependency: false };
 });
 app.get("/api/v2/version", async () => ({ ok: true, release: releaseManifest() }));
-app.get("/api/v2/status", async (request, reply) => requireAdmin(request, reply) ? overview() : undefined);
+app.get("/api/v2/status", async (request, reply) => requireAdmin(request, reply) ? (await overview()) : undefined);
 
 app.post("/api/v2/admin/login", async (request, reply) => {
-  if (!consumeRate(request, "admin-login", 8)) return reply.code(429).send({ error: "登录尝试过多" });
+  if (!await consumeRate(request, "admin-login", 8)) return reply.code(429).send({ error: "登录尝试过多" });
   if (!sameOrigin(request)) return reply.code(403).send({ error: "请求来源不允许" });
   const body = request.body as any;
   if (!config.adminPassword || !constantTimeEqual(String(body?.password || ""), config.adminPassword)) return reply.code(401).send({ error: "后台口令不正确" });
@@ -228,32 +231,32 @@ app.get("/api/v2/admin/session", async (request, reply) => adminSession(request)
   ? { ok: true, readOnly: !commandWritesAvailable(), nativeReadOnly: config.readOnly, commandWriter: commandWriterLabel(), accountAuthority: config.accountAuthority, independent: true }
   : reply.code(401).send({ error: "未登录" }));
 
-app.get("/api/v2/admin/overview", async (request, reply) => requireAdmin(request, reply) ? overview() : undefined);
+app.get("/api/v2/admin/overview", async (request, reply) => requireAdmin(request, reply) ? (await overview()) : undefined);
 app.get("/api/v2/admin/mail-health", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   if (!sameOrigin(request)) return reply.code(403).send({ error: "请求来源不允许" });
   reply.header("Cache-Control", "no-store");
-  return mailHealth();
+  return (await mailHealth());
 });
 app.get("/api/v2/admin/accounts", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   const query = request.query as any;
-  return listAccounts({
+  return (await listAccounts({
     search: String(query.search || ""), range: query.range || "all", status: String(query.status || ""),
     provider: String(query.provider || ""), billingChannel: String(query.billingChannel || ""), sold: String(query.sold || ""), plan: String(query.plan || ""),
     credential: String(query.credential || ""), sourceStatus: String(query.sourceStatus || ""), unused: String(query.unused || ""),
     workbench: String(query.workbench || ""), deactivationWindow: query.deactivationWindow || "today",
     redGroup: String(query.redGroup || ""), markColor: String(query.markColor || ""), pending: String(query.pending || ""),
     limit: Number(query.limit || 80), offset: Number(query.offset || 0),
-  });
+  }));
 });
 app.get("/api/v2/admin/red-groups", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  return { results: listRedGroups() };
+  return { results: (await listRedGroups()) };
 });
 app.get("/api/v2/admin/pending-reviews", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  return { results: listPendingReviews() };
+  return { results: (await listPendingReviews()) };
 });
 app.post("/api/v2/admin/pending-reviews/:id/resolve", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
@@ -261,12 +264,12 @@ app.post("/api/v2/admin/pending-reviews/:id/resolve", async (request, reply) => 
     const reviewId = String((request.params as any).id);
     const action = String((request.body as any)?.action || "");
     if (action === "reprocess_mail") return await reprocessReviewedMail(reviewId);
-    return resolvePendingReview(reviewId, action);
+    return (await resolvePendingReview(reviewId, action));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/migration-report", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  return migrationReport();
+  return (await migrationReport());
 });
 app.get("/api/v2/admin/outlook-free", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
@@ -303,7 +306,7 @@ app.get("/api/v2/admin/accounts/:id/recent-mails", async (request, reply) => {
   try {
     const accountId = String((request.params as any).id);
     const query = request.query as any;
-    return listAdminAccountMails(accountId, query?.offset, query?.limit);
+    return (await listAdminAccountMails(accountId, query?.offset, query?.limit));
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
@@ -320,14 +323,14 @@ app.get("/api/v2/admin/accounts/:id/verification-code", async (request, reply) =
   if (!requireAdmin(request, reply)) return;
   try {
     const accountId = String((request.params as any).id);
-    return accountVerificationCode(accountId);
+    return (await accountVerificationCode(accountId));
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/oauth/batch-preview", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
-    return previewOauthBatch((request.body as any)?.text || request.body);
+    return (await previewOauthBatch((request.body as any)?.text || request.body));
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
@@ -335,27 +338,27 @@ app.post("/api/v2/admin/oauth/batch-apply", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
     const body = request.body as any;
-    return applyOauthBatch(body?.text, body?.previewHash, body?.confirm);
+    return (await applyOauthBatch(body?.text, body?.previewHash, body?.confirm));
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/oauth-health/start", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
-    return startOauthHealth();
+    return (await startOauthHealth());
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/oauth-health/status", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   try {
-    return oauthHealthStatus();
+    return (await oauthHealthStatus());
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 for (const [route, action] of [
   ["/api/v2/admin/import/outlook", importOutlook],
-  ["/api/v2/admin/import/session", (input: unknown) => importSession(input)],
+  ["/api/v2/admin/import/session", async (input: unknown) => (await importSession(input))],
   ["/api/v2/admin/import/outlook-transfer-preview", previewOutlookTransfer],
   ["/api/v2/admin/import/outlook-transfer", applyOutlookTransfer],
 ] as const) {
@@ -372,27 +375,27 @@ app.post("/api/v2/admin/import/third-party-file", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
     const body = request.body as any;
-    return importThirdPartySessionFile(body?.paths || body?.path || body?.filePath || body?.file || "");
+    return (await importThirdPartySessionFile(body?.paths || body?.path || body?.filePath || body?.file || ""));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/usage-audit", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
-    return runUsageAudit();
+    return (await runUsageAudit());
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/share/links", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   try {
-    return listShareLinks();
+    return (await listShareLinks());
   }
   catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/share/links", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
-    return createShareLink(request.body as any);
+    return (await createShareLink(request.body as any));
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
@@ -400,26 +403,26 @@ app.delete("/api/v2/admin/share/links/:id", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
     const id = String((request.params as any).id);
-    return revokeShareLink(id) ? { ok: true } : reply.code(404).send({ error: "分享链接不存在" });
+    return (await revokeShareLink(id)) ? { ok: true } : reply.code(404).send({ error: "分享链接不存在" });
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/payment-exposure/routes", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  const checkRoutes = listCheckRouteSummaries();
+  const checkRoutes = (await listCheckRouteSummaries());
   return {
     routes: listPaymentExposureRoutes(),
     promotionRoute: checkRoutes.find((route) => route.key === "promotion_jp"),
     checkRoutes,
-    eligibilityApi: paymentEligibilityApiSummary(),
+    eligibilityApi: (await paymentEligibilityApiSummary()),
   };
 });
 app.put("/api/v2/admin/payment-exposure/api", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "payment-eligibility-api-save", 20)) return reply.code(429).send({ error: "检查接口配置操作过多" });
+  if (!await consumeRate(request, "payment-eligibility-api-save", 20)) return reply.code(429).send({ error: "检查接口配置操作过多" });
   const body = request.body as any;
   try {
-    return { eligibilityApi: savePaymentEligibilityApi(body?.endpoint, body?.apiToken, Object.prototype.hasOwnProperty.call(body || {}, "apiToken")) };
+    return { eligibilityApi: (await savePaymentEligibilityApi(body?.endpoint, body?.apiToken, Object.prototype.hasOwnProperty.call(body || {}, "apiToken"))) };
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : "检查接口配置保存失败" });
   }
@@ -427,31 +430,31 @@ app.put("/api/v2/admin/payment-exposure/api", async (request, reply) => {
 app.get("/api/v2/admin/payment-exposure/api/reveal", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   reply.header("Cache-Control", "no-store");
-  return effectivePaymentEligibilityApi();
+  return (await effectivePaymentEligibilityApi());
 });
 app.delete("/api/v2/admin/payment-exposure/api", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  return { eligibilityApi: clearPaymentEligibilityApi() };
+  return { eligibilityApi: (await clearPaymentEligibilityApi()) };
 });
 app.put("/api/v2/admin/payment-exposure/routes/:key", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "check-route-save", 30)) return reply.code(429).send({ error: "出口配置操作过多" });
+  if (!await consumeRate(request, "check-route-save", 30)) return reply.code(429).send({ error: "出口配置操作过多" });
   const key = String((request.params as any).key || "").trim().toLowerCase();
   if (!isCheckRouteKey(key)) return reply.code(404).send({ error: "检测出口不存在" });
-  try { return { route: saveCheckRouteProxy(key, (request.body as any)?.proxy) }; }
+  try { return { route: (await saveCheckRouteProxy(key, (request.body as any)?.proxy)) }; }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : "出口配置保存失败" }); }
 });
 app.delete("/api/v2/admin/payment-exposure/routes/:key", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   const key = String((request.params as any).key || "").trim().toLowerCase();
   if (!isCheckRouteKey(key)) return reply.code(404).send({ error: "检测出口不存在" });
-  return { route: clearCheckRouteProxy(key) };
+  return { route: (await clearCheckRouteProxy(key)) };
 });
 // This is an API-only eligibility lookup. It must never create Checkout or
 // call Stripe payment-page endpoints.
 app.post("/api/v2/admin/accounts/:id/payment-exposure-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "payment-exposure-start", 30)) return reply.code(429).send({ error: "支付检查请求过多" });
+  if (!await consumeRate(request, "payment-exposure-start", 30)) return reply.code(429).send({ error: "支付检查请求过多" });
   try {
     const body = request.body as any;
     const routeKey = String(body?.routeKey || body?.route || "").trim().toLowerCase();
@@ -464,7 +467,7 @@ app.post("/api/v2/admin/accounts/:id/payment-exposure-check", async (request, re
 });
 app.post("/api/v2/admin/accounts/payment-exposure-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "payment-exposure-bulk-start", 10)) return reply.code(429).send({ error: "批量支付检查请求过多" });
+  if (!await consumeRate(request, "payment-exposure-bulk-start", 10)) return reply.code(429).send({ error: "批量支付检查请求过多" });
   try {
     const body = request.body as any;
     if (!Array.isArray(body?.accountIds) || body.accountIds.length > 24) return reply.code(413).send({ error: "批量支付方式探查单次最多选择 24 个账号" });
@@ -486,32 +489,32 @@ app.post("/api/v2/admin/accounts/payment-exposure-check/status", async (request,
 });
 app.post("/api/v2/admin/accounts/:id/trial-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "trial-check-start", 30)) return reply.code(429).send({ error: "试用检测请求过多" });
+  if (!await consumeRate(request, "trial-check-start", 30)) return reply.code(429).send({ error: "试用检测请求过多" });
   try {
-    const item = queuePromotionCheck(String((request.params as any).id), "manual");
+    const item = (await queuePromotionCheck(String((request.params as any).id), "manual"));
     void runPromotionQueue(500).catch(() => undefined);
-    return promotionJob(String(item.id || ""));
+    return (await promotionJob(String(item.id || "")));
   } catch (error) {
     return reply.code(400).send({ error: error instanceof Error ? error.message : "试用检测启动失败" });
   }
 });
 app.post("/api/v2/admin/accounts/promotion-check", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
-  if (!consumeRate(request, "promotion-check-bulk", 30)) return reply.code(429).send({ error: "批量优惠检测请求过多" });
+  if (!await consumeRate(request, "promotion-check-bulk", 30)) return reply.code(429).send({ error: "批量优惠检测请求过多" });
   const accountIds = Array.isArray((request.body as any)?.accountIds) ? (request.body as any).accountIds : [];
   if (!accountIds.length) return reply.code(400).send({ error: "请选择至少一个账号" });
-  const result = queuePromotionChecks(accountIds);
+  const result = (await queuePromotionChecks(accountIds));
   void runPromotionQueue(500).catch(() => undefined);
   return result;
 });
 app.post("/api/v2/admin/accounts/promotion-check/status", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   const jobIds = Array.isArray((request.body as any)?.jobIds) ? (request.body as any).jobIds : [];
-  return { jobs: promotionJobs(jobIds) };
+  return { jobs: (await promotionJobs(jobIds)) };
 });
 app.get("/api/v2/admin/accounts/:id/promotion-check/:jobId", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  const item = promotionJob(String((request.params as any).jobId));
+  const item = (await promotionJob(String((request.params as any).jobId)));
   return item && String(item.accountId) === String((request.params as any).id)
     ? item : reply.code(404).send({ error: "优惠检测任务不存在" });
 });
@@ -519,7 +522,7 @@ app.post("/api/v2/admin/accounts/:id/promotion-suspicion", async (request, reply
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   const accountId = String((request.params as any).id);
   const suspicious = Boolean((request.body as any)?.suspicious);
-  const item = setPromotionSuspicion(accountId, suspicious);
+  const item = (await setPromotionSuspicion(accountId, suspicious));
   return item || reply.code(404).send({ error: "账号不存在" });
 });
 app.get("/api/v2/admin/accounts/:id/payment-exposure-check/:jobId", async (request, reply) => {
@@ -532,7 +535,7 @@ app.get("/api/v2/admin/accounts/:id/payment-exposure-check/:jobId", async (reque
 });
 app.get("/api/v2/admin/accounts/:id", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  const item = getAccountDetail(String((request.params as any).id));
+  const item = (await getAccountDetail(String((request.params as any).id)));
   return item || reply.code(404).send({ error: "账号不存在" });
 });
 
@@ -543,19 +546,19 @@ app.post("/api/v2/internal/payment-exposure-check", async (request, reply) => {
   if (!config.paymentExposureApiKey) return reply.code(503).send({ error: "支付方式检查接收API未配置" });
   const provided = String(request.headers["x-api-key"] || "").trim();
   if (!constantTimeEqual(provided, config.paymentExposureApiKey)) return reply.code(401).send({ error: "API密钥无效" });
-  if (!consumeRate(request, "payment-exposure-ingest", 2000)) return reply.code(429).send({ error: "支付检查接收请求过多" });
+  if (!await consumeRate(request, "payment-exposure-ingest", 2000)) return reply.code(429).send({ error: "支付检查接收请求过多" });
   const body = request.body as any;
   const checks = Array.isArray(body) ? body : Array.isArray(body?.checks) ? body.checks : body && typeof body === "object" ? [body] : [];
   if (!checks.length) return reply.code(400).send({ error: "请求必须包含单条检查记录或 checks 数组" });
   if (checks.length > 500) return reply.code(413).send({ error: "单次最多接收500条检查记录" });
-  return { ok: true, ...ingestPaymentExposureChecks(checks) };
+  return { ok: true, ...(await ingestPaymentExposureChecks(checks)) };
 });
 
 app.get("/api/v2/admin/accounts/:id/credentials", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
     const accountId = String((request.params as any).id);
-    return revealCredentials(accountId) || {
+    return (await revealCredentials(accountId)) || {
       accessToken: "", refreshToken: "", idToken: "", sessionToken: "", openaiPassword: "", totpSecret: "",
     };
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
@@ -565,7 +568,7 @@ app.post("/api/v2/admin/accounts/:id/credentials", async (request, reply) => {
   try {
     const accountId = String((request.params as any).id);
     const body = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {};
-    return saveAccountCredentials(accountId, body);
+    return (await saveAccountCredentials(accountId, body));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/accounts/bulk-credentials", async (request, reply) => {
@@ -573,20 +576,20 @@ app.post("/api/v2/admin/accounts/bulk-credentials", async (request, reply) => {
   const body = request.body as any;
   const ids = [...new Set<string>((Array.isArray(body?.accountIds) ? body.accountIds : []).map((value: unknown) => String(value)).filter(Boolean))].slice(0, 500);
   if (!ids.length) return reply.code(400).send({ error: "没有选择账号" });
-  const results = ids.map((id) => {
-    const credentials = revealCredentials(id);
+  const results = (await asyncMap(ids, async (id) => {
+    const credentials = (await revealCredentials(id));
     return {
       id,
-      primaryEmail: primaryEmailForAccount(id),
+      primaryEmail: (await primaryEmailForAccount(id)),
       accessToken: String(credentials?.accessToken || ""),
     };
-  });
+  }));
   return { results };
 });
 app.get("/api/v2/admin/accounts/:id/current-export", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request)) return;
   try {
-    const item = provisionCurrentCustomerExport(String((request.params as any).id));
+    const item = (await provisionCurrentCustomerExport(String((request.params as any).id)));
     if (!item) return reply.code(404).send({ error: "账号没有当前邮箱绑定" });
     if (!item.available) return reply.code(409).send({ error: item.reason, currentEmail: item.currentEmail });
     return item;
@@ -599,15 +602,15 @@ app.post("/api/v2/admin/accounts/bulk-current-export", async (request, reply) =>
   const body = request.body as any;
   const ids = [...new Set<string>((Array.isArray(body?.accountIds) ? body.accountIds : []).map((value: unknown) => String(value)).filter(Boolean))].slice(0, 500);
   if (!ids.length) return reply.code(400).send({ error: "没有选择账号" });
-  const results = ids.map((id) => {
+  const results = (await asyncMap(ids, async (id) => {
     try {
-      const item = provisionCurrentCustomerExport(id);
+      const item = (await provisionCurrentCustomerExport(id));
       return item ? { id, ...item } : { id, available: false, currentEmail: "", loginIdentifier: "", publicUrl: "", text: "", reason: "账号没有当前邮箱绑定" };
     } catch (error) {
-      return { id, available: false, currentEmail: primaryEmailForAccount(id), loginIdentifier: "", publicUrl: "", text: "",
+      return { id, available: false, currentEmail: (await primaryEmailForAccount(id)), loginIdentifier: "", publicUrl: "", text: "",
         reason: error instanceof Error ? error.message : String(error) };
     }
-  });
+  }));
   return { results };
 });
 app.patch("/api/v2/admin/accounts/:id", async (request, reply) => {
@@ -615,7 +618,7 @@ app.patch("/api/v2/admin/accounts/:id", async (request, reply) => {
   try {
     const accountId = String((request.params as any).id);
     const patch = request.body as any;
-    const item = updateAccount(accountId, patch);
+    const item = (await updateAccount(accountId, patch));
     return item || reply.code(404).send({ error: "账号不存在" });
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
@@ -624,7 +627,7 @@ app.post("/api/v2/admin/accounts/:id/rebind", async (request, reply) => {
   try {
     const accountId = String((request.params as any).id);
     const email = String((request.body as any)?.email || "");
-    return createRebind(accountId, email);
+    return (await createRebind(accountId, email));
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
@@ -633,13 +636,13 @@ app.post("/api/v2/admin/accounts/:id/deactivate", async (request, reply) => {
   try {
     const accountId = String((request.params as any).id);
     const reason = String((request.body as any)?.reason || "admin_manual");
-    return deactivateAccount(accountId, reason);
+    return (await deactivateAccount(accountId, reason));
   }
   catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/accounts/:id/recycle-eligibility", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  const eligibility = getRecycleEligibility(String((request.params as any).id));
+  const eligibility = (await getRecycleEligibility(String((request.params as any).id)));
   return eligibility || reply.code(404).send({ error: "账号不存在" });
 });
 app.post("/api/v2/admin/accounts/:id/recycle", async (request, reply) => {
@@ -648,40 +651,40 @@ app.post("/api/v2/admin/accounts/:id/recycle", async (request, reply) => {
     const accountId = String((request.params as any).id);
     const body = request.body as any;
     if (body?.confirmRevokeCustomerAccess !== true) throw new Error("请管理员明确确认回收将撤销原客户链接和会话");
-    if (body?.mode !== undefined) return recycleAccountByMode(accountId, String(body.mode));
+    if (body?.mode !== undefined) return (await recycleAccountByMode(accountId, String(body.mode)));
     // The older custom-address entry must honor the same eligibility rule as
     // the mode buttons. Omitting mode cannot bypass the seven-day boundary.
-    return db.transaction(() => {
-      const eligibility = getRecycleEligibility(accountId);
+    return (await db.transaction(async () => {
+      const eligibility = (await getRecycleEligibility(accountId));
       if (!eligibility) throw new Error("账号不存在");
       if (!eligibility.modes.deactivated.eligible) throw new Error(eligibility.modes.deactivated.reason);
-      const result = recycleAccount(accountId, String(body?.email || ""), String(body?.plan || "free"));
-      db.prepare(`INSERT INTO account_business_evidence(account_id,recycle_generation,updated_at) VALUES(?,?,?)
+      const result = (await recycleAccount(accountId, String(body?.email || ""), String(body?.plan || "free")));
+      (await db.prepare(`INSERT INTO account_business_evidence(account_id,recycle_generation,updated_at) VALUES(?,?,?)
         ON CONFLICT(account_id) DO UPDATE SET recycle_generation=excluded.recycle_generation,updated_at=excluded.updated_at`)
-        .run(result.replacement.id, eligibility.generation + 1, new Date().toISOString());
-      db.prepare(`UPDATE account_relations SET evidence_json=json_set(evidence_json,'$.mode','deactivated','$.eligibility',json(?))
+        .run(result.replacement.id, eligibility.generation + 1, new Date().toISOString()));
+      (await db.prepare(`UPDATE account_relations SET evidence_json=json_set(evidence_json,'$.mode','deactivated','$.eligibility',json(?))
         WHERE relation_type='mailbox_recycle' AND from_account_id=? AND to_account_id=?`)
-        .run(JSON.stringify(recycleEligibilityAudit(eligibility, "deactivated")), accountId, result.replacement.id);
-      return { previous: result.previous, replacement: getAccountDetail(result.replacement.id)! };
-    }).immediate();
+        .run(JSON.stringify(recycleEligibilityAudit(eligibility, "deactivated")), accountId, result.replacement.id));
+      return { previous: result.previous, replacement: (await getAccountDetail(result.replacement.id))! };
+    }).immediate());
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.get("/api/v2/admin/accounts/:id/grants", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
-  return { results: listAccountGrants(String((request.params as any).id)) };
+  return { results: (await listAccountGrants(String((request.params as any).id))) };
 });
 app.post("/api/v2/admin/accounts/:id/grants", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   try {
     const accountId = String((request.params as any).id);
     const body = request.body as any;
-    return createCustomerGrant(accountId, String(body?.bindingId || ""), body || {});
+    return (await createCustomerGrant(accountId, String(body?.bindingId || ""), body || {}));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.delete("/api/v2/admin/accounts/:id/grants/:grantId", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   const params = request.params as any;
-  return revokeCustomerGrant(String(params.id), String(params.grantId)) ? { ok: true } : reply.code(404).send({ error: "授权不存在" });
+  return (await revokeCustomerGrant(String(params.id), String(params.grantId))) ? { ok: true } : reply.code(404).send({ error: "授权不存在" });
 });
 app.post("/api/v2/admin/accounts/bulk", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
@@ -689,33 +692,33 @@ app.post("/api/v2/admin/accounts/bulk", async (request, reply) => {
     const body = request.body as any;
     const accountIds = Array.isArray(body?.accountIds) ? body.accountIds.map(String) : [];
     const action = String(body?.action || "");
-    return applyBulkAction(accountIds, action, body?.value);
+    return (await applyBulkAction(accountIds, action, body?.value));
   } catch (error) { return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) }); }
 });
 app.post("/api/v2/admin/import/accounts", async (request, reply) => {
   if (!requireAdmin(request, reply) || !sameOrigin(request) || !requireCommandWrite(reply)) return;
   const body = request.body as any;
   if (!Array.isArray(body?.accounts)) return reply.code(400).send({ error: "accounts 必须是数组" });
-  return importAccounts(body.accounts);
+  return (await importAccounts(body.accounts));
 });
 
 app.get("/api/share/snapshot", async (request, reply) => {
-  if (!consumeRate(request, "share-snapshot", 120)) return reply.code(429).send({ error: "请求过多，请稍后再试" });
+  if (!await consumeRate(request, "share-snapshot", 120)) return reply.code(429).send({ error: "请求过多，请稍后再试" });
   const token = String((request.query as any)?.t || (request.query as any)?.token || "");
-  const item = readShareSnapshot(token, request.ip);
+  const item = (await readShareSnapshot(token, request.ip));
   return item || reply.code(410).send({ error: "分享链接无效、已过期或次数用尽" });
 });
 
 app.get("/api/v2/import/accounts", async (_request, reply) => reply.code(405).send({ error: "请使用POST" }));
 app.post("/api/v2/import/accounts", async (request, reply) => {
-  if (!consumeRate(request, "v2-import", 60)) return reply.code(429).send({ error: "导入请求过多" });
+  if (!await consumeRate(request, "v2-import", 60)) return reply.code(429).send({ error: "导入请求过多" });
   if (!config.importApiKey) return reply.code(503).send({ error: "导入API未配置" });
   const provided = String(request.headers["x-api-key"] || "").trim();
   if (!constantTimeEqual(provided, config.importApiKey)) return reply.code(401).send({ error: "API密钥无效" });
   if (!requireWrite(reply)) return;
   const body = request.body as any;
   if (!Array.isArray(body?.accounts)) return reply.code(400).send({ error: "accounts 必须是数组" });
-  return importAccounts(body.accounts);
+  return (await importAccounts(body.accounts));
 });
 
 app.setErrorHandler((error, _request, reply) => {
@@ -745,13 +748,13 @@ app.post("/api/v2/admin/accounts/:id/billing-recheck", async (request, reply) =>
   const accountId = String((request.params as any)?.id || "");
   const messageId = String((request.body as any)?.messageId || "").trim();
   if (!/^[1-9][0-9]{0,15}$/.test(messageId)) return reply.code(400).send({ error: "必须提供一个邮件ID" });
-  const owner = db.prepare(`SELECT 1 FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
-    WHERE m.provider='shared-mail-api' AND m.provider_message_id=? AND c.account_id=? LIMIT 1`).get(messageId, accountId);
+  const owner = (await db.prepare(`SELECT 1 FROM mail_messages m JOIN mail_ownership_claims c ON c.message_id=m.id
+    WHERE m.provider='shared-mail-api' AND m.provider_message_id=? AND c.account_id=? LIMIT 1`).get(messageId, accountId));
   if (!owner) return reply.code(404).send({ error: "邮件不存在或不属于该账号" });
   try {
     const result = await recheckBillingEvidenceForMail(messageId);
     if (!result.accountIds.includes(accountId)) return reply.code(409).send({ error: "邮件归属不唯一，未改写套餐或渠道" });
-    const account = db.prepare("SELECT plan,billing_channel FROM gpt_accounts WHERE id=?").get(accountId) as any;
+    const account = (await db.prepare("SELECT plan,billing_channel FROM gpt_accounts WHERE id=?").get(accountId)) as any;
     return { ok: true, ...result, accountId, plan: String(account?.plan || "unknown"),
       billingChannel: String(account?.billing_channel || result.billingChannel || "") };
   } catch (error) {
@@ -771,5 +774,5 @@ return app;
 
 if (process.argv[1] && import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href) {
   const app = await buildApp({ logger: true });
-  await app.listen({ host: "127.0.0.1", port: config.port });
+  await app.listen({ host: process.env.HOST || "127.0.0.1", port: config.port });
 }

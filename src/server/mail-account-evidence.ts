@@ -35,12 +35,12 @@ export function noticeEvidence(subject: string, sender: string, text: string): N
   };
 }
 
-export function resolveNoticeEvidence(evidence: NoticeEvidence | undefined, candidateIds: string[], receivedAt = "") {
+export async function resolveNoticeEvidence(evidence: NoticeEvidence | undefined, candidateIds: string[], receivedAt = "") {
   const unresolved = { accountId: "", bindingId: "", conflict: false };
   if (!evidence || !candidateIds.length || candidateIds.length > 32) return unresolved;
   const placeholders = candidateIds.map(() => "?").join(",");
-  const bindings = (db.prepare(`SELECT id,account_id,email_enc,valid_from,valid_to,is_current FROM email_bindings
-    WHERE account_id IN (${placeholders}) ORDER BY valid_from DESC,id`).all(...candidateIds) as any[])
+  const bindings = ((await db.prepare(`SELECT id,account_id,email_enc,valid_from,valid_to,is_current FROM email_bindings
+    WHERE account_id IN (${placeholders}) ORDER BY valid_from DESC,id`).all(...candidateIds)) as any[])
     .map((binding) => ({ ...binding, email: normalizeEmail(decryptSecret(binding.email_enc)) }));
   const emailOwners = new Set(bindings.filter((b) => evidence.emails.includes(b.email)).map((b) => b.account_id as string));
   const phraseOwners = new Set(bindings.filter((b) => evidence.associatedEmails.includes(b.email)).map((b) => b.account_id as string));
@@ -50,13 +50,13 @@ export function resolveNoticeEvidence(evidence: NoticeEvidence | undefined, cand
     // never become evidence that the disputed identity owns this account.
     // Expired/superseded credentials are still useful when their subject was
     // independently confirmed; expiration does not change historical identity.
-    const versions = db.prepare(`SELECT v.subject_hash,v.access_token_enc,v.id_token_enc FROM credential_versions v
+    const versions = (await db.prepare(`SELECT v.subject_hash,v.access_token_enc,v.id_token_enc FROM credential_versions v
       WHERE v.account_id=? AND v.subject_hash!='' AND v.validity_status!='conflict'
         AND v.retired_reason NOT IN ('identity_conflict','subject_conflict')
         AND (EXISTS(SELECT 1 FROM credentials c WHERE c.account_id=v.account_id AND c.openai_subject_hash=v.subject_hash)
           OR EXISTS(SELECT 1 FROM openai_identity_observations o WHERE o.account_id=v.account_id
             AND o.subject_hash=v.subject_hash AND o.status='confirmed'))
-      ORDER BY v.last_seen_at DESC LIMIT 32`).all(accountId) as any[];
+      ORDER BY v.last_seen_at DESC LIMIT 32`).all(accountId)) as any[];
     for (const version of versions) {
       if (evidence.identityHashes.includes(version.subject_hash)) identityOwners.add(accountId);
       for (const encrypted of [version.access_token_enc, version.id_token_enc]) {

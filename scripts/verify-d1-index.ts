@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseEnv } from "node:util";
 import { pathToFileURL } from "node:url";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import { D1MailReader, MailReadError } from "../src/server/cf-mail.js";
 
 export interface IndexVerificationReport {
@@ -16,7 +16,7 @@ export interface IndexVerificationReport {
 // only so verification shares the candidate/runtime's persistent request budget.
 // This script never loads .env implicitly, migrates a schema or changes config.
 export async function verifyD1Index(args = process.argv.slice(2), transport: typeof fetch = globalThis.fetch): Promise<IndexVerificationReport> {
-  let database: Database.Database | undefined;
+  let database: Database | undefined;
   let previous = new Set<string>();
   let verified = false;
   let error: string | undefined;
@@ -36,7 +36,7 @@ export async function verifyD1Index(args = process.argv.slice(2), transport: typ
     if (!environment.DATABASE_PATH || fs.realpathSync(environment.DATABASE_PATH) !== filename) throw new Error("environment_database_mismatch");
     database = new Database(filename, { fileMustExist: true });
     database.pragma("busy_timeout = 30000");
-    previous = new Set((database.prepare("SELECT id FROM mail_read_requests").all() as { id: string }[]).map((row) => row.id));
+    previous = new Set(((await database.prepare("SELECT id FROM mail_read_requests").all()) as { id: string }[]).map((row) => row.id));
     const reader = new D1MailReader(database, {
       accountId: environment.V2_CF_ACCOUNT_ID || environment.CF_ACCOUNT_ID || "",
       databaseId: environment.V2_CF_D1_DATABASE_ID || environment.CF_D1_DATABASE_ID || "",
@@ -50,11 +50,11 @@ export async function verifyD1Index(args = process.argv.slice(2), transport: typ
   } finally {
     if (database) {
       try {
-        for (const row of database.prepare("SELECT id, rows_read FROM mail_read_requests").all() as { id: string; rows_read: number }[]) {
+        for (const row of (await database.prepare("SELECT id, rows_read FROM mail_read_requests").all()) as { id: string; rows_read: number }[]) {
           if (!previous.has(row.id)) { requests += 1; rowsRead += row.rows_read; }
         }
       } catch { verified = false; error = "index_verification_failed"; }
-      database.close();
+      (await database.close());
     }
   }
   return { verified, requests, rowsRead, ...(error ? { error } : {}) };

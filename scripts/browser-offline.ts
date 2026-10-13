@@ -14,23 +14,23 @@ const { encryptSecret } = await import("../src/server/crypto.js");
 const artifacts = path.resolve("artifacts/browser");
 fs.mkdirSync(artifacts, { recursive: true });
 
-const result = importAccounts(Array.from({ length: 8 }, (_, i) => {
+const result = (await importAccounts(Array.from({ length: 8 }, (_, i) => {
   const email = `offline-browser-${i}@icloud.com`;
   const token = [Buffer.from("{}").toString("base64url"), Buffer.from(JSON.stringify({ sub: `offline-${i}`, email,
     exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_plan_type: "free" } })).toString("base64url"), "offline-signature"].join(".");
   return { email, accessToken: token, refreshToken: `offline-refresh-${i}`, plan: "free" };
-}));
+})));
 assert.equal(result.errors.length, 0);
-const owners = db.prepare("SELECT a.id,b.id binding_id FROM gpt_accounts a JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1 ORDER BY a.id").all() as any[];
-const grant = createCustomerGrant(owners[0].id, owners[0].binding_id, { password: "offline-customer-password" });
-deactivateAccount(owners[1].id, "offline-browser-fixture");
+const owners = (await db.prepare("SELECT a.id,b.id binding_id FROM gpt_accounts a JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1 ORDER BY a.id").all()) as any[];
+const grant = (await createCustomerGrant(owners[0].id, owners[0].binding_id, { password: "offline-customer-password" }));
+(await deactivateAccount(owners[1].id, "offline-browser-fixture"));
 const receivedAt = new Date(Date.now() + 10).toISOString();
 const bodyMarker = "OFFLINE-BROWSER-TRANSIENT-CONTENT";
 const recipient = "browser-delivery@example.com";
-db.prepare(`INSERT INTO mail_messages(id,provider,provider_message_id,sender,recipient_enc,subject,received_at,indexed_at)
-  VALUES('browser-message','shared-mail-api','991','noreply@example.com',?,'Offline delivery',?,?)`).run(encryptSecret(recipient), receivedAt, receivedAt);
-db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,reason,visible_to_customer,created_at)
-  VALUES('browser-message',?,?,'exact','browser fixture',1,?)`).run(owners[0].id, owners[0].binding_id, receivedAt);
+(await db.prepare(`INSERT INTO mail_messages(id,provider,provider_message_id,sender,recipient_enc,subject,received_at,indexed_at)
+  VALUES('browser-message','shared-mail-api','991','noreply@example.com',?,'Offline delivery',?,?)`).run(encryptSecret(recipient), receivedAt, receivedAt));
+(await db.prepare(`INSERT INTO mail_ownership_claims(message_id,account_id,binding_id,claim_type,reason,visible_to_customer,created_at)
+  VALUES('browser-message',?,?,'exact','browser fixture',1,?)`).run(owners[0].id, owners[0].binding_id, receivedAt));
 let fakeMailReads = 0;
 sharedMailReader.byId = async (id: string) => {
   assert.equal(id, "991");
@@ -105,5 +105,5 @@ try {
 } finally {
   await browser.close();
   await app.close();
-  db.close();
+  (await db.close());
 }

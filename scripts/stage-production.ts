@@ -113,23 +113,23 @@ export async function stageProduction(args = process.argv.slice(2)): Promise<Sta
     await migrateSnapshot(["--snapshot", snapshot, "--update-staging"]);
     const [{ db }, { decryptSecret }] = await Promise.all([import("../src/server/db.js"), import("../src/server/crypto.js")]);
     opened = db;
-    db.transaction(() => {
-      db.exec("UPDATE raw_import_records SET payload_json='{}'");
+    (await db.transaction(async () => {
+      (await db.exec("UPDATE raw_import_records SET payload_json='{}'"));
       const update = db.prepare("UPDATE mail_messages SET metadata_json=? WHERE id=?");
-      for (const row of db.prepare("SELECT id,metadata_json FROM mail_messages").all() as any[]) {
+      for (const row of (await db.prepare("SELECT id,metadata_json FROM mail_messages").all()) as any[]) {
         let metadata: Record<string, unknown> = {};
         try { metadata = JSON.parse(String(row.metadata_json || "{}")); } catch {}
         const entries = metadata && typeof metadata === "object" && !Array.isArray(metadata) ? Object.entries(metadata) : [];
         const lightweight = Object.fromEntries(entries.filter(([key, value]) => mailMetadataKeys.has(key)
           && ["string", "number", "boolean"].includes(typeof value))
           .map(([key, value]) => [key, typeof value === "string" ? value.slice(0, 256) : value]));
-        update.run(JSON.stringify(lightweight), row.id);
+        (await update.run(JSON.stringify(lightweight), row.id));
       }
-    })();
+    })());
     db.pragma("wal_checkpoint(TRUNCATE)");
     db.pragma("journal_mode = DELETE");
-    db.prepare("VACUUM INTO ?").run(compact);
-    db.close(); opened = undefined;
+    (await db.prepare("VACUUM INTO ?").run(compact));
+    (await db.close()); opened = undefined;
     fs.chmodSync(compact, 0o600);
     fs.renameSync(compact, target);
     compacted = true;

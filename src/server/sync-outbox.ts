@@ -8,11 +8,11 @@ function object(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
 }
 
-export function consumeV1Outbox(): { consumed: number; cursor: number; reset: boolean } {
+export async function consumeV1Outbox(): Promise<{ consumed: number; cursor: number; reset: boolean }> {
   let stat: fs.Stats;
   try { stat = fs.statSync(legacyConfig.changeOutboxFile); }
   catch { return { consumed: 0, cursor: 0, reset: false }; }
-  const state = db.prepare("SELECT source_cursor FROM sync_consumers WHERE consumer='v2-from-v1-outbox'").get() as any;
+  const state = (await db.prepare("SELECT source_cursor FROM sync_consumers WHERE consumer='v2-from-v1-outbox'").get()) as any;
   let cursor = Math.max(0, Number(state?.source_cursor || 0));
   let reset = false;
   if (cursor > stat.size) { cursor = 0; reset = true; }
@@ -34,7 +34,7 @@ export function consumeV1Outbox(): { consumed: number; cursor: number; reset: bo
   ) VALUES(?, ?, ?, ?, ?, ?, 'v1', ?, ?)`);
   let consumed = 0;
   let lastEventId = "";
-  db.transaction(() => {
+  (await db.transaction(async () => {
     for (const line of lines) {
       try {
         const event = object(JSON.parse(line));
@@ -47,10 +47,10 @@ export function consumeV1Outbox(): { consumed: number; cursor: number; reset: bo
         };
         lastEventId = String(event.eventId || "");
         if (!lastEventId) continue;
-        const result = insert.run(lastEventId, String(event.aggregateType || "mapping_collection"),
+        const result = (await insert.run(lastEventId, String(event.aggregateType || "mapping_collection"),
           String(event.aggregateId || "access-config"), Number(event.aggregateVersion || 1),
           String(event.eventType || "mapping_collection_changed"), JSON.stringify(sanitized),
-          String(event.occurredAt || now), now);
+          String(event.occurredAt || now), now));
         consumed += result.changes;
       } catch {
         // A malformed line is skipped only after it is durably delimited. File
@@ -58,10 +58,10 @@ export function consumeV1Outbox(): { consumed: number; cursor: number; reset: bo
       }
     }
     cursor += Buffer.byteLength(complete);
-    db.prepare(`INSERT INTO sync_consumers(consumer, last_sequence, last_event_id, source_cursor, updated_at)
+    (await db.prepare(`INSERT INTO sync_consumers(consumer, last_sequence, last_event_id, source_cursor, updated_at)
       VALUES('v2-from-v1-outbox', 0, ?, ?, ?)
       ON CONFLICT(consumer) DO UPDATE SET last_event_id=excluded.last_event_id,
-        source_cursor=excluded.source_cursor, updated_at=excluded.updated_at`).run(lastEventId, String(cursor), now);
-  })();
+        source_cursor=excluded.source_cursor, updated_at=excluded.updated_at`).run(lastEventId, String(cursor), now));
+  })());
   return { consumed, cursor, reset };
 }

@@ -18,25 +18,25 @@ function blockedCategory(value: string): MailHealth["d1"]["blockedReason"] {
 }
 
 /** Reads only local aggregate state. Opening or refreshing diagnostics cannot read upstream mail. */
-export function mailHealth(now = Date.now()): MailHealth {
-  const ingestion = db.prepare(`SELECT COUNT(*) total,
+export async function mailHealth(now = Date.now()): Promise<MailHealth> {
+  const ingestion = (await db.prepare(`SELECT COUNT(*) total,
     COALESCE(SUM(status='processed'),0) processed,
     COALESCE(SUM(status IN ('pending_time','pending_parse') AND attempts<3),0) pending,
     COALESCE(SUM(status<>'processed' AND (attempts>=3 OR status NOT IN ('pending_time','pending_parse'))),0) failed,
     COALESCE(SUM(status IN ('pending_time','pending_parse') AND attempts BETWEEN 1 AND 2),0) retrying,
     MAX(discovered_at) last_event_at, MAX(CASE WHEN status='processed' THEN updated_at END) last_processed_at
-    FROM mail_ingestion_state WHERE provider='shared-mail-api'`).get() as Record<string, any>;
-  const reads = db.prepare(`SELECT COUNT(*) day_requests,
+    FROM mail_ingestion_state WHERE provider='shared-mail-api'`).get()) as Record<string, any>;
+  const reads = (await db.prepare(`SELECT COUNT(*) day_requests,
     COALESCE(SUM(started_at>?),0) minute_requests, COALESCE(SUM(rows_read),0) day_rows_read
-    FROM mail_read_requests WHERE started_at>?`).get(now - 60_000, now - 86_400_000) as Record<string, number>;
-  const control = db.prepare("SELECT lease_until,blocked_reason,backfill_at FROM mail_read_control WHERE id=1").get() as Record<string, any>;
+    FROM mail_read_requests WHERE started_at>?`).get(now - 60_000, now - 86_400_000)) as Record<string, number>;
+  const control = (await db.prepare("SELECT lease_until,blocked_reason,backfill_at FROM mail_read_control WHERE id=1").get()) as Record<string, any>;
   const blockedReason = blockedCategory(String(control?.blocked_reason || ""));
   const backfillAvailable = Number(control?.backfill_at || 0) + MAIL_READ_LIMITS.backfillCooldownMs;
-  const notices = db.prepare(`SELECT COUNT(*) total,
+  const notices = (await db.prepare(`SELECT COUNT(*) total,
     COALESCE(SUM(NOT EXISTS(SELECT 1 FROM mail_ownership_claims c WHERE c.message_id=m.id)),0) unassigned
-    FROM mail_messages m WHERE m.category='deactivation'`).get() as { total: number; unassigned: number };
-  const pendingNotices = db.prepare(`SELECT COUNT(*) n FROM pending_reviews
-    WHERE review_type='mail_ownership_ambiguous' AND status='pending'`).get() as { n: number };
+    FROM mail_messages m WHERE m.category='deactivation'`).get()) as { total: number; unassigned: number };
+  const pendingNotices = (await db.prepare(`SELECT COUNT(*) n FROM pending_reviews
+    WHERE review_type='mail_ownership_ambiguous' AND status='pending'`).get()) as { n: number };
   return {
     notices: { ...notices, pendingReviews: pendingNotices.n },
     checkedAt: new Date(now).toISOString(), independent: true, readOnly: config.readOnly,

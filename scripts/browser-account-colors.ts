@@ -24,20 +24,20 @@ const fixtures = [
   { email: "color-conflict@example.com", plan: "plus", status: "quarantined", mark: "yellow", channel: "", tone: "yellow", row: "" },
   { email: "color-retired@example.com", plan: "plus", status: "retired", mark: "orange", channel: "", tone: "gray", row: "" },
 ];
-const imported = importAccounts(fixtures.map((fixture, index) => ({ email: fixture.email, plan: fixture.plan,
+const imported = (await importAccounts(fixtures.map((fixture, index) => ({ email: fixture.email, plan: fixture.plan,
   accessToken: [Buffer.from("{}").toString("base64url"), Buffer.from(JSON.stringify({ sub: `offline-color-${index}`,
     email: fixture.email, exp: 4_000_000_000, "https://api.openai.com/auth": { chatgpt_plan_type: fixture.plan } })).toString("base64url"), "offline-signature"].join("."),
   refreshToken: `offline-color-refresh-${index}`,
-})));
+}))));
 assert.equal(imported.errors.length, 0);
-const accounts = listAccounts({ limit: 100 }).results;
+const accounts = (await listAccounts({ limit: 100 })).results;
 const cases = fixtures.map((fixture) => ({ ...fixture, id: accounts.find((account) => account.primaryEmail === fixture.email)!.id }));
 for (const fixture of cases) {
-  if (fixture.status === "deactivated") deactivateAccount(fixture.id, "offline-color-fixture");
-  else db.prepare("UPDATE gpt_accounts SET lifecycle_status=?, identity_status=? WHERE id=?")
-    .run(fixture.status, fixture.status === "quarantined" ? "conflict" : "confirmed", fixture.id);
-  db.prepare("UPDATE gpt_accounts SET mark_color=?, billing_channel=?, group_boundary=? WHERE id=?")
-    .run(fixture.mark, fixture.channel, fixture.email === "color-free@example.com" ? 1 : 0, fixture.id);
+  if (fixture.status === "deactivated") (await deactivateAccount(fixture.id, "offline-color-fixture"));
+  else (await db.prepare("UPDATE gpt_accounts SET lifecycle_status=?, identity_status=? WHERE id=?")
+    .run(fixture.status, fixture.status === "quarantined" ? "conflict" : "confirmed", fixture.id));
+  (await db.prepare("UPDATE gpt_accounts SET mark_color=?, billing_channel=?, group_boundary=? WHERE id=?")
+    .run(fixture.mark, fixture.channel, fixture.email === "color-free@example.com" ? 1 : 0, fixture.id));
 }
 globalThis.fetch = async () => { throw new Error("Account color fixture cannot access upstream"); };
 const app = await buildApp();
@@ -139,8 +139,8 @@ try {
     }
   }
   assert.deepEqual(errors, []);
-  assert.equal((db.prepare("SELECT count(*) AS count FROM mail_read_requests").get() as any).count, 0);
+  assert.equal(((await db.prepare("SELECT count(*) AS count FROM mail_read_requests").get()) as any).count, 0);
   console.log(JSON.stringify({ ok: true, checks, upstreamRequests: 0, pageErrors: errors }));
 } finally {
-  await browser.close(); await app.close(); db.close();
+  await browser.close(); await app.close(); (await db.close());
 }

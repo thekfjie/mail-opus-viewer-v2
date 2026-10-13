@@ -14,46 +14,46 @@ const [{ db }, routes] = await Promise.all([
   import("../src/server/check-routes.js"),
 ]);
 
-test("检测出口长期加密保存、管理员完整显示并可回退环境配置", () => {
-  const initial = routes.checkRouteSummary("promotion_jp");
+test("检测出口长期加密保存、管理员完整显示并可回退环境配置", async () => {
+  const initial = (await routes.checkRouteSummary("promotion_jp"));
   assert.equal(initial.source, "environment");
   assert.equal(initial.addressDisplay, "JP 路由 · http://env-user:env-pass@jp-env.test:7903");
 
-  const saved = routes.saveCheckRouteProxy("promotion_jp", "socks5://saved-user:saved-pass@jp-saved.test:1080");
+  const saved = (await routes.saveCheckRouteProxy("promotion_jp", "socks5://saved-user:saved-pass@jp-saved.test:1080"));
   assert.equal(saved.source, "saved");
   assert.equal(saved.addressDisplay, "JP 路由 · socks5://saved-user:saved-pass@jp-saved.test:1080");
-  assert.equal(routes.effectiveCheckProxy("promotion_jp"), "socks5://saved-user:saved-pass@jp-saved.test:1080");
-  const stored = db.prepare("SELECT value FROM settings WHERE key='check_route_proxy_v1:promotion_jp'").get() as any;
+  assert.equal((await routes.effectiveCheckProxy("promotion_jp")), "socks5://saved-user:saved-pass@jp-saved.test:1080");
+  const stored = (await db.prepare("SELECT value FROM settings WHERE key='check_route_proxy_v1:promotion_jp'").get()) as any;
   assert.match(String(stored.value), /^v1\./);
   assert.equal(String(stored.value).includes("saved-pass"), false);
 
-  const cleared = routes.clearCheckRouteProxy("promotion_jp");
+  const cleared = (await routes.clearCheckRouteProxy("promotion_jp"));
   assert.equal(cleared.source, "environment");
-  assert.equal(routes.effectiveCheckProxy("promotion_jp"), "http://env-user:env-pass@jp-env.test:7903");
+  assert.equal((await routes.effectiveCheckProxy("promotion_jp")), "http://env-user:env-pass@jp-env.test:7903");
 });
 
-test("支付资格接口地址和令牌加密长期保存", () => {
-  assert.deepEqual(routes.paymentEligibilityApiSummary(), {
+test("支付资格接口地址和令牌加密长期保存", async () => {
+  assert.deepEqual((await routes.paymentEligibilityApiSummary()), {
     configured: true,
     source: "environment",
     endpoint: "https://eligibility-default.test/api/v1/check",
     hasApiToken: false,
   });
 
-  const saved = routes.savePaymentEligibilityApi("https://saved.test/api/v1/check?tenant=opus", "api-secret-value", true);
+  const saved = (await routes.savePaymentEligibilityApi("https://saved.test/api/v1/check?tenant=opus", "api-secret-value", true));
   assert.equal(saved.source, "saved");
   assert.equal(saved.endpoint, "https://saved.test/api/v1/check?tenant=opus");
   assert.equal(saved.hasApiToken, true);
-  assert.deepEqual(routes.effectivePaymentEligibilityApi(), {
+  assert.deepEqual((await routes.effectivePaymentEligibilityApi()), {
     endpoint: "https://saved.test/api/v1/check?tenant=opus",
     apiToken: "api-secret-value",
   });
-  const stored = db.prepare("SELECT key, value FROM settings WHERE key LIKE 'payment_eligibility_%' ORDER BY key").all() as any[];
+  const stored = (await db.prepare("SELECT key, value FROM settings WHERE key LIKE 'payment_eligibility_%' ORDER BY key").all()) as any[];
   assert.equal(stored.length, 2);
   assert.equal(stored.every((row) => String(row.value).startsWith("v1.")), true);
   assert.equal(stored.some((row) => String(row.value).includes("api-secret-value")), false);
 
-  const cleared = routes.clearPaymentEligibilityApi();
+  const cleared = (await routes.clearPaymentEligibilityApi());
   assert.equal(cleared.source, "environment");
   assert.equal(cleared.endpoint, "https://eligibility-default.test/api/v1/check");
   assert.equal(cleared.hasApiToken, false);

@@ -26,7 +26,7 @@ test("compatibility import waits for a concurrent WAL writer instead of failing 
     import("../src/server/db.js"),
     import("../src/server/compatibility-state.js"),
   ]);
-  db.exec("CREATE TABLE contention_fixture(id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+  (await db.exec("CREATE TABLE contention_fixture(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"));
 
   const ready = new Int32Array(new SharedArrayBuffer(4));
   const require = createRequire(import.meta.url);
@@ -55,22 +55,22 @@ test("compatibility import waits for a concurrent WAL writer instead of failing 
   });
   t.after(async () => {
     await worker.terminate();
-    db.close();
+    (await db.close());
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
   assert.equal(Atomics.wait(ready, 0, 0, 5000), "ok");
   const startedAt = Date.now();
-  const imported = compatibility.upsertCompatibilityAccount({
+  const imported = (await compatibility.upsertCompatibilityAccount({
     email: "contention@icloud.com",
     accessToken: "fake-contention-token",
-  });
+  }));
   const elapsedMs = Date.now() - startedAt;
 
   assert.equal(imported.ok, true);
   assert.equal(imported.created, true);
   assert.ok(elapsedMs >= 200, `expected import to wait for writer, elapsed=${elapsedMs}ms`);
-  assert.equal((db.prepare("SELECT COUNT(*) AS count FROM contention_fixture").get() as any).count, 1);
+  assert.equal(((await db.prepare("SELECT COUNT(*) AS count FROM contention_fixture").get()) as any).count, 1);
   assert.equal(await new Promise((resolve, reject) => {
     worker.once("message", resolve);
     worker.once("error", reject);

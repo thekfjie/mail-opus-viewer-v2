@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { Database } from "better-sqlite3";
+import type { Database } from "./storage/types.js";
 
 function boundedEnvInt(name: string, fallback: number, min: number, max: number): number {
   const value = Number(process.env[name] || fallback);
@@ -23,8 +23,8 @@ export class MailReadError extends Error {
   }
 }
 
-export function applyMailIngestionSchema(database: Database): void {
-  database.exec(`
+export async function applyMailIngestionSchema(database: Database): Promise<void> {
+  (await database.exec(`
     CREATE TABLE IF NOT EXISTS mail_read_requests (
       id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, rows_read INTEGER NOT NULL DEFAULT 0,
       outcome TEXT NOT NULL DEFAULT 'pending'
@@ -53,7 +53,7 @@ export function applyMailIngestionSchema(database: Database): void {
       FOREIGN KEY(provider, provider_message_id)
         REFERENCES mail_ingestion_state(provider, provider_message_id) ON DELETE CASCADE
     );
-  `);
+  `));
 }
 
 export interface SharedMailRow {
@@ -186,41 +186,41 @@ export class D1MailReader {
     }
   }
 
-  private acquire(key: string): string {
-    return this.database.transaction(() => {
+  private async acquire(key: string): Promise<string> {
+    return (await this.database.transaction(async () => {
       const now = this.now();
-      const control = this.database.prepare("SELECT * FROM mail_read_control WHERE id=1").get() as any;
+      const control = (await this.database.prepare("SELECT * FROM mail_read_control WHERE id=1").get()) as any;
       if (!control) throw new MailReadError("mail_schema_not_ready");
       if (control.blocked_reason) throw new MailReadError(String(control.blocked_reason));
       if (control.lease_until > now) throw new MailReadError("mail_read_busy", 429);
       // A process can exit after sending a request but before recording its cost.
       // Keep that reservation and charge the maximum accepted cost on recovery.
       if (control.owner) {
-        this.database.prepare(`UPDATE mail_read_requests SET outcome='mail_d1_interrupted', rows_read=?
-          WHERE id=? AND outcome='pending'`).run(MAIL_READ_LIMITS.maxRowsRead, control.owner);
+        (await this.database.prepare(`UPDATE mail_read_requests SET outcome='mail_d1_interrupted', rows_read=?
+          WHERE id=? AND outcome='pending'`).run(MAIL_READ_LIMITS.maxRowsRead, control.owner));
       }
-      const failure = this.database.prepare("SELECT retry_after FROM mail_read_failures WHERE request_key=?").get(key) as any;
+      const failure = (await this.database.prepare("SELECT retry_after FROM mail_read_failures WHERE request_key=?").get(key)) as any;
       if (Number(failure?.retry_after) > now) throw new MailReadError("mail_read_cooling_down", 429);
-      this.database.prepare("DELETE FROM mail_read_requests WHERE started_at<=?").run(now - 86_400_000);
-      this.database.prepare("DELETE FROM mail_read_failures WHERE retry_after<=?").run(now);
-      const counts = this.database.prepare(`SELECT COUNT(*) daily,
+      (await this.database.prepare("DELETE FROM mail_read_requests WHERE started_at<=?").run(now - 86_400_000));
+      (await this.database.prepare("DELETE FROM mail_read_failures WHERE retry_after<=?").run(now));
+      const counts = (await this.database.prepare(`SELECT COUNT(*) daily,
         COALESCE(SUM(CASE WHEN started_at>? THEN 1 ELSE 0 END),0) minute,
-        COALESCE(SUM(rows_read),0) rows_read FROM mail_read_requests`).get(now - 60_000) as any;
+        COALESCE(SUM(rows_read),0) rows_read FROM mail_read_requests`).get(now - 60_000)) as any;
       if (counts.daily >= MAIL_READ_LIMITS.perDay || counts.minute >= MAIL_READ_LIMITS.perMinute
         || counts.rows_read >= MAIL_READ_LIMITS.maxRowsReadPerDay) throw new MailReadError("mail_read_budget_exhausted", 429);
       const id = crypto.randomUUID();
-      this.database.prepare("UPDATE mail_read_control SET owner=?, lease_until=? WHERE id=1")
-        .run(id, now + this.timeoutMs + 5_000);
-      this.database.prepare("INSERT INTO mail_read_requests(id, started_at) VALUES(?, ?)").run(id, now);
+      (await this.database.prepare("UPDATE mail_read_control SET owner=?, lease_until=? WHERE id=1")
+        .run(id, now + this.timeoutMs + 5_000));
+      (await this.database.prepare("INSERT INTO mail_read_requests(id, started_at) VALUES(?, ?)").run(id, now));
       return id;
-    }).immediate();
+    }).immediate());
   }
 
   private async acquireWhenAvailable(key: string): Promise<string> {
     const deadline = Date.now() + this.leaseWaitMs;
     for (;;) {
       try {
-        return this.acquire(key);
+        return (await this.acquire(key));
       } catch (error) {
         if (!(error instanceof MailReadError) || error.code !== "mail_read_busy" || Date.now() >= deadline) throw error;
         await new Promise((resolve) => setTimeout(resolve, 25));
@@ -265,24 +265,24 @@ export class D1MailReader {
             errorCode = response.status === 401 || response.status === 403 ? "mail_d1_unauthorized"
               : response.status === 429 ? "mail_d1_quota_exhausted" : "mail_d1_upstream_failure";
             if ([401, 403, 429].includes(response.status)) {
-              this.database.prepare("UPDATE mail_read_control SET blocked_reason=? WHERE id=1").run(errorCode);
+              (await this.database.prepare("UPDATE mail_read_control SET blocked_reason=? WHERE id=1").run(errorCode));
             }
             throw new MailReadError(errorCode);
           }
           const payload = await boundedJson(response);
           const result = payload?.result?.[0];
           if (payload?.success !== true || result?.success === false || !Array.isArray(result?.results)) {
-            this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_query_rejected' WHERE id=1").run();
+            (await this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_query_rejected' WHERE id=1").run());
             throw new MailReadError("mail_d1_query_rejected");
           }
           const rowsRead = Number(result?.meta?.rows_read);
           if (!Number.isSafeInteger(rowsRead) || rowsRead < 0) {
-            this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_missing_cost' WHERE id=1").run();
+            (await this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_missing_cost' WHERE id=1").run());
             throw new MailReadError("mail_d1_missing_cost");
           }
-          this.database.prepare("UPDATE mail_read_requests SET rows_read=?, outcome='ok' WHERE id=?").run(rowsRead, requestId);
+          (await this.database.prepare("UPDATE mail_read_requests SET rows_read=?, outcome='ok' WHERE id=?").run(rowsRead, requestId));
           if (rowsRead > MAIL_READ_LIMITS.maxRowsRead) {
-            this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_query_cost_exceeded' WHERE id=1").run();
+            (await this.database.prepare("UPDATE mail_read_control SET blocked_reason='mail_d1_query_cost_exceeded' WHERE id=1").run());
             throw new MailReadError("mail_d1_query_cost_exceeded");
           }
           if (result.results.length > MAIL_READ_LIMITS.backfillPage) throw new MailReadError("mail_d1_response_limit_exceeded");
@@ -293,15 +293,15 @@ export class D1MailReader {
             errorCode = "mail_d1_transport_failure";
             retryable = true;
           }
-          this.database.prepare("UPDATE mail_read_requests SET outcome=? WHERE id=?").run(errorCode, requestId);
+          (await this.database.prepare("UPDATE mail_read_requests SET outcome=? WHERE id=?").run(errorCode, requestId));
           if (!retryable || attempt + 1 >= MAIL_READ_LIMITS.attempts) {
-            this.database.prepare(`INSERT INTO mail_read_failures(request_key, retry_after, error_code) VALUES(?, ?, ?)
+            (await this.database.prepare(`INSERT INTO mail_read_failures(request_key, retry_after, error_code) VALUES(?, ?, ?)
               ON CONFLICT(request_key) DO UPDATE SET retry_after=excluded.retry_after, error_code=excluded.error_code`)
-              .run(key, this.now() + MAIL_READ_LIMITS.failureCooldownMs, errorCode);
+              .run(key, this.now() + MAIL_READ_LIMITS.failureCooldownMs, errorCode));
             throw new MailReadError(errorCode);
           }
         } finally {
-          this.database.prepare("UPDATE mail_read_control SET owner='', lease_until=0 WHERE id=1 AND owner=?").run(requestId);
+          (await this.database.prepare("UPDATE mail_read_control SET owner='', lease_until=0 WHERE id=1 AND owner=?").run(requestId));
         }
       }
       throw new MailReadError("mail_read_failed");
@@ -342,13 +342,13 @@ export class D1MailReader {
     this.configured();
     validateBackfillWindow(window);
     const index = timeIndexName(this.options.timeIndex);
-    this.database.transaction(() => {
-      const row = this.database.prepare("SELECT backfill_at FROM mail_read_control WHERE id=1").get() as any;
+    (await this.database.transaction(async () => {
+      const row = (await this.database.prepare("SELECT backfill_at FROM mail_read_control WHERE id=1").get()) as any;
       if (row?.backfill_at && this.now() - row.backfill_at < MAIL_READ_LIMITS.backfillCooldownMs) {
         throw new MailReadError("mail_backfill_cooling_down", 429);
       }
-      this.database.prepare("UPDATE mail_read_control SET backfill_at=? WHERE id=1").run(this.now());
-    }).immediate();
+      (await this.database.prepare("UPDATE mail_read_control SET backfill_at=? WHERE id=1").run(this.now()));
+    }).immediate());
     const from = d1Date(window.from);
     const to = d1Date(window.to);
     const cursorAt = window.cursor ? d1Date(window.cursor.createdAt) : from;

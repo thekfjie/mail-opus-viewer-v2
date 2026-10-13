@@ -42,15 +42,15 @@ test("所有支付资格统一请求本机无优惠观察且只保存管理员�
     import("../src/server/repository.js"),
     import("../src/server/payment-exposure.js"),
   ]);
-  t.after(() => db.close());
+  t.after(async () => (await db.close()));
 
-  repository.importAccounts([{
+  (await repository.importAccounts([{
     email: "eligibility@icloud.com",
     accessToken: "fake-access-token-for-test",
     openaiSubject: "eligibility-subject",
     plan: "free",
-  }]);
-  const account = repository.listAccounts({ limit: 5 }).results[0];
+  }]));
+  const account = (await repository.listAccounts({ limit: 5 })).results[0];
   const routes = paymentExposure.listPaymentExposureRoutes();
   assert.deepEqual(routes.map((route) => route.target), ["ideal", "gcash", "upi", "gopay", "kakao", "naver", "momo"]);
   assert.equal(routes.every((route) => route.configured && route.addressDisplay === "本机提炼服务"), true);
@@ -76,7 +76,7 @@ test("所有支付资格统一请求本机无优惠观察且只保存管理员�
   assert.equal(result.items[0].paymentExposure[0].exposed, true);
   assert.equal(JSON.stringify(result).includes("fake-access-token-for-test"), false);
 
-  const saved = repository.listPaymentExposureChecks(account.id).filter((item) => item.checkoutType === "local_extractor");
+  const saved = (await repository.listPaymentExposureChecks(account.id)).filter((item) => item.checkoutType === "local_extractor");
   assert.equal(saved.length, 1);
   assert.equal(saved[0].target, "ideal");
   assert.deepEqual(saved[0].availableMethods, ["ideal"]);

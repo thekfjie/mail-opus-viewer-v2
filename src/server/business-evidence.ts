@@ -1,4 +1,4 @@
-import type { Database } from "better-sqlite3";
+import type { Database } from "./storage/types.js";
 
 export const LEGACY_RELAY_SENDER_PATTERN = "(^|<|\\b)[a-z]+_at_tm[a-z0-9]*_openai_com_[a-z0-9]+_[a-z0-9]+@icloud\\.com(>|\\b|$)";
 export const LEGACY_DIRECT_SENDER_PATTERN = "(^|<|\\b)[^\\s<>@]+@(?:[a-z0-9-]+\\.)*openai\\.com(>|\\b|$)";
@@ -7,12 +7,12 @@ export function mailboxRecipientPattern(address: string): string {
   return `(^|<|\\b)${address.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(>|\\b|$)`;
 }
 
-export function applyBusinessEvidenceSchema(database: Database): void {
-  database.exec(`CREATE TABLE IF NOT EXISTS account_passwords (
+export async function applyBusinessEvidenceSchema(database: Database): Promise<void> {
+  (await database.exec(`CREATE TABLE IF NOT EXISTS account_passwords (
     account_id TEXT PRIMARY KEY REFERENCES gpt_accounts(id) ON DELETE CASCADE,
     password_enc TEXT NOT NULL DEFAULT '', totp_secret_enc TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
-  )`);
-  database.exec(`CREATE TABLE IF NOT EXISTS account_business_evidence (
+  )`));
+  (await database.exec(`CREATE TABLE IF NOT EXISTS account_business_evidence (
     account_id TEXT PRIMARY KEY REFERENCES gpt_accounts(id) ON DELETE CASCADE,
     hidden_tags_json TEXT NOT NULL DEFAULT '[]',
     mail_verified_no_plus INTEGER NOT NULL DEFAULT 0,
@@ -24,7 +24,7 @@ export function applyBusinessEvidenceSchema(database: Database): void {
     audit_binding_id TEXT NOT NULL DEFAULT '',
     audited_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
-  )`);
+  )`));
 }
 
 export function normalizeHiddenTags(value: unknown): Record<string, string | boolean>[] {

@@ -1,3 +1,4 @@
+import { asyncMap } from './async-collections.js';
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -328,12 +329,12 @@ function registrationResultMaterial(value: Record<string, any>, line: number): T
   return base;
 }
 
-function importMaterialAccounts(accounts: ThirdPartyMaterialAccount[]): { imported: number; created: number; errors: Array<{ index: number; error: string }> } {
+async function importMaterialAccounts(accounts: ThirdPartyMaterialAccount[]): Promise<{ imported: number; created: number; errors: Array<{ index: number; error: string }> }> {
   let imported = 0;
   let created = 0;
   const errors: Array<{ index: number; error: string }> = [];
   for (let offset = 0; offset < accounts.length; offset += 200) {
-    const result = importAccounts(accounts.slice(offset, offset + 200));
+    const result = (await importAccounts(accounts.slice(offset, offset + 200)));
     imported += result.imported;
     created += result.created;
     errors.push(...result.errors.map((item) => ({ index: item.index + offset, error: item.error })));
@@ -343,7 +344,7 @@ function importMaterialAccounts(accounts: ThirdPartyMaterialAccount[]): { import
 
 /** Import third-party OpenAI session exports without any network request.
  * The existing encrypted credential-version store owns AT/session persistence. */
-export function importThirdPartySessionFile(inputPath: unknown): Record<string, unknown> {
+export async function importThirdPartySessionFile(inputPath: unknown): Promise<Record<string, unknown>> {
   const files = thirdPartyPaths(inputPath).map(readThirdPartyFile);
   const envelopes: Array<{ file: string; value: ThirdPartyEnvelope }> = [];
   const keys: Array<{ file: string; value: Buffer }> = [];
@@ -401,14 +402,14 @@ export function importThirdPartySessionFile(inputPath: unknown): Record<string, 
   for (const account of accounts) {
     if (account.hasIdentityCredential) account.lifecycleStatus = "third_party_registered";
     else {
-      const existing = db.prepare(`SELECT a.lifecycle_status FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
-        WHERE b.email_hash=? AND b.is_current=1 AND a.deleted_at='' LIMIT 1`).get(emailHash(account.email)) as any;
+      const existing = (await db.prepare(`SELECT a.lifecycle_status FROM email_bindings b JOIN gpt_accounts a ON a.id=b.account_id
+        WHERE b.email_hash=? AND b.is_current=1 AND a.deleted_at='' LIMIT 1`).get(emailHash(account.email))) as any;
       const status = String(existing?.lifecycle_status || "");
       account.lifecycleStatus = status === "third_party_registered" ? "third_party_registered"
         : status === "active" ? undefined : "third_party_pending_recovery";
     }
   }
-  const result = importMaterialAccounts(accounts);
+  const result = (await importMaterialAccounts(accounts));
   const mfaEnabledCount = accounts.filter((account) => account.mfaEnabled).length;
   const emailOtpCount = accounts.filter((account) => account.emailOtp).length;
   const missingTotpCount = accounts.filter((account) => account.missingTotp && !account.totpSecret).length;
@@ -428,24 +429,24 @@ export function importThirdPartySessionFile(inputPath: unknown): Record<string, 
   };
 }
 
-function resolveCredential(item: ParsedCredential): { status: string; reason: string; accountId: string; email: string; subjectHash: string } {
+async function resolveCredential(item: ParsedCredential): Promise<{ status: string; reason: string; accountId: string; email: string; subjectHash: string }> {
   if (item.error) return { status: "invalid", reason: item.error, accountId: "", email: item.email, subjectHash: "" };
   const tokenEmail = item.accessToken ? jwtEmail(item.accessToken) : "";
   const subject = item.accessToken ? parseJwtSubject(item.accessToken) : "";
   const subjectHash = subject ? sha256(subject) : "";
   if (item.email && tokenEmail && item.email !== tokenEmail) {
-    const explicit = db.prepare("SELECT account_id FROM email_bindings WHERE email_hash=? ORDER BY is_current DESC LIMIT 1").get(emailHash(item.email)) as any;
-    const byIdentity = subjectHash ? resolveAccountMatch(subjectHash, "") : null;
+    const explicit = (await db.prepare("SELECT account_id FROM email_bindings WHERE email_hash=? ORDER BY is_current DESC LIMIT 1").get(emailHash(item.email))) as any;
+    const byIdentity = subjectHash ? (await resolveAccountMatch(subjectHash, "")) : null;
     if (!explicit || !byIdentity?.accountId || String(explicit.account_id) !== byIdentity.accountId) {
       return { status: "conflict", reason: "行内邮箱与 AT 身份指向不同账号", accountId: "", email: item.email, subjectHash };
     }
   }
   const email = item.email || tokenEmail;
-  const match = resolveAccountMatch(subjectHash, email);
+  const match = (await resolveAccountMatch(subjectHash, email));
   if (match.kind === "conflict") return { status: "conflict", reason: match.reason, accountId: match.accountId, email, subjectHash };
   if (match.kind !== "account" || !match.accountId) {
-    const candidates = (db.prepare(`SELECT cv.account_id,cv.access_token_enc,cv.refresh_token_enc
-      FROM credential_versions cv JOIN gpt_accounts a ON a.id=cv.account_id WHERE a.deleted_at=''`).all() as any[])
+    const candidates = ((await db.prepare(`SELECT cv.account_id,cv.access_token_enc,cv.refresh_token_enc
+      FROM credential_versions cv JOIN gpt_accounts a ON a.id=cv.account_id WHERE a.deleted_at=''`).all()) as any[])
       .filter((row) => item.accessToken ? decryptSecret(row.access_token_enc) === item.accessToken
         : item.refreshToken && decryptSecret(row.refresh_token_enc) === item.refreshToken);
     const owners = [...new Set<string>(candidates.map((row) => row.account_id))];
@@ -456,8 +457,8 @@ function resolveCredential(item: ParsedCredential): { status: string; reason: st
   return { status: "ready", reason: "", accountId: match.accountId, email, subjectHash };
 }
 
-function resolvedCredentialBatch(text: string) {
-  const items = parseCredentials(text).map((credential) => ({ credential, resolution: resolveCredential(credential) }));
+async function resolvedCredentialBatch(text: string) {
+  const items = (await asyncMap(parseCredentials(text), async (credential) => ({ credential, resolution: (await resolveCredential(credential)) })));
   const groups = new Map<string, typeof items>();
   for (const item of items) if (item.resolution.status === "ready") {
     const group = groups.get(item.resolution.accountId) || [];
@@ -474,9 +475,9 @@ function resolvedCredentialBatch(text: string) {
   return items;
 }
 
-export function previewOauthBatch(textInput: unknown): Record<string, unknown> {
+export async function previewOauthBatch(textInput: unknown): Promise<Record<string, unknown>> {
   const text = String(textInput || "").trim();
-  const items = resolvedCredentialBatch(text).map(({ credential, resolution }) => {
+  const items = (await resolvedCredentialBatch(text)).map(({ credential, resolution }) => {
     return {
       line: credential.line, email: resolution.email, status: resolution.status, reason: resolution.reason,
       targetId: resolution.accountId, hasAccessToken: Boolean(credential.accessToken), hasRefreshToken: Boolean(credential.refreshToken),
@@ -492,13 +493,13 @@ export function previewOauthBatch(textInput: unknown): Record<string, unknown> {
   };
 }
 
-export function applyOauthBatch(textInput: unknown, previewHash: unknown, confirmed: unknown): Record<string, unknown> {
+export async function applyOauthBatch(textInput: unknown, previewHash: unknown, confirmed: unknown): Promise<Record<string, unknown>> {
   const text = String(textInput || "").trim();
   if (!confirmed || String(previewHash || "") !== sha256(text)) throw new Error("预览已变化，请重新预览后确认");
-  const credentials = resolvedCredentialBatch(text);
+  const credentials = (await resolvedCredentialBatch(text));
   let applied = 0;
-  const observedByAccount = new Map<string, ReturnType<typeof observeCredentialVersion>>();
-  const results = db.transaction(() => credentials.map(({ credential, resolution }) => {
+  const observedByAccount = new Map<string, Awaited<ReturnType<typeof observeCredentialVersion>>>();
+  const results = (await db.transaction(async () => (await asyncMap(credentials, async ({ credential, resolution }) => {
     if (resolution.status !== "ready") return { line: credential.line, status: resolution.status, reason: resolution.reason };
     const prior = observedByAccount.get(resolution.accountId);
     if (prior) return { line: credential.line, status: prior.conflict ? "conflict" : "applied", targetId: resolution.accountId, changed: prior.changed };
@@ -507,10 +508,10 @@ export function applyOauthBatch(textInput: unknown, previewHash: unknown, confir
         accessToken: item.credential.accessToken || bundle.accessToken, refreshToken: item.credential.refreshToken || bundle.refreshToken,
         idToken: item.credential.idToken || bundle.idToken, sessionToken: item.credential.sessionToken || bundle.sessionToken,
         openaiPassword: item.credential.openaiPassword || bundle.openaiPassword }), credential);
-    const existing = db.prepare(`SELECT cv.* FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
-      WHERE cc.account_id=?`).get(resolution.accountId) as any;
-    const binding = db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(resolution.accountId) as any;
-    const observed = observeCredentialVersion({
+    const existing = (await db.prepare(`SELECT cv.* FROM account_current_credentials cc JOIN credential_versions cv ON cv.id=cc.credential_version_id
+      WHERE cc.account_id=?`).get(resolution.accountId)) as any;
+    const binding = (await db.prepare("SELECT id FROM email_bindings WHERE account_id=? AND is_current=1").get(resolution.accountId)) as any;
+    const observed = (await observeCredentialVersion({
       accountId: resolution.accountId, bindingId: String(binding?.id || "") || null,
       accessToken: combined.accessToken, refreshToken: combined.refreshToken,
       idToken: combined.idToken || decryptSecret(String(existing?.id_token_enc || "")),
@@ -519,11 +520,11 @@ export function applyOauthBatch(textInput: unknown, previewHash: unknown, confir
       subjectHash: resolution.subjectHash || (parseJwtSubject(combined.accessToken) ? sha256(parseJwtSubject(combined.accessToken)) : ""),
       source: "v2-oauth-batch", validityStatus: combined.accessToken ? "alive" : "unknown",
       evidence: { batchHash: sha256(text), line: credential.line },
-    });
+    }));
     observedByAccount.set(resolution.accountId, observed);
     if (!observed.conflict) applied += 1;
     return { line: credential.line, status: observed.conflict ? "conflict" : "applied", targetId: resolution.accountId, changed: observed.changed };
-  }))();
+  })))());
   return { ok: true, applied, total: results.length, results };
 }
 
@@ -531,16 +532,16 @@ let oauthHealthRun: Promise<void> | null = null;
 
 export async function runOauthHealth(jobId: string, probe: OAuthProbe = probeOAuth): Promise<void> {
   const startedAt = new Date().toISOString();
-  db.prepare("UPDATE oauth_health_jobs SET status='running', started_at=?, updated_at=? WHERE id=?").run(startedAt, startedAt, jobId);
+  (await db.prepare("UPDATE oauth_health_jobs SET status='running', started_at=?, updated_at=? WHERE id=?").run(startedAt, startedAt, jobId));
   try {
-    const rows = db.prepare(`SELECT a.id account_id, cc.credential_version_id, cv.*
+    const rows = (await db.prepare(`SELECT a.id account_id, cc.credential_version_id, cv.*
       FROM gpt_accounts a JOIN account_current_credentials cc ON cc.account_id=a.id
       JOIN credential_versions cv ON cv.id=cc.credential_version_id
       WHERE a.deleted_at='' AND a.lifecycle_status='active' AND a.deactivation_locked=0
         AND a.plan NOT IN ('plus','pro','team','business','enterprise','edu')
         AND cv.validity_status NOT IN ('invalid','conflict')
-        AND (cv.access_token_enc!='' OR cv.refresh_token_enc!='') ORDER BY a.arrived_at,a.id`).all() as any[];
-    db.prepare("UPDATE oauth_health_jobs SET total_count=? WHERE id=?").run(rows.length, jobId);
+        AND (cv.access_token_enc!='' OR cv.refresh_token_enc!='') ORDER BY a.arrived_at,a.id`).all()) as any[];
+    (await db.prepare("UPDATE oauth_health_jobs SET total_count=? WHERE id=?").run(rows.length, jobId));
     let completed = 0;
     let errors = 0;
     for (const row of rows) {
@@ -551,60 +552,60 @@ export async function runOauthHealth(jobId: string, probe: OAuthProbe = probeOAu
         result = { status: "error", accessStatus: "unknown", refreshStatus: "unknown", detail: "oauth_probe_failed" } as const;
       }
       const now = new Date().toISOString();
-      db.transaction(() => {
-        const selected = db.prepare(`SELECT cc.credential_version_id, a.lifecycle_status, a.deactivation_locked,
+      (await db.transaction(async () => {
+        const selected = (await db.prepare(`SELECT cc.credential_version_id, a.lifecycle_status, a.deactivation_locked,
             cv.updated_at credential_updated_at FROM account_current_credentials cc JOIN gpt_accounts a ON a.id=cc.account_id
-            JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=? AND a.deleted_at=''`).get(row.account_id) as any;
+            JOIN credential_versions cv ON cv.id=cc.credential_version_id WHERE cc.account_id=? AND a.deleted_at=''`).get(row.account_id)) as any;
         const unchanged = selected?.credential_version_id === row.credential_version_id && selected?.credential_updated_at === row.updated_at
           && selected?.lifecycle_status === "active" && !selected?.deactivation_locked;
         let detail = unchanged ? result.detail : "credential_changed_during_probe";
         if (unchanged && result.status === "alive" && result.rotatedTokens) {
           const subject = parseJwtSubject(result.rotatedTokens.accessToken || result.rotatedTokens.idToken);
-          const observed = observeCredentialVersion({ accountId: row.account_id,
+          const observed = (await observeCredentialVersion({ accountId: row.account_id,
             ...result.rotatedTokens, sessionToken: decryptSecret(row.session_token_enc), openaiPassword: decryptSecret(row.openai_password_enc),
             subjectHash: subject ? sha256(subject) : String(row.subject_hash || ""), source: "v2-oauth-health", validityStatus: "alive",
-            evidence: { jobId, previousCredentialVersionId: row.credential_version_id } });
+            evidence: { jobId, previousCredentialVersionId: row.credential_version_id } }));
           if (observed.conflict) { detail = "refreshed_identity_conflict"; errors += 1; }
         } else if (unchanged && result.status !== "error") {
-          db.prepare("UPDATE credential_versions SET validity_status=?,validity_checked_at=?,updated_at=? WHERE id=?")
-            .run(result.status === "alive" ? "alive" : "invalid", now, now, row.credential_version_id);
-          db.prepare(`UPDATE credentials SET access_token_alive=?,
+          (await db.prepare("UPDATE credential_versions SET validity_status=?,validity_checked_at=?,updated_at=? WHERE id=?")
+            .run(result.status === "alive" ? "alive" : "invalid", now, now, row.credential_version_id));
+          (await db.prepare(`UPDATE credentials SET access_token_alive=?,
             refresh_token_alive=CASE WHEN ?='alive' THEN 1 WHEN ? IN ('invalid','missing') THEN 0 ELSE refresh_token_alive END,
-            updated_at=? WHERE account_id=?`).run(result.status === "alive" ? 1 : 0, result.refreshStatus, result.refreshStatus, now, row.account_id);
+            updated_at=? WHERE account_id=?`).run(result.status === "alive" ? 1 : 0, result.refreshStatus, result.refreshStatus, now, row.account_id));
         }
-        db.prepare(`INSERT INTO oauth_health_results(id, job_id, account_id, credential_version_id, access_status, refresh_status, detail, checked_at)
+        (await db.prepare(`INSERT INTO oauth_health_results(id, job_id, account_id, credential_version_id, access_status, refresh_status, detail, checked_at)
           VALUES(?, ?, ?, ?, ?, ?, ?, ?)`).run(
           crypto.randomUUID(), jobId, row.account_id, row.credential_version_id, result.accessStatus,
           result.refreshStatus, detail, now,
-        );
+        ));
         completed += 1;
         if (result.status !== "alive" || !unchanged) errors += 1;
-        db.prepare("UPDATE oauth_health_jobs SET completed_count=?,error_count=?,updated_at=? WHERE id=?").run(completed, errors, now, jobId);
-      })();
+        (await db.prepare("UPDATE oauth_health_jobs SET completed_count=?,error_count=?,updated_at=? WHERE id=?").run(completed, errors, now, jobId));
+      })());
     }
     const now = new Date().toISOString();
-    db.prepare("UPDATE oauth_health_jobs SET status='completed',finished_at=?,updated_at=? WHERE id=?").run(now, now, jobId);
+    (await db.prepare("UPDATE oauth_health_jobs SET status='completed',finished_at=?,updated_at=? WHERE id=?").run(now, now, jobId));
   } catch (error) {
     const now = new Date().toISOString();
-    db.prepare("UPDATE oauth_health_jobs SET status='failed', error_count=1, finished_at=?, updated_at=? WHERE id=?").run(now, now, jobId);
-    db.prepare(`INSERT INTO settings(key,value,updated_at) VALUES('oauth_health_last_error',?,?)
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run("oauth_health_job_failed", now);
+    (await db.prepare("UPDATE oauth_health_jobs SET status='failed', error_count=1, finished_at=?, updated_at=? WHERE id=?").run(now, now, jobId));
+    (await db.prepare(`INSERT INTO settings(key,value,updated_at) VALUES('oauth_health_last_error',?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run("oauth_health_job_failed", now));
   }
 }
 
-export function startOauthHealth(): Record<string, unknown> {
-  const active = db.prepare("SELECT * FROM oauth_health_jobs WHERE status IN ('queued','running') ORDER BY created_at DESC LIMIT 1").get() as any;
-  if (active) return oauthHealthStatus(String(active.id));
+export async function startOauthHealth(): Promise<Record<string, unknown>> {
+  const active = (await db.prepare("SELECT * FROM oauth_health_jobs WHERE status IN ('queued','running') ORDER BY created_at DESC LIMIT 1").get()) as any;
+  if (active) return (await oauthHealthStatus(String(active.id)));
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
-  db.prepare("INSERT INTO oauth_health_jobs(id,status,created_at,updated_at) VALUES(?,'queued',?,?)").run(id, now, now);
+  (await db.prepare("INSERT INTO oauth_health_jobs(id,status,created_at,updated_at) VALUES(?,'queued',?,?)").run(id, now, now));
   oauthHealthRun = runOauthHealth(id).finally(() => { oauthHealthRun = null; });
-  return oauthHealthStatus(id);
+  return (await oauthHealthStatus(id));
 }
 
-export function oauthHealthStatus(id = ""): Record<string, unknown> {
-  const row = id ? db.prepare("SELECT * FROM oauth_health_jobs WHERE id=?").get(id) as any
-    : db.prepare("SELECT * FROM oauth_health_jobs ORDER BY created_at DESC LIMIT 1").get() as any;
+export async function oauthHealthStatus(id = ""): Promise<Record<string, unknown>> {
+  const row = id ? (await db.prepare("SELECT * FROM oauth_health_jobs WHERE id=?").get(id)) as any
+    : (await db.prepare("SELECT * FROM oauth_health_jobs ORDER BY created_at DESC LIMIT 1").get()) as any;
   if (!row) return { status: "idle", total: 0, completed: 0, errors: 0 };
   return {
     id: row.id, status: row.status, total: Number(row.total_count || 0), completed: Number(row.completed_count || 0),
@@ -643,19 +644,19 @@ function parseOutlookLines(input: unknown): OutlookImportItem[] {
   return output.slice(0, 500);
 }
 
-function accountForEmail(email: string): { accountId: string; bindingId: string } | null {
-  const row = db.prepare(`SELECT b.account_id, b.id binding_id FROM email_bindings b
-    JOIN gpt_accounts a ON a.id=b.account_id WHERE b.email_hash=? AND b.is_current=1 AND a.deleted_at=''`).get(emailHash(email)) as any;
+async function accountForEmail(email: string): Promise<{ accountId: string; bindingId: string } | null> {
+  const row = (await db.prepare(`SELECT b.account_id, b.id binding_id FROM email_bindings b
+    JOIN gpt_accounts a ON a.id=b.account_id WHERE b.email_hash=? AND b.is_current=1 AND a.deleted_at=''`).get(emailHash(email))) as any;
   return row ? { accountId: String(row.account_id), bindingId: String(row.binding_id) } : null;
 }
 
-function saveOutlookConnection(item: OutlookImportItem, groupId: unknown = ""): void {
-  const owner = accountForEmail(item.email);
+async function saveOutlookConnection(item: OutlookImportItem, groupId: unknown = ""): Promise<void> {
+  const owner = (await accountForEmail(item.email));
   if (!owner) throw new Error("Outlook 邮箱导入后没有当前绑定");
   const now = new Date().toISOString();
   const id = sha256(`outlook-manager:${owner.bindingId}`).slice(0, 32);
   const secret = encryptSecret(JSON.stringify({ password: item.mailboxPassword, clientId: item.clientId, refreshToken: item.mailboxRefreshToken }));
-  db.prepare(`INSERT INTO mailbox_connections(id,binding_id,provider,external_account_id,external_group_id,secret_ref,status,last_checked_at,
+  (await db.prepare(`INSERT INTO mailbox_connections(id,binding_id,provider,external_account_id,external_group_id,secret_ref,status,last_checked_at,
       metadata_json,created_at,updated_at,manager_email_enc,credentials_enc)
     VALUES(?,?,'outlook-manager',?,?,?,'active','',?, ?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET external_account_id=excluded.external_account_id,external_group_id=excluded.external_group_id,
@@ -663,7 +664,7 @@ function saveOutlookConnection(item: OutlookImportItem, groupId: unknown = ""): 
       credentials_enc=excluded.credentials_enc,updated_at=excluded.updated_at`).run(
     id, owner.bindingId, emailHash(item.email), String(groupId || ""), `v2:${owner.bindingId}:mailbox`,
     JSON.stringify({ mailSource: "outlook-manager", importedBy: "v2" }), now, now, encryptSecret(item.email), secret,
-  );
+  ));
 }
 
 export async function importOutlook(input: unknown): Promise<Record<string, unknown>> {
@@ -677,14 +678,14 @@ export async function importOutlook(input: unknown): Promise<Record<string, unkn
   let errors = 0;
   for (let index = 0; index < parsed.length; index += 200) {
     const chunk = parsed.slice(index, index + 200);
-    const result = importAccounts(chunk.map((item) => ({
+    const result = (await importAccounts(chunk.map((item) => ({
       email: item.email, accessToken: item.accessToken, openaiPassword: item.openaiPassword, plan: "free", note: "",
-    })));
+    }))));
     imported += result.imported;
     created += result.created;
     errors += result.errors.length;
   }
-  for (const item of parsed) if (accountForEmail(item.email)) saveOutlookConnection(item, managerResult?.group_id || "");
+  for (const item of parsed) if ((await accountForEmail(item.email))) (await saveOutlookConnection(item, managerResult?.group_id || ""));
   return { ok: true, added: created, updated: imported - created, skipped: parsed.length - imported, errors, managerAdded: Number(managerResult?.added_count || 0), managerSkipped: Number(managerResult?.skipped_count || 0) };
 }
 
@@ -699,11 +700,11 @@ export async function previewOutlookTransfer(input: unknown): Promise<Record<str
   const emails = transferEmails(input);
   if (!emails.length) throw new Error("请粘贴至少一个邮箱");
   const manager = new Map((await listOutlookManagerAccounts()).map((item) => [normalizeEmail(item.email), item]));
-  const results = emails.map((email) => {
+  const results = (await asyncMap(emails, async (email) => {
     const listed = manager.get(email);
-    const local = accountForEmail(email);
+    const local = (await accountForEmail(email));
     return { email, exists: Boolean(listed), transferable: Boolean(listed), alreadyInViewer: Boolean(local), status: !listed ? "missing" : local ? "existing" : "ready", reason: !listed ? "Outlook 管理库未找到" : local ? "V2 已有账号" : "可转移" };
-  });
+  }));
   return { ok: true, total: results.length, transferable: results.filter((item) => item.transferable).length, results };
 }
 
@@ -720,13 +721,13 @@ export async function applyOutlookTransfer(input: unknown): Promise<Record<strin
     try {
       const detailPayload = await outlookManagerFetch(`/api/accounts/${listed.id}`);
       const detail = detailPayload?.account || detailPayload;
-      const result = importAccounts([{ email, plan: "free" }]);
+      const result = (await importAccounts([{ email, plan: "free" }]));
       added += result.created;
       updated += result.imported - result.created;
-      saveOutlookConnection({
+      (await saveOutlookConnection({
         email, openaiPassword: "", accessToken: "", mailboxPassword: String(detail.password || ""),
         clientId: String(detail.client_id || ""), mailboxRefreshToken: String(detail.refresh_token || ""), raw: "",
-      }, detail.group_id || listed.group_id || "");
+      }, detail.group_id || listed.group_id || ""));
     } catch (error) {
       failed.push({ email, error: error instanceof Error ? error.message : String(error) });
     }
@@ -734,7 +735,7 @@ export async function applyOutlookTransfer(input: unknown): Promise<Record<strin
   return { ok: true, added, updated, failed: failed.length, failedItems: failed };
 }
 
-export function importSession(input: unknown): Record<string, unknown> {
+export async function importSession(input: unknown): Promise<Record<string, unknown>> {
   const text = String(input || "");
   const session = findJson(text);
   if (!session) throw new Error("会话 JSON 无法解析，请完整复制后重试");
@@ -743,25 +744,25 @@ export function importSession(input: unknown): Record<string, unknown> {
   credential.email ||= normalizeEmail(session.user?.email || "");
   if (!validEmail(credential.email)) throw new Error("会话 JSON 中没有有效的账号邮箱");
   if (!credential.accessToken && !credential.sessionToken) throw new Error("会话 JSON 中没有可识别的 Token");
-  const result = importAccounts([credential]);
+  const result = (await importAccounts([credential]));
   return { ok: result.errors.length === 0, added: result.created, updated: result.imported - result.created, skipped: result.imported ? 0 : 1, errors: result.errors };
 }
 
-export function runUsageAudit(): Record<string, unknown> {
+export async function runUsageAudit(): Promise<Record<string, unknown>> {
   const now = new Date().toISOString();
-  const candidates = db.prepare(`SELECT a.id,a.mark_color,
+  const candidates = (await db.prepare(`SELECT a.id,a.mark_color,
     (SELECT b.id FROM email_bindings b WHERE b.account_id=a.id ORDER BY b.is_current DESC,b.valid_from DESC LIMIT 1) binding_id,
     e.billing_started_at,e.last_activity_at,e.newest_mail_at,e.audit_binding_id
-    FROM gpt_accounts a LEFT JOIN account_business_evidence e ON e.account_id=a.id WHERE a.deleted_at=''`).all() as any[];
+    FROM gpt_accounts a LEFT JOIN account_business_evidence e ON e.account_id=a.id WHERE a.deleted_at=''`).all()) as any[];
   let suspected = 0;
-  db.transaction(() => {
+  (await db.transaction(async () => {
     for (const row of candidates) {
       const sameBinding = row.audit_binding_id === row.binding_id;
       let billingAt = Date.parse(String(row.billing_started_at || "")) || 0;
       let activityAt = sameBinding ? Date.parse(String(row.last_activity_at || "")) || 0 : 0;
       let newestAt = sameBinding ? Date.parse(String(row.newest_mail_at || "")) || 0 : 0;
-      const mails = db.prepare(`SELECT DISTINCT m.subject,m.received_at,oc.binding_id
-        FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE oc.account_id=?`).all(row.id) as any[];
+      const mails = (await db.prepare(`SELECT DISTINCT m.subject,m.received_at,oc.binding_id
+        FROM mail_messages m JOIN mail_ownership_claims oc ON oc.message_id=m.id WHERE oc.account_id=?`).all(row.id)) as any[];
       for (const mail of mails) {
         const at = Date.parse(String(mail.received_at || ""));
         if (!Number.isFinite(at)) continue;
@@ -773,16 +774,16 @@ export function runUsageAudit(): Record<string, unknown> {
       }
       const unused = row.mark_color !== "purple" && Boolean(billingAt) && !(activityAt > billingAt);
       const iso = (at: number) => at ? new Date(at).toISOString() : "";
-      db.prepare(`INSERT INTO account_business_evidence(account_id,billing_started_at,last_activity_at,newest_mail_at,audit_binding_id,audited_at,updated_at)
+      (await db.prepare(`INSERT INTO account_business_evidence(account_id,billing_started_at,last_activity_at,newest_mail_at,audit_binding_id,audited_at,updated_at)
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET billing_started_at=excluded.billing_started_at,
         last_activity_at=excluded.last_activity_at,newest_mail_at=excluded.newest_mail_at,audit_binding_id=excluded.audit_binding_id,
-        audited_at=excluded.audited_at,updated_at=excluded.updated_at`).run(row.id, iso(billingAt), iso(activityAt), iso(newestAt), row.binding_id || "", now, now);
-      db.prepare("UPDATE gpt_accounts SET suspected_unused=?, updated_at=? WHERE id=?").run(unused ? 1 : 0, now, row.id);
+        audited_at=excluded.audited_at,updated_at=excluded.updated_at`).run(row.id, iso(billingAt), iso(activityAt), iso(newestAt), row.binding_id || "", now, now));
+      (await db.prepare("UPDATE gpt_accounts SET suspected_unused=?, updated_at=? WHERE id=?").run(unused ? 1 : 0, now, row.id));
       if (unused) suspected += 1;
     }
-    db.prepare(`INSERT INTO settings(key,value,updated_at) VALUES('usage_audit_last_result',?,?)
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(JSON.stringify({ checked: candidates.length, suspected }), now);
-  })();
+    (await db.prepare(`INSERT INTO settings(key,value,updated_at) VALUES('usage_audit_last_result',?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(JSON.stringify({ checked: candidates.length, suspected }), now));
+  })());
   return { ok: true, checked: candidates.length, suspectedUnused: suspected, finishedAt: now };
 }
 
@@ -806,24 +807,24 @@ function publicShare(row: any): Record<string, unknown> {
   };
 }
 
-export function listShareLinks(): Record<string, unknown> {
-  return { results: (db.prepare("SELECT * FROM share_links ORDER BY created_at DESC").all() as any[]).map(publicShare) };
+export async function listShareLinks(): Promise<Record<string, unknown>> {
+  return { results: ((await db.prepare("SELECT * FROM share_links ORDER BY created_at DESC").all()) as any[]).map(publicShare) };
 }
 
-export function createShareLink(input: any): Record<string, unknown> {
+export async function createShareLink(input: any): Promise<Record<string, unknown>> {
   const ttlHours = Math.max(1, Math.min(168, Number(input?.ttlHours || 24)));
   const maxViews = Math.max(1, Math.min(50, Number(input?.maxViews || 5)));
   const token = crypto.randomBytes(24).toString("base64url");
   const id = crypto.randomUUID();
   const now = new Date();
   const expires = new Date(now.getTime() + ttlHours * 60 * 60 * 1_000).toISOString();
-  db.prepare(`INSERT INTO share_links(id,token_hash,token_enc,label,expires_at,max_views,filters_json,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?)`).run(id, digestToken(token), encryptSecret(token), String(input?.label || "").slice(0, 80), expires, maxViews, JSON.stringify(shareFilters(input)), now.toISOString(), now.toISOString());
-  return { ok: true, link: publicShare(db.prepare("SELECT * FROM share_links WHERE id=?").get(id)) };
+  (await db.prepare(`INSERT INTO share_links(id,token_hash,token_enc,label,expires_at,max_views,filters_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)`).run(id, digestToken(token), encryptSecret(token), String(input?.label || "").slice(0, 80), expires, maxViews, JSON.stringify(shareFilters(input)), now.toISOString(), now.toISOString()));
+  return { ok: true, link: publicShare((await db.prepare("SELECT * FROM share_links WHERE id=?").get(id))) };
 }
 
-export function revokeShareLink(id: string): boolean {
-  return db.prepare("UPDATE share_links SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at=''").run(new Date().toISOString(), new Date().toISOString(), id).changes > 0;
+export async function revokeShareLink(id: string): Promise<boolean> {
+  return (await db.prepare("UPDATE share_links SET revoked_at=?,updated_at=? WHERE id=? AND revoked_at=''").run(new Date().toISOString(), new Date().toISOString(), id)).changes > 0;
 }
 
 function maskEmail(email: string): string {
@@ -835,28 +836,28 @@ function maskEmail(email: string): string {
   return `${local.slice(0, start)}${"*".repeat(count)}${local.slice(start + count)}@${domain}`;
 }
 
-export function readShareSnapshot(token: string, visitor: string): Record<string, unknown> | null {
-  const row = db.prepare("SELECT * FROM share_links WHERE token_hash=?").get(digestToken(token)) as any;
+export async function readShareSnapshot(token: string, visitor: string): Promise<Record<string, unknown> | null> {
+  const row = (await db.prepare("SELECT * FROM share_links WHERE token_hash=?").get(digestToken(token))) as any;
   if (!row || row.revoked_at || Date.parse(String(row.expires_at || "")) <= Date.now() || Number(row.views) >= Number(row.max_views)) return null;
   const now = new Date().toISOString();
   const visitorHash = sha256(`${visitor}:${token}`);
-  const dedupe = db.prepare("SELECT expires_at FROM share_view_dedup WHERE link_id=? AND visitor_hash=?").get(row.id, visitorHash) as any;
+  const dedupe = (await db.prepare("SELECT expires_at FROM share_view_dedup WHERE link_id=? AND visitor_hash=?").get(row.id, visitorHash)) as any;
   const counted = !dedupe || Date.parse(String(dedupe.expires_at || "")) <= Date.now();
-  db.transaction(() => {
+  (await db.transaction(async () => {
     if (counted) {
-      db.prepare("UPDATE share_links SET views=views+1,last_view_at=?,updated_at=? WHERE id=?").run(now, now, row.id);
-      db.prepare(`INSERT INTO share_view_dedup(link_id,visitor_hash,expires_at) VALUES(?,?,?)
-        ON CONFLICT(link_id,visitor_hash) DO UPDATE SET expires_at=excluded.expires_at`).run(row.id, visitorHash, new Date(Date.now() + 10 * 60_000).toISOString());
-    } else db.prepare("UPDATE share_links SET last_view_at=?,updated_at=? WHERE id=?").run(now, now, row.id);
-  })();
+      (await db.prepare("UPDATE share_links SET views=views+1,last_view_at=?,updated_at=? WHERE id=?").run(now, now, row.id));
+      (await db.prepare(`INSERT INTO share_view_dedup(link_id,visitor_hash,expires_at) VALUES(?,?,?)
+        ON CONFLICT(link_id,visitor_hash) DO UPDATE SET expires_at=excluded.expires_at`).run(row.id, visitorHash, new Date(Date.now() + 10 * 60_000).toISOString()));
+    } else (await db.prepare("UPDATE share_links SET last_view_at=?,updated_at=? WHERE id=?").run(now, now, row.id));
+  })());
   const filters = shareFilters(JSON.parse(String(row.filters_json || "{}")));
-  const rows = db.prepare(`SELECT a.plan,a.billing_channel,a.deactivation_locked,a.mark_color,b.email_enc,b.provider
+  const rows = (await db.prepare(`SELECT a.plan,a.billing_channel,a.deactivation_locked,a.mark_color,b.email_enc,b.provider
     FROM gpt_accounts a JOIN email_bindings b ON b.account_id=a.id AND b.is_current=1
     WHERE a.deleted_at='' AND a.lifecycle_status!='retired'
       AND (?='all' OR (?='sold' AND a.sold=1) OR (?='unsold' AND a.sold=0))
       AND (?='' OR a.billing_channel=?) AND (?=0 OR a.plan='plus')
-    ORDER BY a.arrived_at DESC,a.id DESC`).all(filters.sold, filters.sold, filters.sold, filters.channel, filters.channel, filters.plusOnly ? 1 : 0) as any[];
-  const current = db.prepare("SELECT * FROM share_links WHERE id=?").get(row.id) as any;
+    ORDER BY a.arrived_at DESC,a.id DESC`).all(filters.sold, filters.sold, filters.sold, filters.channel, filters.channel, filters.plusOnly ? 1 : 0)) as any[];
+  const current = (await db.prepare("SELECT * FROM share_links WHERE id=?").get(row.id)) as any;
   return {
     ok: true, label: row.label || "账号概览", generatedAt: now, expiresAt: row.expires_at,
     maxViews: Number(row.max_views), remainingViews: Math.max(0, Number(row.max_views) - Number(current.views)), count: rows.length,
@@ -868,11 +869,11 @@ export function readShareSnapshot(token: string, visitor: string): Record<string
   };
 }
 
-export function changeCustomerPassword(grantId: string, password: unknown): void {
+export async function changeCustomerPassword(grantId: string, password: unknown): Promise<void> {
   const value = String(password || "");
   if (value.length < 6 || value.length > 256) throw new Error("新密码长度应为 6 到 256 个字符");
   const now = new Date().toISOString();
-  const result = db.prepare(`UPDATE access_grants SET password_hash=?,password_plain_enc=?,updated_at=?
-    WHERE id=? AND active=1 AND scope!='admin_only'`).run(hashPassword(value), encryptSecret(value), now, grantId);
+  const result = (await db.prepare(`UPDATE access_grants SET password_hash=?,password_plain_enc=?,updated_at=?
+    WHERE id=? AND active=1 AND scope!='admin_only'`).run(hashPassword(value), encryptSecret(value), now, grantId));
   if (!result.changes) throw new Error("当前授权已失效");
 }

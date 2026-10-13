@@ -9,7 +9,7 @@ test("批次级收件覆盖基础地址、三个别名、隔离、幂等和手�
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "mailbox-batch-regression-"));
   const databasePath = path.join(directory, "scenario.sqlite");
   try {
-    const run = spawnSync(path.resolve("node_modules/.bin/tsx"), ["scripts/validate-mailbox-batch-copy.ts"], {
+    const run = spawnSync(process.execPath, ["--import", "tsx", "scripts/validate-mailbox-batch-copy.ts"], {
       cwd: path.resolve("."), encoding: "utf8",
       env: { ...process.env, BATCH_VALIDATION_DATABASE_PATH: databasePath, ENV_FILE: "/dev/null" },
     });

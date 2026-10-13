@@ -3,10 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import Database from "better-sqlite3";
+import { SqliteTestDatabase as Database } from "../src/server/storage/sqlite-test.js";
 import test from "node:test";
 
-test("production staging preserves V2 identities, imports snapshots and removes content from SQLite free pages", () => {
+test("production staging preserves V2 identities, imports snapshots and removes content from SQLite free pages", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "v2-stage-production-"));
   const snapshot = path.join(directory, "snapshot");
   const source = path.join(directory, "source.sqlite");
@@ -53,9 +53,9 @@ test("production staging preserves V2 identities, imports snapshots and removes 
     assert.equal(fs.readFileSync(path.join(snapshot, "access-config.json"), "utf8"), snapshotText);
     assert.equal(fs.existsSync(path.join(directory, "must-not-open.sqlite")), false);
     const db = new Database(target, { readonly: true });
-    assert.ok(db.prepare("SELECT id FROM gpt_accounts WHERE id='existing-v2-account'").get());
-    assert.equal((db.prepare("SELECT metadata_json FROM mail_messages WHERE id='old-mail'").get() as any).metadata_json, '{"source":"v1-mail-index"}');
-    db.close();
+    assert.ok((await db.prepare("SELECT id FROM gpt_accounts WHERE id='existing-v2-account'").get()));
+    assert.equal(((await db.prepare("SELECT metadata_json FROM mail_messages WHERE id='old-mail'").get()) as any).metadata_json, '{"source":"v1-mail-index"}');
+    (await db.close());
     const beforeRepeat = fs.readFileSync(target);
     assert.notEqual(invoke(target).status, 0);
     assert.deepEqual(fs.readFileSync(target), beforeRepeat);

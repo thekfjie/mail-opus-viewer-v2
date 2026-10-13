@@ -105,39 +105,39 @@ test("promotion parser classifies upstream and credential failures", () => {
   assert.equal(parsePromotionResponse({ ok: false, status: 403, error: "edge/CF blocked HTML" }, "TARGET").resultStatus, "unknown_retryable");
 });
 
-test("automatic promotion scheduling excludes invalid and conflicting credential versions", () => {
+test("automatic promotion scheduling excludes invalid and conflicting credential versions", async () => {
   const now = new Date("2026-09-02T12:00:00.000Z");
   const firstSeen = new Date(now.getTime() - 13 * 60 * 60_000).toISOString();
-  db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, arrived_at, created_at, updated_at)
-    VALUES('invalid-schedule-account', 'active', ?, ?, ?)`).run(firstSeen, firstSeen, firstSeen);
-  db.prepare(`INSERT INTO credential_versions(
+  (await db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, arrived_at, created_at, updated_at)
+    VALUES('invalid-schedule-account', 'active', ?, ?, ?)`).run(firstSeen, firstSeen, firstSeen));
+  (await db.prepare(`INSERT INTO credential_versions(
     id, account_id, access_token_enc, token_fingerprint, first_seen_at, last_seen_at,
     validity_status, source, created_at, updated_at
   ) VALUES('invalid-schedule-version', 'invalid-schedule-account', ?, 'fingerprint', ?, ?, 'invalid', 'test', ?, ?)`).run(
     encryptSecret("fixture-access-token"), firstSeen, firstSeen, firstSeen, firstSeen,
-  );
-  db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
-    VALUES('invalid-schedule-account', 'invalid-schedule-version', ?, 'test')`).run(firstSeen);
-  assert.deepEqual(scheduleDuePromotionChecks(now), { queued: 0 });
-  db.prepare("UPDATE credential_versions SET validity_status='alive' WHERE id='invalid-schedule-version'").run();
-  assert.deepEqual(scheduleDuePromotionChecks(now), { queued: 1 });
+  ));
+  (await db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
+    VALUES('invalid-schedule-account', 'invalid-schedule-version', ?, 'test')`).run(firstSeen));
+  assert.deepEqual((await scheduleDuePromotionChecks(now)), { queued: 0 });
+  (await db.prepare("UPDATE credential_versions SET validity_status='alive' WHERE id='invalid-schedule-version'").run());
+  assert.deepEqual((await scheduleDuePromotionChecks(now)), { queued: 1 });
 
-  const job = db.prepare("SELECT id FROM promotion_jobs WHERE account_id='invalid-schedule-account'").get() as any;
-  db.prepare("UPDATE promotion_jobs SET status='completed' WHERE id=?").run(job.id);
-  db.prepare(`INSERT INTO promotion_observations(
+  const job = (await db.prepare("SELECT id FROM promotion_jobs WHERE account_id='invalid-schedule-account'").get()) as any;
+  (await db.prepare("UPDATE promotion_jobs SET status='completed' WHERE id=?").run(job.id));
+  (await db.prepare(`INSERT INTO promotion_observations(
     id, job_id, account_id, credential_version_id, campaign, eligible, result_status,
     upstream_status, evidence_json, response_hash, checked_at, expires_at, created_at
   ) VALUES('one-shot-observation', ?, 'invalid-schedule-account', 'invalid-schedule-version',
     'eligible-promo-catalog', 0, 'ineligible', 200, '{"campaigns":[]}', 'hash', ?, '', ?)`)
-    .run(job.id, now.toISOString(), now.toISOString());
-  assert.deepEqual(scheduleDuePromotionChecks(new Date(now.getTime() + 30 * 24 * 60 * 60_000)), { queued: 0 });
+    .run(job.id, now.toISOString(), now.toISOString()));
+  assert.deepEqual((await scheduleDuePromotionChecks(new Date(now.getTime() + 30 * 24 * 60 * 60_000))), { queued: 0 });
 
-  const manual = queuePromotionChecks(["invalid-schedule-account"]);
+  const manual = (await queuePromotionChecks(["invalid-schedule-account"]));
   assert.equal(manual.queued, 1);
   assert.equal(manual.failed, 0);
 });
 
-test("第三方注册与 active 一样允许优惠检测，Plus 和真实停用仍被拦截", () => {
+test("第三方注册与 active 一样允许优惠检测，Plus 和真实停用仍被拦截", async () => {
   const now = new Date("2026-09-04T00:00:00.000Z");
   const firstSeen = new Date(now.getTime() - 13 * 60 * 60_000).toISOString();
   for (const [id, plan, lifecycle, locked] of [
@@ -146,63 +146,63 @@ test("第三方注册与 active 一样允许优惠检测，Plus 和真实停用�
     ["promo-third-party-manual", "free", "third_party_registered", 0],
     ["promo-third-party-auto", "free", "third_party_registered", 0],
   ] as const) {
-    db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, deactivation_locked, plan, arrived_at, created_at, updated_at)
-      VALUES(?, ?, ?, ?, ?, ?, ?)`).run(id, lifecycle, locked, plan, firstSeen, firstSeen, firstSeen);
-    db.prepare(`INSERT INTO credential_versions(id, account_id, access_token_enc, token_fingerprint, first_seen_at,
+    (await db.prepare(`INSERT INTO gpt_accounts(id, lifecycle_status, deactivation_locked, plan, arrived_at, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?)`).run(id, lifecycle, locked, plan, firstSeen, firstSeen, firstSeen));
+    (await db.prepare(`INSERT INTO credential_versions(id, account_id, access_token_enc, token_fingerprint, first_seen_at,
       last_seen_at, validity_status, source, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, 'alive', 'test', ?, ?)`)
-      .run(`${id}-version`, id, encryptSecret("fixture-access-token"), `${id}-fingerprint`, firstSeen, firstSeen, firstSeen, firstSeen);
-    db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
-      VALUES(?, ?, ?, 'test')`).run(id, `${id}-version`, firstSeen);
+      .run(`${id}-version`, id, encryptSecret("fixture-access-token"), `${id}-fingerprint`, firstSeen, firstSeen, firstSeen, firstSeen));
+    (await db.prepare(`INSERT INTO account_current_credentials(account_id, credential_version_id, selected_at, selection_reason)
+      VALUES(?, ?, ?, 'test')`).run(id, `${id}-version`, firstSeen));
   }
   assert.equal(promotionLifecycleEligible("active"), true);
   assert.equal(promotionLifecycleEligible("third_party_registered"), true);
   assert.equal(promotionLifecycleEligible("third_party_pending_recovery"), false);
   assert.equal(promotionLifecycleEligible("deactivated"), false);
 
-  const manual = queuePromotionChecks(["promo-plus-account", "promo-deactivated-account", "promo-third-party-manual"]);
+  const manual = (await queuePromotionChecks(["promo-plus-account", "promo-deactivated-account", "promo-third-party-manual"]));
   assert.equal(manual.queued, 1);
   assert.equal(manual.skipped, 2);
   assert.equal(manual.failed, 0);
-  db.prepare("UPDATE credential_versions SET first_seen_at=? WHERE account_id='promo-third-party-manual'").run(now.toISOString());
-  assert.deepEqual(scheduleDuePromotionChecks(now), { queued: 1 });
-  assert.equal((db.prepare("SELECT status FROM promotion_jobs WHERE account_id='promo-third-party-auto'").get() as any).status, "queued");
-  assert.equal(db.prepare("SELECT 1 FROM promotion_jobs WHERE account_id='promo-deactivated-account'").get(), undefined);
+  (await db.prepare("UPDATE credential_versions SET first_seen_at=? WHERE account_id='promo-third-party-manual'").run(now.toISOString()));
+  assert.deepEqual((await scheduleDuePromotionChecks(now)), { queued: 1 });
+  assert.equal(((await db.prepare("SELECT status FROM promotion_jobs WHERE account_id='promo-third-party-auto'").get()) as any).status, "queued");
+  assert.equal((await db.prepare("SELECT 1 FROM promotion_jobs WHERE account_id='promo-deactivated-account'").get()), undefined);
 });
 
 test("后台队列清理保留第三方注册任务，只取消真实停用任务", async () => {
   const now = "2026-09-04T01:00:00.000Z";
   const insert = db.prepare(`INSERT INTO promotion_jobs(id, account_id, campaign, region, check_kind, due_at, status, created_at, updated_at)
     VALUES(?, ?, 'eligible-promo-catalog', 'JP', 'manual', ?, 'queued', ?, ?)`);
-  insert.run("third-party-cleanup-job", "promo-third-party-manual", now, now, now);
-  insert.run("deactivated-cleanup-job", "promo-deactivated-account", now, now, now);
+  (await insert.run("third-party-cleanup-job", "promo-third-party-manual", now, now, now));
+  (await insert.run("deactivated-cleanup-job", "promo-deactivated-account", now, now, now));
   await runPromotionQueue(0);
-  assert.equal((db.prepare("SELECT status FROM promotion_jobs WHERE id='third-party-cleanup-job'").get() as any).status, "queued");
-  const cancelled = db.prepare("SELECT status,error_class FROM promotion_jobs WHERE id='deactivated-cleanup-job'").get() as any;
+  assert.equal(((await db.prepare("SELECT status FROM promotion_jobs WHERE id='third-party-cleanup-job'").get()) as any).status, "queued");
+  const cancelled = (await db.prepare("SELECT status,error_class FROM promotion_jobs WHERE id='deactivated-cleanup-job'").get()) as any;
   assert.deepEqual(cancelled, { status: "cancelled", error_class: "account_not_eligible" });
 });
 
-test("已保存但被 OpenAI 撤销的 AT 明确显示失效且仍保留原文", () => {
-  repository.importAccounts([{ email: "stored-invalid-at@ai-mail.tech", arrivedAt: "2026-09-04T01:00:00.000Z", plan: "free" }]);
-  const account = repository.listAccounts({ search: "stored-invalid-at@ai-mail.tech", limit: 10 }).results[0];
-  const observed = observeCredentialVersion({
+test("已保存但被 OpenAI 撤销的 AT 明确显示失效且仍保留原文", async () => {
+  (await repository.importAccounts([{ email: "stored-invalid-at@ai-mail.tech", arrivedAt: "2026-09-04T01:00:00.000Z", plan: "free" }]));
+  const account = (await repository.listAccounts({ search: "stored-invalid-at@ai-mail.tech", limit: 10 })).results[0];
+  const observed = (await observeCredentialVersion({
     accountId: account.id,
     accessToken: "fixture-stored-invalid-access-token",
     source: "legacy-v1",
     observedAt: "2026-09-04T01:01:00.000Z",
     validityStatus: "alive",
-  });
-  invalidateCredentialVersion(observed.credentialVersionId, "2026-09-04T01:02:00.000Z");
-  const result = repository.listAccounts({ search: "stored-invalid-at@ai-mail.tech", limit: 10 }).results[0];
+  }));
+  (await invalidateCredentialVersion(observed.credentialVersionId, "2026-09-04T01:02:00.000Z"));
+  const result = (await repository.listAccounts({ search: "stored-invalid-at@ai-mail.tech", limit: 10 })).results[0];
   assert.equal(result.hasAccessToken, false);
   assert.equal(result.hasStoredAccessToken, true);
   assert.equal(result.credentialState, "invalid_at");
   assert.equal(result.credentialStateLabel, "AT 已保存但已失效");
-  assert.equal(repository.revealCredentials(account.id)?.accessToken, "fixture-stored-invalid-access-token");
+  assert.equal((await repository.revealCredentials(account.id))?.accessToken, "fixture-stored-invalid-access-token");
 });
 
-test("凭证失效检查不会覆盖上一次权威优惠结果", () => {
-  repository.importAccounts([{ email: "promo-then-revoked@ai-mail.tech", arrivedAt: "2026-09-04T02:00:00.000Z", plan: "free" }]);
-  const account = repository.listAccounts({ search: "promo-then-revoked@ai-mail.tech", limit: 10 }).results[0];
+test("凭证失效检查不会覆盖上一次权威优惠结果", async () => {
+  (await repository.importAccounts([{ email: "promo-then-revoked@ai-mail.tech", arrivedAt: "2026-09-04T02:00:00.000Z", plan: "free" }]));
+  const account = (await repository.listAccounts({ search: "promo-then-revoked@ai-mail.tech", limit: 10 })).results[0];
   const insertJob = db.prepare(`INSERT INTO promotion_jobs(id, account_id, campaign, region, check_kind, due_at, status, created_at, updated_at)
     VALUES(?, ?, 'eligible-promo-catalog', 'JP', 'manual', ?, ?, ?, ?)`);
   const insertObservation = db.prepare(`INSERT INTO promotion_observations(
@@ -211,23 +211,23 @@ test("凭证失效检查不会覆盖上一次权威优惠结果", () => {
   ) VALUES(?, ?, ?, 'eligible-promo-catalog', ?, ?, ?, ?, ?, ?, '', ?)`);
   const eligibleAt = "2026-09-04T02:01:00.000Z";
   const revokedAt = "2026-09-04T02:02:00.000Z";
-  insertJob.run("promo-before-revoked-job", account.id, eligibleAt, "completed", eligibleAt, eligibleAt);
-  insertObservation.run("promo-before-revoked-observation", "promo-before-revoked-job", account.id, 1, "eligible", 200,
-    JSON.stringify({ campaigns: [{ id: "plus-1-month-free" }] }), "eligible-hash", eligibleAt, eligibleAt);
-  insertJob.run("promo-revoked-job", account.id, revokedAt, "credential_invalid", revokedAt, revokedAt);
-  insertObservation.run("promo-revoked-observation", "promo-revoked-job", account.id, null, "credential_invalid", 401,
-    JSON.stringify({ detail: "token_revoked" }), "revoked-hash", revokedAt, revokedAt);
+  (await insertJob.run("promo-before-revoked-job", account.id, eligibleAt, "completed", eligibleAt, eligibleAt));
+  (await insertObservation.run("promo-before-revoked-observation", "promo-before-revoked-job", account.id, 1, "eligible", 200,
+    JSON.stringify({ campaigns: [{ id: "plus-1-month-free" }] }), "eligible-hash", eligibleAt, eligibleAt));
+  (await insertJob.run("promo-revoked-job", account.id, revokedAt, "credential_invalid", revokedAt, revokedAt));
+  (await insertObservation.run("promo-revoked-observation", "promo-revoked-job", account.id, null, "credential_invalid", 401,
+    JSON.stringify({ detail: "token_revoked" }), "revoked-hash", revokedAt, revokedAt));
 
-  const result = repository.listAccounts({ search: "promo-then-revoked@ai-mail.tech", limit: 10 }).results[0];
+  const result = (await repository.listAccounts({ search: "promo-then-revoked@ai-mail.tech", limit: 10 })).results[0];
   assert.equal(result.promoEligible, true);
   assert.equal(result.trialStatus, "eligible");
   assert.deepEqual(result.promoCampaigns, ["plus-1-month-free"]);
-  assert.equal(repository.getAccountDetail(account.id)?.promotion?.status, "eligible");
+  assert.equal((await repository.getAccountDetail(account.id))?.promotion?.status, "eligible");
 });
 
-test("latest ineligible result is globally marked suspicious when an older observation was eligible", () => {
-  repository.importAccounts([{ email: "promotion-history@ai-mail.tech", arrivedAt: "2026-09-03T01:00:00.000Z", plan: "free" }]);
-  const account = repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 }).results[0];
+test("latest ineligible result is globally marked suspicious when an older observation was eligible", async () => {
+  (await repository.importAccounts([{ email: "promotion-history@ai-mail.tech", arrivedAt: "2026-09-03T01:00:00.000Z", plan: "free" }]));
+  const account = (await repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 })).results[0];
   assert.ok(account);
   const insertJob = db.prepare(`INSERT INTO promotion_jobs(id, account_id, campaign, region, check_kind, due_at, status, created_at, updated_at)
     VALUES(?, ?, 'eligible-promo-catalog', 'JP', 'manual', ?, 'completed', ?, ?)`);
@@ -237,14 +237,14 @@ test("latest ineligible result is globally marked suspicious when an older obser
   ) VALUES(?, ?, ?, 'eligible-promo-catalog', ?, ?, 200, ?, ?, ?, '', ?)`);
   const oldAt = "2026-09-03T01:10:00.000Z";
   const newAt = "2026-09-03T01:20:00.000Z";
-  insertJob.run("history-eligible-job", account.id, oldAt, oldAt, oldAt);
-  insertObservation.run("history-eligible-observation", "history-eligible-job", account.id, 1, "eligible",
-    JSON.stringify({ campaigns: [{ id: "plus-1-month-free" }] }), "old-hash", oldAt, oldAt);
-  insertJob.run("history-ineligible-job", account.id, newAt, newAt, newAt);
-  insertObservation.run("history-ineligible-observation", "history-ineligible-job", account.id, 0, "ineligible",
-    JSON.stringify({ campaigns: [] }), "new-hash", newAt, newAt);
+  (await insertJob.run("history-eligible-job", account.id, oldAt, oldAt, oldAt));
+  (await insertObservation.run("history-eligible-observation", "history-eligible-job", account.id, 1, "eligible",
+    JSON.stringify({ campaigns: [{ id: "plus-1-month-free" }] }), "old-hash", oldAt, oldAt));
+  (await insertJob.run("history-ineligible-job", account.id, newAt, newAt, newAt));
+  (await insertObservation.run("history-ineligible-observation", "history-ineligible-job", account.id, 0, "ineligible",
+    JSON.stringify({ campaigns: [] }), "new-hash", newAt, newAt));
 
-  const result = repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 }).results[0];
+  const result = (await repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 })).results[0];
   assert.equal(result.promoEligible, false);
   assert.equal(result.promoSuspicious, true);
   assert.deepEqual(result.historicalPromoCampaigns, ["plus-1-month-free"]);
@@ -252,16 +252,16 @@ test("latest ineligible result is globally marked suspicious when an older obser
 });
 
 
-test("manual suspicion annotates an authoritative no-promo result without rewriting observations", () => {
-  const existing = repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 }).results[0];
+test("manual suspicion annotates an authoritative no-promo result without rewriting observations", async () => {
+  const existing = (await repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 })).results[0];
   assert.ok(existing);
-  repository.setPromotionSuspicion(existing.id, true);
-  const marked = repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 }).results[0];
+  (await repository.setPromotionSuspicion(existing.id, true));
+  const marked = (await repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 })).results[0];
   assert.equal(marked.promoEligible, false);
   assert.equal(marked.promoSuspicious, true);
   assert.equal(marked.promoSuspiciousOverride, true);
-  repository.setPromotionSuspicion(existing.id, false);
-  const cleared = repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 }).results[0];
+  (await repository.setPromotionSuspicion(existing.id, false));
+  const cleared = (await repository.listAccounts({ search: "promotion-history@ai-mail.tech", limit: 10 })).results[0];
   assert.equal(cleared.promoSuspiciousOverride, false);
   assert.equal(cleared.promoSuspicious, true, "historical eligible evidence still keeps the automatic suspicion");
 });

@@ -1,3 +1,4 @@
+import { asyncMap } from './async-collections.js';
 import { config } from "./config.js";
 import { decryptSecret, encryptSecret } from "./crypto.js";
 import { db } from "./db.js";
@@ -55,23 +56,23 @@ function settingKey(key: CheckRouteKey): string {
   return `${SETTING_PREFIX}${key}`;
 }
 
-function savedProxy(key: CheckRouteKey): string {
-  const row = db.prepare("SELECT value FROM settings WHERE key=?").get(settingKey(key)) as { value?: string } | undefined;
+async function savedProxy(key: CheckRouteKey): Promise<string> {
+  const row = (await db.prepare("SELECT value FROM settings WHERE key=?").get(settingKey(key))) as { value?: string } | undefined;
   if (!row?.value) return "";
   try { return decryptSecret(String(row.value)); } catch { return ""; }
 }
 
-function savedSecret(key: string): string {
-  const row = db.prepare("SELECT value FROM settings WHERE key=?").get(key) as { value?: string } | undefined;
+async function savedSecret(key: string): Promise<string> {
+  const row = (await db.prepare("SELECT value FROM settings WHERE key=?").get(key)) as { value?: string } | undefined;
   if (!row?.value) return "";
   try { return decryptSecret(String(row.value)); } catch { return ""; }
 }
 
-function saveSecret(key: string, value: string): void {
+async function saveSecret(key: string, value: string): Promise<void> {
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+  (await db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
-    .run(key, encryptSecret(value), now);
+    .run(key, encryptSecret(value), now));
 }
 
 function validateEligibilityEndpoint(value: unknown): string {
@@ -86,17 +87,17 @@ function validateEligibilityEndpoint(value: unknown): string {
   return parsed.toString();
 }
 
-export function effectivePaymentEligibilityApi(): { endpoint: string; apiToken: string } {
+export async function effectivePaymentEligibilityApi(): Promise<{ endpoint: string; apiToken: string }> {
   return {
-    endpoint: savedSecret(ELIGIBILITY_ENDPOINT_SETTING) || config.paymentEligibilityApiUrl,
-    apiToken: savedSecret(ELIGIBILITY_TOKEN_SETTING) || config.paymentEligibilityApiToken,
+    endpoint: (await savedSecret(ELIGIBILITY_ENDPOINT_SETTING)) || config.paymentEligibilityApiUrl,
+    apiToken: (await savedSecret(ELIGIBILITY_TOKEN_SETTING)) || config.paymentEligibilityApiToken,
   };
 }
 
-export function paymentEligibilityApiSummary(): PaymentEligibilityApiSummary {
-  const savedEndpoint = savedSecret(ELIGIBILITY_ENDPOINT_SETTING);
+export async function paymentEligibilityApiSummary(): Promise<PaymentEligibilityApiSummary> {
+  const savedEndpoint = (await savedSecret(ELIGIBILITY_ENDPOINT_SETTING));
   const endpoint = savedEndpoint || config.paymentEligibilityApiUrl;
-  const savedToken = savedSecret(ELIGIBILITY_TOKEN_SETTING);
+  const savedToken = (await savedSecret(ELIGIBILITY_TOKEN_SETTING));
   return {
     configured: Boolean(endpoint),
     source: savedEndpoint ? "saved" : process.env.PAYMENT_ELIGIBILITY_API_URL ? "environment" : endpoint ? "default" : "none",
@@ -105,24 +106,24 @@ export function paymentEligibilityApiSummary(): PaymentEligibilityApiSummary {
   };
 }
 
-export function savePaymentEligibilityApi(endpointValue: unknown, apiTokenValue: unknown, updateToken: boolean): PaymentEligibilityApiSummary {
+export async function savePaymentEligibilityApi(endpointValue: unknown, apiTokenValue: unknown, updateToken: boolean): Promise<PaymentEligibilityApiSummary> {
   const endpoint = validateEligibilityEndpoint(endpointValue);
-  saveSecret(ELIGIBILITY_ENDPOINT_SETTING, endpoint);
+  (await saveSecret(ELIGIBILITY_ENDPOINT_SETTING, endpoint));
   if (updateToken) {
     const token = String(apiTokenValue || "").trim();
-    if (token) saveSecret(ELIGIBILITY_TOKEN_SETTING, token);
-    else db.prepare("DELETE FROM settings WHERE key=?").run(ELIGIBILITY_TOKEN_SETTING);
+    if (token) (await saveSecret(ELIGIBILITY_TOKEN_SETTING, token));
+    else (await db.prepare("DELETE FROM settings WHERE key=?").run(ELIGIBILITY_TOKEN_SETTING));
   }
-  return paymentEligibilityApiSummary();
+  return (await paymentEligibilityApiSummary());
 }
 
-export function clearPaymentEligibilityApi(): PaymentEligibilityApiSummary {
-  db.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(ELIGIBILITY_ENDPOINT_SETTING, ELIGIBILITY_TOKEN_SETTING);
-  return paymentEligibilityApiSummary();
+export async function clearPaymentEligibilityApi(): Promise<PaymentEligibilityApiSummary> {
+  (await db.prepare("DELETE FROM settings WHERE key IN (?, ?)").run(ELIGIBILITY_ENDPOINT_SETTING, ELIGIBILITY_TOKEN_SETTING));
+  return (await paymentEligibilityApiSummary());
 }
 
-export function effectiveCheckProxy(key: CheckRouteKey): string {
-  return savedProxy(key) || String(definitions[key].environmentValue() || "").trim();
+export async function effectiveCheckProxy(key: CheckRouteKey): Promise<string> {
+  return (await savedProxy(key)) || String(definitions[key].environmentValue() || "").trim();
 }
 
 function validateProxy(value: unknown): string {
@@ -141,8 +142,8 @@ function displayProxy(proxy: string): string {
   return proxy;
 }
 
-export function checkRouteSummary(key: CheckRouteKey): CheckRouteSummary {
-  const saved = savedProxy(key);
+export async function checkRouteSummary(key: CheckRouteKey): Promise<CheckRouteSummary> {
+  const saved = (await savedProxy(key));
   const environment = String(definitions[key].environmentValue() || "").trim();
   const proxy = saved || environment;
   return {
@@ -155,20 +156,20 @@ export function checkRouteSummary(key: CheckRouteKey): CheckRouteSummary {
   };
 }
 
-export function listCheckRouteSummaries(): CheckRouteSummary[] {
-  return (Object.keys(definitions) as CheckRouteKey[]).map(checkRouteSummary);
+export async function listCheckRouteSummaries(): Promise<CheckRouteSummary[]> {
+  return (await asyncMap((Object.keys(definitions) as CheckRouteKey[]), checkRouteSummary));
 }
 
-export function saveCheckRouteProxy(key: CheckRouteKey, value: unknown): CheckRouteSummary {
+export async function saveCheckRouteProxy(key: CheckRouteKey, value: unknown): Promise<CheckRouteSummary> {
   const proxy = validateProxy(value);
   const now = new Date().toISOString();
-  db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+  (await db.prepare(`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
-    .run(settingKey(key), encryptSecret(proxy), now);
-  return checkRouteSummary(key);
+    .run(settingKey(key), encryptSecret(proxy), now));
+  return (await checkRouteSummary(key));
 }
 
-export function clearCheckRouteProxy(key: CheckRouteKey): CheckRouteSummary {
-  db.prepare("DELETE FROM settings WHERE key=?").run(settingKey(key));
-  return checkRouteSummary(key);
+export async function clearCheckRouteProxy(key: CheckRouteKey): Promise<CheckRouteSummary> {
+  (await db.prepare("DELETE FROM settings WHERE key=?").run(settingKey(key)));
+  return (await checkRouteSummary(key));
 }
