@@ -909,7 +909,7 @@ function PaymentExposureSection({
     </section>
     {!billingKnown && <section className="payment-method-panel">
     <div className="payment-exposure-heading payment-method-heading"><div><h3>支付资格检测</h3><small>可选择无优惠或带 1 month 优惠创建一次只读 Checkout，读取支付 method 后立即停止；不创建 PaymentMethod，不 confirm 或 approve</small></div><span>{eligibilityChecks.length ? `最近 ${eligibilityChecks.length} 项` : "暂无结果"}</span></div>
-    <div className="promotion-route-row"><span><Badge tone={localExtractorReady ? "green" : "red"}>LOCAL</Badge><strong>本机支付方式提炼</strong><small className={localExtractorReady ? "route-ready" : "route-missing"}>{localExtractorReady ? "已接入全部支付方式 · 代理跟随提炼侧配置" : "本机提炼服务未就绪"}</small></span></div>
+    <div className="promotion-route-row"><span><Badge tone={localExtractorReady ? "green" : "red"}>LOCAL</Badge><strong>本机支付方式提炼</strong><small className={localExtractorReady ? "route-ready" : "route-missing"}>{localExtractorReady ? "已配置服务地址 · 代理跟随提炼侧配置" : "本机提炼服务未配置"}</small></span></div>
     <div className="payment-exposure-controls">
       <select aria-label="选择支付资格项目" value={selectedRoute} onChange={(event) => setSelectedRoute(event.target.value)} disabled={starting || jobRunning || !routes.length}>
         {!routes.length && <option value="">正在读取资格项目…</option>}
@@ -921,7 +921,7 @@ function PaymentExposureSection({
         <option value="one_month">带 1 month 优惠</option>
       </select>
       <button className="primary" disabled={!selected?.configured || starting || jobRunning} onClick={() => void start()}>{starting ? "请求中…" : jobRunning ? "检测进行中…" : "检测所选资格"}</button>
-      {selected && <span className={selected.configured ? "route-ready" : "route-missing"}>{selected.configured ? `本机提炼已就绪 · ${paymentPromoMode === "one_month" ? "带 1 month 优惠" : "无优惠"} · 只保存 ${selected.target} 的观察结果 · 代理跟随提炼侧配置` : "请先配置对应检查服务"}</span>}
+      {selected && <span className={selected.configured ? "route-ready" : "route-missing"}>{selected.configured ? `已配置本机服务 · ${paymentPromoMode === "one_month" ? "带 1 month 优惠" : "无优惠"} · 只保存 ${selected.target} 的观察结果 · 代理跟随提炼侧配置` : "请先配置对应检查服务"}</span>}
       {!selected && routes.length > 0 && <span className="route-missing">请选择一个要检测的支付资格</span>}
     </div>
     {job && <div className="payment-exposure-job"><div className="payment-exposure-job-heading"><span><Badge tone={exposureJobStatusTone(job.status)}>{exposureJobStatusLabel(job.status)}</Badge><span>{job.route.label}</span></span><small>{job.jobId}</small></div>{job.items.map((item) => <div className="payment-exposure-job-item" key={`${job.jobId}-${item.index}`}><span>本机支付方式探查</span><span>{item.stage === "payment_method_exposure" ? `${job.promoMode === "one_month" ? "1 month 优惠" : "无优惠"} method 观察` : item.stage || item.extractionStatus || "等待阶段"}</span><span>{item.finishedAt ? fmt(item.finishedAt) : "进行中"}</span></div>)}{job.pollError && <small className="route-missing">{job.pollError}</small>}{liveChecks.length > 0 && <div className="payment-exposure-live-methods">{liveChecks.map((check) => <span key={check.id}><Badge tone={paymentExposureTone(check.status, check.exposed)}>{paymentMethodLabel(check.target)} · {paymentExposureLabel(check.status, check.exposed)}</Badge></span>)}</div>}</div>}

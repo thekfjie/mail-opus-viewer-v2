@@ -8,7 +8,7 @@ if (process.env.OPUS_SQLITE_TEST === '1') throw new Error('Do not use the SQLite
 const tests = process.argv.slice(2);
 const files = tests.length ? tests : [
   'account-order', 'business-regressions', 'multigeneration-identity', 'rebind-order',
-  'mail-ingestion', 'mail-ingestion-reliability', 'mail-metadata-event', 'runtime-api',
+  'mail-ingestion', 'mail-ingestion-reliability', 'mail-metadata-event', 'mail-health', 'runtime-api',
   'compatibility-review', 'payment-eligibility-api', 'mail-security', 'plus-plan-state',
   'payment-exposure', 'payment-exposure-batch', 'recycle-eligibility', 'customer-ban-access',
   'pending-credential-visibility', 'third-party-file-import', 'sub2api-sync', 'auto-trial',

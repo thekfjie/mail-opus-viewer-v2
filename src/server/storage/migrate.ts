@@ -4,24 +4,26 @@ import { tables, foreignKeys } from './schema-v1.js';
 import { pathToFileURL } from 'node:url';
 
 export async function migrateMySql(database: MySqlDatabase): Promise<void> {
-  // A dedicated session owns the migration lock, independent of pool borrowing.
+  // The lock and every migration statement share one session. Borrowing from
+  // the pool again while holding this connection deadlocks a one-slot pool.
   const connection = await database.pool.getConnection();
   let locked = false;
   try {
     const [lock] = await connection.query<any[]>("SELECT GET_LOCK(CONCAT(DATABASE(), ':schema'),30) AS acquired");
     if (Number(lock[0].acquired) !== 1) throw new Error('Schema migration is already running');
     locked = true;
-    await database.exec('CREATE TABLE IF NOT EXISTS opus_schema_versions(version INT PRIMARY KEY, applied_at VARCHAR(40) NOT NULL) ENGINE=InnoDB');
-    const current = await database.prepare('SELECT MAX(version) AS version FROM opus_schema_versions').get();
+    await connection.query('CREATE TABLE IF NOT EXISTS opus_schema_versions(version INT PRIMARY KEY, applied_at VARCHAR(40) NOT NULL) ENGINE=InnoDB');
+    const [versions] = await connection.query<any[]>('SELECT MAX(version) AS version FROM opus_schema_versions');
+    const current = versions[0];
     if (Number(current?.version) > 1) throw new Error('Database schema is newer than this application');
     if (Number(current?.version) === 1) return;
-    for (const sql of tables) await database.exec(sql);
+    for (const sql of tables) await connection.query(sql);
     for (const fk of foreignKeys) {
-      const exists = await database.prepare('SELECT 1 FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=? AND constraint_name=?').get(fk.table, fk.name);
-      if (!exists) await database.exec(fk.sql);
+      const [existing] = await connection.execute<any[]>('SELECT 1 FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND table_name=? AND constraint_name=?', [fk.table, fk.name]);
+      if (!existing.length) await connection.query(fk.sql);
     }
-    await database.prepare('INSERT OR IGNORE INTO mail_read_control(id) VALUES(1)').run();
-    await database.prepare('INSERT INTO opus_schema_versions(version, applied_at) VALUES(1,?)').run(new Date().toISOString());
+    await connection.query('INSERT INTO mail_read_control(id) VALUES(1) ON DUPLICATE KEY UPDATE id=id');
+    await connection.execute('INSERT INTO opus_schema_versions(version, applied_at) VALUES(1,?)', [new Date().toISOString()]);
   } finally {
     if (locked) await connection.query("SELECT RELEASE_LOCK(CONCAT(DATABASE(), ':schema'))").catch(() => {});
     connection.release();

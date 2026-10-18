@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { databaseSnapshot } from "./helpers/database-snapshot.js";
 
 test("administrator mail health exposes local aggregates, exact rolling budgets and no secrets or upstream calls", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "v2-mail-health-"));
@@ -44,10 +45,10 @@ test("administrator mail health exposes local aggregates, exact rolling budgets 
     VALUES('orphan','test','sensitive-mail-id','OpenAI - Access Deactivated','deactivation','2026-09-08T07:00:00Z','2026-09-08T07:00:00Z')`).run());
   (await db.prepare(`INSERT INTO pending_reviews(id,review_type,candidate_email_hash,reason,evidence_json,created_at,updated_at)
     VALUES('orphan-review','mail_ownership_ambiguous','sensitive-hash','deactivation_owner_unresolved','{}','2026-09-08T07:00:00Z','2026-09-08T07:00:00Z')`).run());
-  const beforeHealth = db.serialize();
+  const beforeHealth = await databaseSnapshot(db);
   const snapshot = (await mailHealth(now));
   assert.deepEqual(snapshot.notices, { total: 1, unassigned: 1, pendingReviews: 1 });
-  assert.deepEqual(db.serialize(), beforeHealth, "health reads never repair, revoke or read upstream");
+  assert.equal(await databaseSnapshot(db), beforeHealth, "health reads never repair, revoke or read upstream");
   assert.deepEqual(snapshot.ingestion, { total: 4, processed: 1, pending: 2, failed: 1, retrying: 1 });
   assert.deepEqual(snapshot.d1.limits, MAIL_READ_LIMITS);
   assert.equal(snapshot.d1.minuteRequests, 1);
@@ -60,12 +61,15 @@ test("administrator mail health exposes local aggregates, exact rolling budgets 
   assert.equal(snapshot.webhook.lastProcessedAt, "2026-09-08T07:00:01.000Z");
   assert.equal(snapshot.webhook.configured, true);
   assert.equal(snapshot.d1.configured, true);
-  assert.equal(snapshot.background.redisConnected, false);
+  assert.deepEqual(snapshot.background, {
+    mailLeases: db.dialect, workerMutex: "in-process", rateLimiter: db.dialect === "mysql" ? "redis" : "memory-test",
+  });
   const response = await app.inject({ url: endpoint, headers });
   assert.equal(response.statusCode, 200);
   assert.equal(response.headers["cache-control"], "no-store");
   assert.deepEqual(response.json().storage, { mode: "lightweight-index", bodyRead: "upstream-by-id" });
   assert.doesNotMatch(response.body, /sensitive-|fake-health-|provider_message_id|blocked_reason|raw MIME|parsedHtml|Bearer/);
+  assert.doesNotMatch(response.body, /learningDocument|redis-learning/);
   assert.equal(((await db.prepare("SELECT COUNT(*) n FROM mail_read_requests").get()) as any).n, 4);
   const saved = { hook: config.mailWebhookSecret, token: config.cfD1ReadToken, index: config.cfD1TimeIndex };
   config.mailWebhookSecret = ""; config.cfD1ReadToken = ""; config.cfD1TimeIndex = "";

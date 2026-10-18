@@ -52,6 +52,6 @@ export async function mailHealth(now = Date.now()): Promise<MailHealth> {
       limits: { ...MAIL_READ_LIMITS },
     },
     storage: { mode: "lightweight-index", bodyRead: "upstream-by-id" },
-    background: { mailLeases: "sqlite", workerMutex: "in-process", redisConnected: false, learningDocument: "docs/redis-learning.md" },
+    background: { mailLeases: db.dialect, workerMutex: "in-process", rateLimiter: db.dialect === "mysql" ? "redis" : "memory-test" },
   };
 }

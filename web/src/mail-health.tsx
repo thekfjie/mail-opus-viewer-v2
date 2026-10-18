@@ -47,11 +47,11 @@ export function MailHealthPanel({ data }: { data: MailHealth | null }) {
         <div><dt>补漏冷却</dt><dd>{limits.backfillCooldownMs / 60_000} 分钟{data.d1.backfillAvailableAt && <small>下次可用 {time(data.d1.backfillAvailableAt)}</small>}</dd></div>
         <div><dt>本地邮件数据</dt><dd>轻量索引与必要业务结果</dd></div>
       </dl><p className="muted">不持久化 raw MIME、正文、HTML 或附件；不轮询上游邮件列表，不缓存邮件正文。</p></article>
-      <article><h3>后台互斥与学习入口</h3><dl>
-        <div><dt>邮件处理租约</dt><dd>SQLite 持久租约</dd></div>
+      <article><h3>后台任务与限流</h3><dl>
+        <div><dt>邮件处理租约</dt><dd>{data.background.mailLeases === "mysql" ? "MySQL" : "SQLite 测试库"} 持久租约</dd></div>
         <div><dt>后台任务互斥</dt><dd>进程内 TaskMutex</dd></div>
-        <div><dt>Redis</dt><dd>尚未接入，留作后续学习</dd></div>
-      </dl><details><summary>查看 Redis 学习路线</summary><p>从后台统计缓存、任务互斥、任务 ID 队列逐步练习。当前进程内互斥只保护同一实例；跨进程邮件处理由 SQLite 租约保障。</p><p>项目文档：<code>{data.background.learningDocument}</code></p><p>先运行离线并发测试，再替换 TaskMutex 实现。CF 预算、邮件归属和封禁结果继续由数据库保证。</p></details></article>
+        <div><dt>请求限流</dt><dd>{data.background.rateLimiter === "redis" ? "Redis 跨 API 实例共享" : "进程内计数（离线测试）"}</dd></div>
+      </dl><p className="muted">Worker 只运行一个实例。持久租约避免重复处理同一邮件，Redis 负责请求计数；组件可用性由就绪检查确认。</p></article>
     </div>
   </section>;
 }

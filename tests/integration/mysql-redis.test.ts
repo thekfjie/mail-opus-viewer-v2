@@ -28,6 +28,14 @@ test('MySQL migration, transactions, business API and Redis sharing', { timeout:
   const { importSqlite } = await import('../../src/server/storage/import-sqlite.js');
   const { encryptSecret } = await import('../../src/server/crypto.js');
   const ciphertext = encryptSecret('fake-import-secret');
+  await t.test('one-slot migration and concurrent deployers share the schema lock without exhausting the pool', { timeout: 15_000 }, async () => {
+    const single = new MySqlDatabase(url.href, 1);
+    try {
+      await Promise.all([migrateMySql(single), migrateMySql(database)]);
+      await migrateMySql(single);
+      assert.equal((await single.prepare('SELECT COUNT(*) n FROM opus_schema_versions WHERE version=1').get()).n, 1);
+    } finally { await single.close(); }
+  });
   await t.test('idempotent schema and verified import preserve encrypted data', async () => {
     await migrateMySql(database); await migrateMySql(database);
     const { openLegacySqlite } = await import('../../src/server/storage/legacy-sqlite-bootstrap.js');

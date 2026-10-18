@@ -71,8 +71,8 @@ try {
     assert.equal(fakeMailReads, viewport.width === 1440 ? 0 : 2);
     const healthOverflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1);
     assert.equal(healthOverflow, false, `mail health horizontal overflow at ${viewport.width}`);
-    await page.getByText("查看 Redis 学习路线", { exact: true }).click();
-    await page.getByText("docs/redis-learning.md", { exact: true }).waitFor();
+    await page.getByRole("heading", { name: "后台任务与限流", exact: true }).waitFor();
+    await page.getByText("进程内计数（离线测试）", { exact: true }).waitFor();
     const [refreshedHealth] = await Promise.all([
       page.waitForResponse((response: any) => new URL(response.url()).pathname === "/api/v2/admin/mail-health"
         && response.request().method() === "GET"),

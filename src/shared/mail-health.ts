@@ -23,5 +23,5 @@ export interface MailHealth {
     };
   };
   storage: { mode: "lightweight-index"; bodyRead: "upstream-by-id" };
-  background: { mailLeases: "sqlite"; workerMutex: "in-process"; redisConnected: false; learningDocument: "docs/redis-learning.md" };
+  background: { mailLeases: "mysql" | "sqlite"; workerMutex: "in-process"; rateLimiter: "redis" | "memory-test" };
 }
