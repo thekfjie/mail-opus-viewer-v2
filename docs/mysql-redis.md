@@ -117,10 +117,10 @@ REDIS_URL=redis://127.0.0.1:6379 npm run test:integration
 npm run build
 ```
 
-集成测试使用随机命名的独立库，不清空指定的默认库。覆盖重复迁移、503 行跨页导入、导入失败整批回滚、密文保留、嵌套事务、唯一键冲突、外键、管理员 API、限流共享/过期/故障、逻辑备份恢复，再运行现有 20 组业务契约。CI 另外构建 Docker 镜像。
+集成测试使用随机命名的独立库，不清空指定的默认库。覆盖单连接与并发迁移、重复迁移、503 行跨页导入、导入失败整批回滚、密文保留、嵌套事务、唯一键冲突、外键、管理员 API、限流共享/过期/故障、逻辑备份恢复，再运行现有 21 组业务契约。CI 另外构建 Docker 镜像。
 
-## 性能与简历证据
+## 性能验证
 
-见 [performance.md](performance.md)。简历可以描述“将同步 SQLite 存储迁移到异步 MySQL，落地跨实例 Redis 原子限流、可回滚导入、恢复演练和集成 CI”。真实用户数来自实际运营记录；并发、QPS、P95 必须附上机器、数据量、场景及错误率，不能把测试客户端数写成真实用户数。
+见 [performance.md](performance.md)，包含列表接口的测试方法、环境条件和原始报告。现有结果是本地合成数据基线；线上容量需在实际部署环境测量。
 
 参考：[MySQL mysqldump](https://dev.mysql.com/doc/refman/8.4/en/mysqldump.html)、[Redis INCR 原子限流](https://redis.io/docs/latest/commands/incr/)。

@@ -1,61 +1,55 @@
-# Opus Mail V2
+<div align="center">
+  <img src="docs/assets/opusmail.svg" width="80" height="80" alt="OpusMail" />
+  <h1>OpusMail V2</h1>
+  <p>账号有历史，凭证有版本，邮件有归属。</p>
+  <p>
+    <a href="https://github.com/thekfjie/mail-opus-viewer-v2/actions/workflows/ci.yml"><img src="https://github.com/thekfjie/mail-opus-viewer-v2/actions/workflows/ci.yml/badge.svg" alt="Verify" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
+    <img src="https://img.shields.io/badge/Node.js-%E2%89%A520.19-43853d" alt="Node.js ≥20.19" />
+  </p>
+  <p><a href="#快速开始">快速开始</a> · <a href="docs/architecture.md">架构</a> · <a href="docs/api.md">API</a> · <a href="docs/README.md">文档</a> · <a href="CONTRIBUTING.md">参与开发</a></p>
+</div>
 
-Opus Mail V2 是面向账号运营团队的管理后台，用于统一处理账号生命周期、邮箱绑定、凭证版本、邮件检索、资格检测和运营审计。项目将身份、邮箱与凭证分别建模，通过明确的状态转换和审计记录降低批量运营中的误关联风险。
+OpusMail 是一个可以自行部署的账号与邮箱管理后台。它把账号身份、邮箱绑定、凭证和客户授权分开记录，让换绑、凭证更新和邮件检索都有迹可查；日常查询和批量操作在同一个面板完成。
 
-## 核心能力
+本仓库维护公开 V2 主线，包含 React 管理后台、Fastify API、单实例 Worker，以及 MySQL + Redis 部署配置。截图使用本地生成的演示数据。
 
-### 账号与凭证管理
+![账号总览 · 深色主题](docs/assets/overview-dark.png)
 
-- 按账号状态、套餐、渠道、凭证状态、交付状态和自定义标记进行检索与批量操作。
-- 管理邮箱换绑、账号停用、账号回收、凭证更新及身份冲突审查。
-- 保存 OAuth 凭证版本，支持批量预览、确认写入、完整导出和健康检查。
-- 对重复身份、模糊归属和异常状态采用保守关联策略，并交由人工复核。
+## 可以做什么
 
-### 邮件与运营工具
+| 模块 | 主要能力 |
+| --- | --- |
+| 账号管理 | 搜索与筛选、批量操作、渠道与标记、生命周期记录 |
+| 身份与凭证 | 邮箱换绑历史、凭证版本链、身份冲突审查、管理员按需查看和复制 |
+| 邮件索引 | 接收上游邮件事件、关联账号与绑定区间、按需读取正文和验证码 |
+| 客户与分享 | 邮箱访问授权、撤销与过期、受访问次数约束的只读快照 |
+| 后台任务 | 优惠资格检查、可选 Outlook 与外部账号服务同步、任务状态和审计 |
+| 数据维护 | MySQL 迁移、旧 SQLite 校验导入、一致性备份与恢复验证 |
 
-- 从共享邮件服务和 Outlook 类服务同步邮件，提供管理员邮件列表、详情和验证码检索。
-- 管理 Outlook Free 账号池、账号导入、邮箱转移及 Session 数据导入。
-- 创建可撤销、可过期并带访问次数限制的只读分享快照。
-- 执行促销资格与支付方式资格检查，并记录结构化结果和任务状态。
-- 提供使用情况审计、事件时间线、迁移报告和生产状态检查。
+外部邮件、资格检查和代理服务需要自行接入，可选自动检查默认关闭。支付方式观察另依赖本机提炼服务，该服务不包含在仓库或 Compose 中；接入前需确认它的运行配置。
 
-### 集成与可靠性
-
-- 同步外部账号平台中的有效凭证和账号状态。
-- 通过受保护的 API 批量导入账号或接收检查结果。
-- 使用 MySQL 持久化业务数据，Redis 提供跨 API 实例的原子限流；包含事务迁移、备份恢复演练和集成 CI。
-- 支持只读模式、兼容权威模式与原生独立模式，便于渐进部署。
-
-## 产品边界
-
-本仓库交付管理员后台、管理 API、客户邮箱页面和后台 Worker。旧客户链接及兼容邮件 API 由 V2 本地实现，并继续在管理员鉴权、客户授权和公开读取之间保持严格边界。
-
-## 安全设计
-
-- 访问令牌、刷新令牌、ID Token、Session Token 和业务密码使用 AES-256-GCM 加密保存。
-- 管理接口要求已登录会话；写操作同时校验同源请求，并设置速率限制。
-- 管理员敏感信息读取接口返回 `Cache-Control: no-store`，公开快照不包含管理凭证和内部地址。
-- 健康检查、审计事件和应用日志仅记录状态或不可逆指纹，不记录完整凭证。
-- 生产环境支持写保护、发布清单校验、MySQL 就绪检查及一致性逻辑备份。
-
-## 技术栈
-
-- Node.js 20.19+
-- TypeScript、Fastify
-- React、Vite
-- MySQL 8.4 LTS、Redis 7.x、`mysql2`、`redis`
-- `better-sqlite3` 仅用于旧数据迁移和离线回归
-- Node.js Test Runner
+<table>
+  <tr>
+    <td width="72%"><img src="docs/assets/account-detail.png" alt="账号详情、绑定历史与凭证管理" /></td>
+    <td width="28%"><img src="docs/assets/overview-mobile.png" alt="移动端浅色主题" /></td>
+  </tr>
+  <tr><td align="center">账号详情与历史</td><td align="center">移动端</td></tr>
+</table>
 
 ## 快速开始
 
-首次部署和旧 SQLite 数据迁移请先读 [MySQL + Redis 运行手册](docs/mysql-redis.md)。旧数据不会在启动时自动搬迁。
+需要 Docker Engine 与 Compose。首次启动使用空库；已有 SQLite 数据请先读[迁移手册](docs/mysql-redis.md#已有-sqlite-数据迁移)。启动服务不会自动搬迁旧数据。
 
 ```bash
 git clone https://github.com/thekfjie/mail-opus-viewer-v2.git
 cd mail-opus-viewer-v2
 cp .env.example .env
-# 按运行手册填写独立密钥、管理员口令、数据库和 Redis 密码
+```
+
+在 `.env` 中分别设置 `MYSQL_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`REDIS_PASSWORD`、`V2_SESSION_SECRET`、`CREDENTIAL_ENCRYPTION_KEY`、`VIEWER_ADMIN_PASSWORD` 和 `PUBLIC_ORIGIN`。新环境可多次运行 `openssl rand -hex 24` 生成独立密钥；迁移旧环境时保留原有加密密钥。
+
+```bash
 docker compose build
 docker compose up -d mysql redis
 docker compose run --rm migrate
@@ -63,94 +57,80 @@ docker compose up -d api worker
 curl --fail http://127.0.0.1:8790/ready
 ```
 
-也支持 Node 原生部署：配置可访问的 MySQL/Redis，依次运行 `npm ci`、`npm run db:migrate`、`npm run build`、`npm start`，另启一个 `npm run worker`。生产环境不再支持 SQLite 存储。
+通过 HTTPS 反向代理访问 `/admin`。API 默认只绑定宿主机回环地址，MySQL 和 Redis 不公开端口。Worker 只运行一个实例。
 
-## 配置
+也可使用 Node.js 20.19+ 原生部署：准备 MySQL、Redis 和配置后，运行 `npm ci`、`npm run db:migrate`、`npm run build`、`npm start`，另启一个 `npm run worker`。详细步骤见[运行手册](docs/mysql-redis.md)。
 
-完整模板见 [`.env.example`](.env.example)。以下为主要配置项：
+## 后端怎么组织
 
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `PORT` | HTTP 监听端口 | `8790` |
-| `MYSQL_URL` | MySQL 连接地址 | 必填 |
-| `MYSQL_POOL_SIZE` | 每进程连接数 | `10` |
-| `REDIS_URL` | Redis 连接地址 | 必填 |
-| `REDIS_PREFIX` | 多 API 实例共享限流键前缀 | `opusmail:` |
-| `PUBLIC_ORIGIN` | 管理后台对外地址 | `https://mail.example.com` |
-| `V2_SESSION_SECRET` | 管理会话签名密钥 | 无 |
-| `CREDENTIAL_ENCRYPTION_KEY` | 敏感业务字段加密密钥 | 无 |
-| `VIEWER_ADMIN_PASSWORD` | 管理后台登录口令 | 无 |
-| `V2_READ_ONLY` | 是否锁定原生写操作 | `false` |
-| `V2_ACCOUNT_AUTHORITY` | 账号写入权威模式：`v1` 或 `v2` | `v2` |
-| `V2_SYNC_INTERVAL_MS` | 后台同步间隔，单位为毫秒 | `60000` |
-| `V2_SHARED_MAIL_SYNC_ENABLED` | 是否启用共享邮件同步 | `false` |
-| `V2_OUTLOOK_MAIL_SYNC_ENABLED` | 是否启用 Outlook 邮件同步 | `false` |
-| `V2_AUTO_TRIAL_ENABLED` | 是否启用自动促销资格检查 | `false` |
+账号身份是核心；邮箱绑定和凭证版本分别关联它，换邮箱不会凭空生成第二个身份。邮件只在本地保存索引与归属，正文从上游按需读取。
 
-外部服务按需配置：
+- **MySQL 8.4 LTS** 保存业务数据与持久任务状态，使用 InnoDB、外键和唯一约束。异步连接池、事务与嵌套保存点集中在存储层。
+- **Redis 7.x** 通过 Lua 原子计数与 TTL 提供跨 API 实例限流，不缓存邮件正文或账号凭证。
+- **API 与 Worker 分开运行**：API 处理交互与集成请求，Worker 执行同步、补漏与检测。API 可以多实例，Worker 尚未实现分布式任务租约。
+- **敏感字段加密保存**：管理员经过显式操作读取原文；客户和分享接口不返回管理凭证，敏感读取响应使用 `no-store`。
 
-| 变量 | 说明 |
-| --- | --- |
-| `MAIL_API_BASE`、`MAIL_ADMIN_AUTH` | 共享邮件服务地址及认证信息 |
-| `OUTLOOK_MANAGER_BASE`、`OUTLOOK_MANAGER_PASSWORD` | Outlook 类邮件管理服务配置 |
-| `SUB2API_API_URL`、`SUB2API_ADMIN_TOKEN` | 外部账号平台地址及访问令牌 |
-| `PAYMENT_ELIGIBILITY_API_URL`、`PAYMENT_ELIGIBILITY_API_TOKEN` | 支付资格检查接口及访问令牌 |
-| `PAYMENT_EXPOSURE_PROXY_*` | 按检查区域配置的服务端代理 |
-| `ROUTING_*` | 不参与账号关联的路由邮箱配置 |
-| `TRUSTED_REBIND_DOMAINS` | 允许自动识别换绑的可信域列表 |
+MySQL 是生产存储。SQLite 仅供旧快照导入和离线回归，真实数据库行为另有集成测试。表关系、事务边界与邮件事件流程见[架构说明](docs/architecture.md)。
 
-生产环境必须显式设置会话密钥、加密密钥和管理口令。不同用途的密钥不得复用，也不得提交 `.env`、数据库、备份文件或真实凭证。
+## 一些处理过的问题
 
-## 常用命令
+这些问题来自实际业务边界，也保留了对应回归测试：
 
-| 命令 | 说明 |
-| --- | --- |
-| `npm run dev` | 启动开发服务并监听源码变化 |
-| `npm test` | 运行离线业务回归套件 |
-| `npm run test:integration` | 真实 MySQL/Redis 集成测试及业务契约 |
-| `npm run db:migrate` | 创建/升级 MySQL 表结构 |
-| `npm run db:import-sqlite` | 校验并导入旧 SQLite v29 快照 |
-| `npm run benchmark` | 已鉴权账号列表压测，记录 QPS/P95/错误率 |
-| `npm run build` | 构建服务端和前端产物 |
-| `npm start` | 启动已构建的 API 与 Web 服务 |
-| `npm run worker` | 启动邮件同步和后台任务 Worker |
-| `npm run backup` | 创建 MySQL 一致性逻辑备份（需官方客户端） |
-| `npm run audit` | 旧 SQLite 快照审计；MySQL 使用管理迁移报告和集成验证 |
+- **换绑后账号顺序不对**：预创建的目标邮箱曾与完成换绑混在一起。现在区分占位与真实账号，并按完成时间处理换绑后的顺序。
+- **优惠查询失败被当成没有优惠**：空目录、凭证失效和未完成的优惠码检查分开记录，不让一次不确定的响应覆盖历史结论。
+- **邮件重复推送破坏已有记录**：补充的元数据与已有归属合并，重试不重复生成索引，本地不保存邮件正文。
+- **单连接迁移卡住**：迁移持有数据库锁时又向连接池申请连接；现已改为在同一连接执行迁移，并验证并发启动与重复执行。
 
-构建输出位于 `dist/`。`dist/release-manifest.json` 记录源码提交、构建时间、前端入口和产物哈希；生产服务启动前会校验该清单。
+[修复记录](docs/fixes.md)列出了问题背景、代码和测试入口。
 
-## 部署
+## 开发与验证
 
-参见 [部署、迁移、备份与回滚](docs/mysql-redis.md) 和 [性能验证](docs/performance.md)。Docker Compose 不公开数据库和 Redis 端口，API 绑定宿主机回环地址；对外使用 HTTPS 反向代理。Worker 目前仅支持单实例。
-
-`deploy/release.sh` 面向已迁移完成的 MySQL 原生部署，发布前运行测试、完整构建和备份。旧 V1/SQLite 切换与修复脚本仅保留作历史工具，不用于新架构的首次部署。
-
-## API 概览
-
-| 路径 | 说明 |
-| --- | --- |
-| `GET /health` | 服务状态、运行模式和发布信息 |
-| `GET /api/v2/version` | 当前发布清单 |
-| `/api/v2/admin/*` | 管理会话、账号、凭证、邮件与运营工具 |
-| `GET /api/share/snapshot` | 访问受限的只读分享快照 |
-| `POST /api/v2/import/accounts` | 使用 `X-API-Key` 导入账号 |
-| `POST /api/v2/internal/payment-exposure-check` | 写入结构化支付检查结果 |
-
-## 目录结构
-
-```text
-src/server/   API、数据库、同步任务和领域逻辑
-src/shared/   前后端共享类型
-web/src/      React 管理后台
-tests/        领域规则、同步、写入流程和安全测试
-scripts/      生产审计、构建清单及检查桥接脚本
-deploy/       systemd、Nginx 和发布配置
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
-## 安全
+`npm test` 使用临时 SQLite 做离线业务回归。MySQL 方言、事务、外键、跨实例限流和备份恢复需要独立的 MySQL / Redis 测试环境：
 
-请勿在公开 Issue 中提交真实凭证、邮箱数据或内部服务地址。安全问题请通过 GitHub Security Advisories 私下报告，详见 [SECURITY.md](SECURITY.md)。
+```bash
+# 使用专用测试服务及可创建临时库的账号；还需要 MySQL 8.x 客户端。
+MYSQL_URL=mysql://root:password@127.0.0.1:3306/opusmail_test \
+REDIS_URL=redis://127.0.0.1:6379 \
+ENV_FILE=/dev/null npm run test:integration
+```
 
-## 许可证
+CI 运行类型检查、业务回归、真实数据库集成测试和构建。已有[性能基线](docs/performance.md)附原始报告、数据规模和运行条件。
 
-本项目基于 [MIT License](LICENSE) 发布。
+## 文档与代码
+
+| 文档 | 内容 |
+| --- | --- |
+| [架构说明](docs/architecture.md) | 模块职责、核心关系、事务与任务边界 |
+| [部署与数据迁移](docs/mysql-redis.md) | Compose、SQLite 导入、备份、恢复与回滚 |
+| [配置说明](docs/configuration.md) | 必填配置、可选集成和历史兼容项 |
+| [API 接入](docs/api.md) | 认证方式、账号导入、换绑、邮件事件和任务接口 |
+| [修复记录](docs/fixes.md) | 问题、处理方式及回归测试 |
+| [性能验证](docs/performance.md) | 可复现的本地负载基线 |
+| [界面截图](docs/showcase.md) | 演示数据与截图复现方法 |
+
+```text
+src/server/       HTTP 接口、领域服务、外部服务适配与 Worker
+  storage/        MySQL 适配、表结构、迁移与旧数据导入
+  infrastructure/ Redis 限流等基础设施
+src/shared/       前后端共享契约
+web/src/          React 界面与样式
+tests/            业务回归；integration/ 使用真实 MySQL 与 Redis
+scripts/          构建、验证、性能测量与演示截图
+deploy/           发布、备份、systemd 与 Nginx 配置
+docs/             当前文档；archive/ 保存历史方案
+```
+
+`main` 的说明只描述已实现的功能。历史设计放在[归档](docs/archive/README.md)，实验改动使用独立分支和 PR，验证并合并后再进入主线文档。
+
+## 参与和安全
+
+欢迎提交可复现的问题和改进，开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。请勿在 Issue 或截图中附带真实凭证、邮件和内部地址；安全问题通过 GitHub Security Advisories 私下报告，详见 [SECURITY.md](SECURITY.md)。
+
+[MIT License](LICENSE)
